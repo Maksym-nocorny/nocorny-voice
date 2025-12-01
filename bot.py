@@ -228,11 +228,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # For groups, use original message id; for private, we'll use the sent message id
         storage_key_message_id = update.message.message_id if is_group else None
 
-        # Create keyboard with callback data containing message_id
+        # Create keyboard with callback data containing message_id (only for private chats)
         button_text = get_text(user_lang, 'summarize_button')
         callback_data = f"summarize_{update.message.message_id}" if is_group else "summarize"
-        keyboard = [[InlineKeyboardButton(button_text, callback_data=callback_data)]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Only add summarize button in private chats
+        if is_group:
+            reply_markup = None
+        else:
+            keyboard = [[InlineKeyboardButton(button_text, callback_data=callback_data)]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
 
         # Split message if too long (Telegram limit is 4096 characters)
         transcription_text = get_text(user_lang, 'transcription_label', response.text)
