@@ -272,11 +272,13 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
     original_text = last_transcriptions.get(chat_id)
 
     if not original_text:
-        await query.edit_message_text(text=get_text(user_lang, 'session_expired'))
+        await query.answer(text=get_text(user_lang, 'session_expired'), show_alert=True)
         return
 
-    await query.edit_message_text(
-        text=get_text(user_lang, 'summarizing', original_text), 
+    # Send a status message
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=get_text(user_lang, 'summarizing', '...'),
         parse_mode='Markdown'
     )
 
@@ -285,11 +287,8 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
         prompt = f"Summarize the following text concisely. The summary MUST be in the language '{user_lang}':\n\n{original_text}"
         response = model.generate_content([prompt])
         
-        # Restore original text without button
-        await query.edit_message_text(
-            text=get_text(user_lang, 'transcription_label', original_text), 
-            parse_mode='Markdown'
-        )
+        # Delete status message
+        await status_msg.delete()
         
         # Send summary
         await context.bot.send_message(
@@ -300,10 +299,7 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
 
     except Exception as e:
         logger.error(f"Error summarizing: {e}")
-        await context.bot.send_message(
-            chat_id=chat_id, 
-            text=get_text(user_lang, 'summary_error', str(e))
-        )
+        await status_msg.edit_text(get_text(user_lang, 'summary_error', str(e)))
 
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
