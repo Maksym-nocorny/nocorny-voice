@@ -34,7 +34,9 @@ if not TELEGRAM_BOT_TOKEN:
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Store last transcription for each user: {chat_id: text}
+# Store last transcription: {(chat_id, message_id): text}
+# For private chats, message_id is the transcription message id
+# For groups, message_id is the original voice message id
 last_transcriptions = {}
 
 # Translations
@@ -221,11 +223,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Store transcription
         chat_id = update.effective_chat.id
-        last_transcriptions[chat_id] = response.text
+        is_group = update.effective_chat.type in ['group', 'supergroup']
+        
+        # For groups, use original message id; for private, we'll use the sent message id
+        storage_key_message_id = update.message.message_id if is_group else None
 
-        # Create keyboard
+        # Create keyboard with callback data containing message_id
         button_text = get_text(user_lang, 'summarize_button')
-        keyboard = [[InlineKeyboardButton(button_text, callback_data="summarize")]]
+        callback_data = f"summarize_{update.message.message_id}" if is_group else "summarize"
+        keyboard = [[InlineKeyboardButton(button_text, callback_data=callback_data)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         # Split message if too long (Telegram limit is 4096 characters)
@@ -233,11 +239,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_length = 4000  # Leave some margin for formatting
         
         if len(transcription_text) <= max_length:
-            await status_message.edit_text(
-                transcription_text, 
-                parse_mode='Markdown', 
-                reply_markup=reply_markup
-            )
+            # In groups, reply to the original message
+            if is_group:
+                sent_msg = await update.message.reply_text(
+                    transcription_text,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+                await status_message.delete()
+            else:
+                sent_msg = await status_message.edit_text(
+                    transcription_text, 
+                    parse_mode='Markdown', 
+                    reply_markup=reply_markup
+                )
+            
+            # Store with appropriate key
+            if not is_group:
+                storage_key_message_id = sent_msg.message_id
+            last_transcriptions[(chat_id, storage_key_message_id)] = response.text
         else:
             # Delete status message
             await status_message.delete()
@@ -246,6 +266,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = get_text(user_lang, 'transcription_label', '')
             chunks = [response.text[i:i+max_length] for i in range(0, len(response.text), max_length)]
             
+            sent_msg = None
             for i, chunk in enumerate(chunks):
                 if i == 0:
                     text = f"{label}{chunk}"
@@ -254,9 +275,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
                 # Add button only to the last chunk
                 if i == len(chunks) - 1:
-                    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+                    if is_group:
+                        sent_msg = await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+                    else:
+                        sent_msg = await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
                 else:
-                    await update.message.reply_text(text, parse_mode='Markdown')
+                    if is_group:
+                        await update.message.reply_text(text, parse_mode='Markdown')
+                    else:
+                        await update.message.reply_text(text, parse_mode='Markdown')
+            
+            # Store with appropriate key
+            if not is_group and sent_msg:
+                storage_key_message_id = sent_msg.message_id
+            last_transcriptions[(chat_id, storage_key_message_id)] = response.text
 
     except Exception as e:
         logger.error(f"Error processing message: {e}")
@@ -269,7 +301,17 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
 
     user_lang = update.effective_user.language_code or 'en'
     chat_id = update.effective_chat.id
-    original_text = last_transcriptions.get(chat_id)
+    
+    # Extract message_id from callback_data
+    callback_data = query.data
+    if callback_data.startswith("summarize_"):
+        # Group chat - extract message_id
+        message_id = int(callback_data.split("_")[1])
+    else:
+        # Private chat - use the message with the button
+        message_id = query.message.message_id
+    
+    original_text = last_transcriptions.get((chat_id, message_id))
 
     if not original_text:
         await query.answer(text=get_text(user_lang, 'session_expired'), show_alert=True)

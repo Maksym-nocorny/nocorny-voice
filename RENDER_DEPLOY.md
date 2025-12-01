@@ -34,11 +34,14 @@ Since you have already created the repository `https://github.com/maksymusmax/no
 5.  **Environment Variables**:
     - `GEMINI_API_KEY`: (Copy from your .env file)
     - `TELEGRAM_BOT_TOKEN`: (Copy from your .env file)
-    - `WEBHOOK_URL`: `https://nocorny-voice.onrender.com` (or whatever URL Render assigns you).
+    - `WEBHOOK_URL`: **Leave this blank for now** (You will get this URL *after* you create the service).
 
 ## Step 3: Finalize Webhook
 
-Once deployed, Render will give you a URL (e.g., `https://nocorny-voice.onrender.com`).
-1.  Go to the **Environment** tab in Render.
-2.  Add/Update the `WEBHOOK_URL` variable with this value.
-3.  Render will restart the bot, and it will start listening for webhooks!
+1.  **Wait for Deploy**: Render will start deploying. It might fail or just sit there because the Webhook URL is missing. That's okay!
+2.  **Get the URL**: Look at the top-left of the Render dashboard (under the service name). You will see a URL like `https://nocorny-voice.onrender.com`. **Copy it.**
+3.  **Update Variable**:
+    - Go to the **Environment** tab.
+    - Add/Update `WEBHOOK_URL` with the URL you just copied.
+    - Click **Save Changes**.
+4.  **Redeploy**: Render will restart the bot automatically. Now it will work!
