@@ -275,6 +275,12 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.answer(text=get_text(user_lang, 'session_expired'), show_alert=True)
         return
 
+    # Remove the button immediately to prevent multiple clicks
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except:
+        pass  # Ignore if message can't be edited
+
     # Send a status message
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
