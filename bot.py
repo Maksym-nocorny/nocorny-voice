@@ -101,8 +101,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         last_transcriptions[chat_id] = response.text
 
+        # Get user's language for button text
+        user_lang = update.effective_user.language_code or 'en'
+        
+        # Button text translations
+        button_texts = {
+            'en': '📝 Summarize',
+            'uk': '📝 Підсумувати',
+            'ru': '📝 Резюмировать',
+            'es': '📝 Resumir',
+            'de': '📝 Zusammenfassen',
+            'fr': '📝 Résumer',
+            'it': '📝 Riassumere',
+            'pl': '📝 Podsumuj',
+        }
+        button_text = button_texts.get(user_lang, '📝 Summarize')  # Default to English
+
         # Create keyboard
-        keyboard = [[InlineKeyboardButton("📝 Summarize", callback_data="summarize")]]
+        keyboard = [[InlineKeyboardButton(button_text, callback_data="summarize")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await status_message.edit_text(f"**Transcription:**\n\n{response.text}", parse_mode='Markdown', reply_markup=reply_markup)
