@@ -228,11 +228,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton(button_text, callback_data="summarize")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await status_message.edit_text(
-            get_text(user_lang, 'transcription_label', response.text), 
-            parse_mode='Markdown', 
-            reply_markup=reply_markup
-        )
+        # Split message if too long (Telegram limit is 4096 characters)
+        transcription_text = get_text(user_lang, 'transcription_label', response.text)
+        max_length = 4000  # Leave some margin for formatting
+        
+        if len(transcription_text) <= max_length:
+            await status_message.edit_text(
+                transcription_text, 
+                parse_mode='Markdown', 
+                reply_markup=reply_markup
+            )
+        else:
+            # Delete status message
+            await status_message.delete()
+            
+            # Send transcription in chunks
+            label = get_text(user_lang, 'transcription_label', '')
+            chunks = [response.text[i:i+max_length] for i in range(0, len(response.text), max_length)]
+            
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    text = f"{label}{chunk}"
+                else:
+                    text = chunk
+                    
+                # Add button only to the last chunk
+                if i == len(chunks) - 1:
+                    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+                else:
+                    await update.message.reply_text(text, parse_mode='Markdown')
 
     except Exception as e:
         logger.error(f"Error processing message: {e}")
