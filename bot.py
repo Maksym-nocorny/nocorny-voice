@@ -354,14 +354,32 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Error summarizing: {e}")
         await status_msg.edit_text(get_text(user_lang, 'summary_error', str(e)))
 
+async def handle_chat_migration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle group to supergroup migration."""
+    old_chat_id = update.message.migrate_from_chat_id
+    new_chat_id = update.message.chat_id
+    
+    logger.info(f"Chat migration: {old_chat_id} -> {new_chat_id}")
+    
+    # Migrate all stored transcriptions
+    keys_to_migrate = [key for key in last_transcriptions.keys() if key[0] == old_chat_id]
+    for old_key in keys_to_migrate:
+        new_key = (new_chat_id, old_key[1])
+        last_transcriptions[new_key] = last_transcriptions.pop(old_key)
+    
+    logger.info(f"Migrated {len(keys_to_migrate)} transcriptions")
+
+
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
     start_handler = CommandHandler('start', start)
     message_handler = MessageHandler(filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO | filters.VIDEO, handle_message)
-    summary_handler = CallbackQueryHandler(handle_summary_callback, pattern="^summarize$")
+    summary_handler = CallbackQueryHandler(handle_summary_callback, pattern="^summarize")
+    migration_handler = MessageHandler(filters.StatusUpdate.MIGRATE, handle_chat_migration)
     
     application.add_handler(start_handler)
+    application.add_handler(migration_handler)  # Add migration handler before message handler
     application.add_handler(message_handler)
     application.add_handler(summary_handler)
     
