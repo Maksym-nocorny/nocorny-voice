@@ -611,7 +611,7 @@ if __name__ == '__main__':
         (filters.TEXT & (~filters.COMMAND)) | 
         filters.Document.ALL | 
         filters.PHOTO | 
-        filters.STICKER | 
+        filters.Sticker.ALL |  
         filters.LOCATION | 
         filters.CONTACT, 
         handle_unsupported_message
