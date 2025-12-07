@@ -1,98 +1,181 @@
-# Deploying to Supabase Edge Functions
+# 🚀 Supabase Deployment Guide
 
-## Prerequisites
+## What You Need
 
-1. **Supabase CLI**: Install the Supabase CLI
-   ```bash
-   npm install -g supabase
-   ```
+- ✅ Supabase account (free at [supabase.com](https://supabase.com))
+- ✅ Your existing Gemini API key
+- ✅ Telegram test bot token: `8057336327:AAHTnOn8GVLUAIxb21qXzUZh2TK0pt36Rqw`
 
-2. **Login to Supabase**:
-   ```bash
-   supabase login
-   ```
+---
 
-3. **Link your project**:
-   ```bash
-   supabase link --project-ref YOUR_PROJECT_REF
-   ```
+## Step 1: Create Supabase Project
 
-## Step 1: Create Database Tables
+1. Go to [supabase.com/dashboard](https://supabase.com/dashboard)
+2. Click **"New Project"**
+3. Name it: `nocorny-voice`
+4. Set a database password (save it somewhere!)
+5. Choose region closest to you
+6. Wait ~2 minutes for setup
 
-Run the schema migration in Supabase SQL Editor:
+---
 
-1. Go to [Supabase Dashboard](https://supabase.com/dashboard)
-2. Open your project → SQL Editor
-3. Copy contents of `supabase/migrations/001_initial_schema.sql`
-4. Run the query
+## Step 2: Create Database Tables
 
-## Step 2: Set Environment Variables
+1. In your project, go to **SQL Editor** (left sidebar)
+2. Click **"New Query"**
+3. Paste this SQL:
 
-In Supabase Dashboard → Edge Functions → Environment Variables:
+```sql
+-- Users table
+CREATE TABLE users (
+    user_id BIGINT PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    language_code TEXT,
+    first_seen TIMESTAMPTZ DEFAULT NOW(),
+    last_seen TIMESTAMPTZ DEFAULT NOW()
+);
 
+-- Events table
+CREATE TABLE events (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(user_id),
+    event_type TEXT NOT NULL,
+    media_type TEXT,
+    chat_type TEXT,
+    timestamp TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Transcriptions table
+CREATE TABLE transcriptions (
+    id BIGSERIAL PRIMARY KEY,
+    chat_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    transcription_text TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(chat_id, message_id)
+);
+
+-- Indexes
+CREATE INDEX idx_events_user_id ON events(user_id);
+CREATE INDEX idx_events_type ON events(event_type);
 ```
-TELEGRAM_BOT_TOKEN=8057336327:AAHTnOn8GVLUAIxb21qXzUZh2TK0pt36Rqw
-GEMINI_API_KEY=your-gemini-api-key
-ADMIN_USER_ID=your-telegram-user-id
+
+4. Click **"Run"** (or Cmd+Enter)
+5. You should see "Success" ✅
+
+---
+
+## Step 3: Set Environment Variables
+
+1. Go to **Edge Functions** (left sidebar)
+2. Click **"Manage Secrets"** button (top right)
+3. Add these secrets one by one:
+
+| Name | Value |
+|------|-------|
+| `TELEGRAM_BOT_TOKEN` | `8057336327:AAHTnOn8GVLUAIxb21qXzUZh2TK0pt36Rqw` |
+| `GEMINI_API_KEY` | Your Gemini API key |
+| `ADMIN_USER_ID` | Your Telegram user ID (for /stats access) |
+
+---
+
+## Step 4: Install Supabase CLI
+
+Open Terminal and run:
+
+```bash
+npm install -g supabase
 ```
 
-> **Note**: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are auto-injected.
+Then login:
 
-## Step 3: Deploy Edge Function
+```bash
+supabase login
+```
+
+This opens a browser - click "Authorize".
+
+---
+
+## Step 5: Link Project
+
+1. In Supabase Dashboard, go to **Settings** → **General**
+2. Copy your **Reference ID** (looks like `abcdefghijklmnop`)
+3. In Terminal, navigate to your project:
+
+```bash
+cd "/Users/maksym/telegram bot Nocorny.voice"
+```
+
+4. Link the project:
+
+```bash
+supabase link --project-ref YOUR_REFERENCE_ID
+```
+
+---
+
+## Step 6: Deploy the Function
+
+Run this command:
 
 ```bash
 supabase functions deploy telegram-webhook --no-verify-jwt
 ```
 
-The `--no-verify-jwt` flag is required for webhook endpoints.
-
-## Step 4: Set Telegram Webhook
-
-Get your function URL (shown after deploy):
+You'll see output like:
 ```
-https://YOUR_PROJECT_REF.supabase.co/functions/v1/telegram-webhook
+Deploying function telegram-webhook...
+Function deployed to https://YOUR_PROJECT.supabase.co/functions/v1/telegram-webhook
 ```
 
-Set the webhook:
+**Copy this URL!** ☝️
+
+---
+
+## Step 7: Connect to Telegram
+
+Replace `YOUR_FUNCTION_URL` with the URL from Step 6:
+
 ```bash
 curl -X POST "https://api.telegram.org/bot8057336327:AAHTnOn8GVLUAIxb21qXzUZh2TK0pt36Rqw/setWebhook" \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://YOUR_PROJECT_REF.supabase.co/functions/v1/telegram-webhook"}'
+  -d '{"url": "YOUR_FUNCTION_URL"}'
 ```
 
-## Step 5: Test the Bot
+You should see: `{"ok":true,"result":true,"description":"Webhook was set"}`
+
+---
+
+## Step 8: Test It! 🎉
 
 1. Open Telegram
-2. Search for your bot
+2. Search for your test bot (the one with token starting `8057336327`)
 3. Send `/start`
 4. Send a voice message
-5. Click "Summarize" button
+5. It should transcribe and show "Summarize" button!
 
-## Local Development
+---
 
-1. Create `.env` file:
-   ```
-   TELEGRAM_BOT_TOKEN=8057336327:AAHTnOn8GVLUAIxb21qXzUZh2TK0pt36Rqw
-   GEMINI_API_KEY=your-gemini-api-key
-   ADMIN_USER_ID=your-telegram-user-id
-   SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
-   SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-   ```
+## Troubleshooting
 
-2. Run locally:
-   ```bash
-   supabase functions serve telegram-webhook --env-file .env
-   ```
+**Check logs:**
+- Supabase Dashboard → Edge Functions → Select `telegram-webhook` → Logs
 
-3. Use [ngrok](https://ngrok.com) to expose local endpoint for testing.
+**Check database:**
+- Supabase Dashboard → Table Editor → See if users/events appear
 
-## Monitoring
+**Reset webhook:**
+```bash
+curl "https://api.telegram.org/bot8057336327:AAHTnOn8GVLUAIxb21qXzUZh2TK0pt36Rqw/deleteWebhook"
+```
 
-- **Logs**: Supabase Dashboard → Edge Functions → Logs
-- **Database**: Supabase Dashboard → Table Editor
+---
 
-## Rollback
+## When Ready for Production
 
-If issues occur:
-1. Delete webhook: `curl "https://api.telegram.org/botTOKEN/deleteWebhook"`
-2. Original bot on Render continues working on the `main` branch
+1. Update secrets with production bot token
+2. Redeploy function
+3. Set webhook with production bot token URL
