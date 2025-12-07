@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 import google.generativeai as genai
+from analytics import Analytics
 
 # Load environment variables
 load_dotenv()
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")  # Optional: restrict /stats to admin only
 
 if not GEMINI_API_KEY:
     logger.error("GEMINI_API_KEY not found in .env file")
@@ -33,6 +35,9 @@ if not TELEGRAM_BOT_TOKEN:
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
+
+# Initialize Analytics
+analytics = Analytics()
 
 # Store last transcription: {(chat_id, message_id): text}
 # For private chats, message_id is the transcription message id
@@ -53,7 +58,19 @@ TRANSLATIONS = {
         'summarizing': "**Transcription:**\n\n{}\n\n_Summarizing..._",
         'summary_label': "**Summary:**\n\n{}",
         'summary_error': "Error generating summary: {}",
-        'processing_failed': "Gemini failed to process the media file."
+        'processing_failed': "Gemini failed to process the media file.",
+        'stats_title': "📊 **Bot Statistics**",
+        'stats_total': "**Total Statistics:**",
+        'stats_transcriptions': "• Transcriptions: {}",
+        'stats_summaries': "• Summaries: {}",
+        'stats_users': "• Unique users: {}",
+        'stats_media_types': "\n**Media Types:**",
+        'stats_top_users': "\n**Top 10 Users:**",
+        'stats_languages': "\n**Language Distribution:**",
+        'stats_chat_types': "\n**Chat Types:**",
+        'stats_user_rank': "{}. {} - {} requests",
+        'stats_no_data': "No statistics available yet.",
+        'stats_unauthorized': "⛔ You are not authorized to view statistics."
     },
     'uk': {
         'welcome': "Привіт! Я бот для транскрипції. Надішліть мені голосове повідомлення або відеоповідомлення, і я транскрибую його за допомогою Gemini.",
@@ -67,7 +84,19 @@ TRANSLATIONS = {
         'summarizing': "**Транскрипція:**\n\n{}\n\n_Підсумовую..._",
         'summary_label': "**Підсумок:**\n\n{}",
         'summary_error': "Помилка створення підсумку: {}",
-        'processing_failed': "Gemini не вдалося обробити медіафайл."
+        'processing_failed': "Gemini не вдалося обробити медіафайл.",
+        'stats_title': "📊 **Статистика бота**",
+        'stats_total': "**Загальна статистика:**",
+        'stats_transcriptions': "• Транскрипцій: {}",
+        'stats_summaries': "• Підсумків: {}",
+        'stats_users': "• Унікальних користувачів: {}",
+        'stats_media_types': "\n**Типи медіа:**",
+        'stats_top_users': "\n**Топ 10 користувачів:**",
+        'stats_languages': "\n**Розподіл мов:**",
+        'stats_chat_types': "\n**Типи чатів:**",
+        'stats_user_rank': "{}. {} - {} запитів",
+        'stats_no_data': "Статистика ще недоступна.",
+        'stats_unauthorized': "⛔ Ви не маєте доступу до перегляду статистики."
     },
     'ru': {
         'welcome': "Привет! Я бот для транскрипции. Отправьте мне голосовое сообщение или видеосообщение, и я транскрибирую его с помощью Gemini.",
@@ -81,7 +110,19 @@ TRANSLATIONS = {
         'summarizing': "**Транскрипция:**\n\n{}\n\n_Резюмирую..._",
         'summary_label': "**Резюме:**\n\n{}",
         'summary_error': "Ошибка создания резюме: {}",
-        'processing_failed': "Gemini не удалось обработать медиафайл."
+        'processing_failed': "Gemini не удалось обработать медиафайл.",
+        'stats_title': "📊 **Статистика бота**",
+        'stats_total': "**Общая статистика:**",
+        'stats_transcriptions': "• Транскрипций: {}",
+        'stats_summaries': "• Резюме: {}",
+        'stats_users': "• Уникальных пользователей: {}",
+        'stats_media_types': "\n**Типы медиа:**",
+        'stats_top_users': "\n**Топ 10 пользователей:**",
+        'stats_languages': "\n**Распределение языков:**",
+        'stats_chat_types': "\n**Типы чатов:**",
+        'stats_user_rank': "{}. {} - {} запросов",
+        'stats_no_data': "Статистика пока недоступна.",
+        'stats_unauthorized': "⛔ Вы не авторизованы для просмотра статистики."
     },
     'es': {
         'welcome': "¡Hola! Soy un bot de transcripción. Envíame un mensaje de voz o una nota de video, y lo transcribiré usando Gemini.",
@@ -163,33 +204,59 @@ def get_text(lang_code, key, *args):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends a welcome message."""
-    user_lang = update.effective_user.language_code or 'en'
+    user = update.effective_user
+    user_lang = user.language_code or 'en'
+    
+    # Track user
+    analytics.track_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        language_code=user_lang
+    )
+    
     await update.message.reply_text(get_text(user_lang, 'welcome'))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles voice and video note messages."""
-    user_lang = update.effective_user.language_code or 'en'
+    user = update.effective_user
+    user_lang = user.language_code or 'en'
+    
+    # Track user
+    analytics.track_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        language_code=user_lang
+    )
     
     status_message = await update.message.reply_text(get_text(user_lang, 'downloading'))
     
     try:
         # Determine file type and get file object
+        media_type = None
         if update.message.voice:
             file_id = update.message.voice.file_id
             file_ext = ".ogg"
             mime_type = "audio/ogg"
+            media_type = "voice"
         elif update.message.video_note:
             file_id = update.message.video_note.file_id
             file_ext = ".mp4"
             mime_type = "video/mp4"
+            media_type = "video_note"
         elif update.message.audio:
              file_id = update.message.audio.file_id
              file_ext = ".mp3"
              mime_type = update.message.audio.mime_type or "audio/mpeg"
+             media_type = "audio"
         elif update.message.video:
              file_id = update.message.video.file_id
              file_ext = ".mp4"
              mime_type = update.message.video.mime_type or "video/mp4"
+             media_type = "video"
         else:
             await status_message.edit_text(get_text(user_lang, 'unsupported'))
             return
@@ -220,6 +287,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Cleanup local file
         os.remove(temp_path)
+        
+        # Track transcription event
+        chat_type = 'private' if update.effective_chat.type == 'private' else 'group'
+        analytics.track_event(
+            user_id=user.id,
+            event_type='transcription',
+            media_type=media_type,
+            chat_type=chat_type
+        )
         
         # Store transcription
         chat_id = update.effective_chat.id
@@ -304,8 +380,18 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
 
-    user_lang = update.effective_user.language_code or 'en'
+    user = update.effective_user
+    user_lang = user.language_code or 'en'
     chat_id = update.effective_chat.id
+    
+    # Track user
+    analytics.track_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        language_code=user_lang
+    )
     
     # Extract message_id from callback_data
     callback_data = query.data
@@ -340,6 +426,14 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
         prompt = f"Summarize the following text concisely. The summary MUST be in the language '{user_lang}':\n\n{original_text}"
         response = model.generate_content([prompt])
         
+        # Track summary event
+        chat_type = 'private' if update.effective_chat.type == 'private' else 'group'
+        analytics.track_event(
+            user_id=user.id,
+            event_type='summary',
+            chat_type=chat_type
+        )
+        
         # Delete status message
         await status_msg.delete()
         
@@ -369,16 +463,89 @@ async def handle_chat_migration(update: Update, context: ContextTypes.DEFAULT_TY
     
     logger.info(f"Migrated {len(keys_to_migrate)} transcriptions")
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display bot statistics."""
+    user = update.effective_user
+    user_lang = user.language_code or 'en'
+    
+    # Check if user is admin (if ADMIN_USER_ID is set)
+    if ADMIN_USER_ID and str(user.id) != ADMIN_USER_ID:
+        await update.message.reply_text(get_text(user_lang, 'stats_unauthorized'))
+        logger.warning(f"Unauthorized stats access attempt by user {user.id} (@{user.username})")
+        return
+    
+    # Track user
+    analytics.track_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        language_code=user_lang
+    )
+    
+    try:
+        # Get statistics
+        total_stats = analytics.get_total_stats()
+        
+        if total_stats['total_events'] == 0:
+            await update.message.reply_text(get_text(user_lang, 'stats_no_data'))
+            return
+        
+        # Build stats message
+        message = get_text(user_lang, 'stats_title') + "\n\n"
+        message += get_text(user_lang, 'stats_total') + "\n"
+        message += get_text(user_lang, 'stats_transcriptions', total_stats['total_transcriptions']) + "\n"
+        message += get_text(user_lang, 'stats_summaries', total_stats['total_summaries']) + "\n"
+        message += get_text(user_lang, 'stats_users', total_stats['total_users']) + "\n"
+        
+        # Media types
+        media_stats = analytics.get_media_type_stats()
+        if media_stats:
+            message += get_text(user_lang, 'stats_media_types') + "\n"
+            for media_type, count in media_stats.items():
+                message += f"• {media_type}: {count}\n"
+        
+        # Chat types
+        chat_stats = analytics.get_chat_type_stats()
+        if chat_stats:
+            message += get_text(user_lang, 'stats_chat_types') + "\n"
+            for chat_type, count in chat_stats.items():
+                message += f"• {chat_type}: {count}\n"
+        
+        # Top users
+        top_users = analytics.get_top_users(10)
+        if top_users:
+            message += get_text(user_lang, 'stats_top_users') + "\n"
+            for i, (user_id, username, count) in enumerate(top_users, 1):
+                display_name = f"@{username}" if username else f"User {user_id}"
+                message += get_text(user_lang, 'stats_user_rank', i, display_name, count) + "\n"
+        
+        # Language distribution
+        lang_stats = analytics.get_language_distribution()
+        if lang_stats:
+            message += get_text(user_lang, 'stats_languages') + "\n"
+            for lang, count in lang_stats.items():
+                message += f"• {lang}: {count}\n"
+        
+        await update.message.reply_text(message, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        await update.message.reply_text(get_text(user_lang, 'error', str(e)))
+
+
 
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
     start_handler = CommandHandler('start', start)
+    stats_handler = CommandHandler('stats', stats)
     message_handler = MessageHandler(filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO | filters.VIDEO, handle_message)
     summary_handler = CallbackQueryHandler(handle_summary_callback, pattern="^summarize")
     migration_handler = MessageHandler(filters.StatusUpdate.MIGRATE, handle_chat_migration)
     
     application.add_handler(start_handler)
+    application.add_handler(stats_handler)
     application.add_handler(migration_handler)  # Add migration handler before message handler
     application.add_handler(message_handler)
     application.add_handler(summary_handler)
