@@ -70,7 +70,12 @@ TRANSLATIONS = {
         'stats_chat_types': "\n**Chat Types:**",
         'stats_user_rank': "{}. {} - {} requests",
         'stats_no_data': "No statistics available yet.",
-        'stats_unauthorized': "⛔ You are not authorized to view statistics."
+        'stats_unauthorized': "⛔ You are not authorized to view statistics.",
+        'stats_time_based': "\n**Usage Over Time:**",
+        'stats_last_7_days': "Last 7 days:",
+        'stats_last_6_months': "Last 6 months:",
+        'stats_by_year': "By year:",
+        'stats_hourly': "\n**Peak Hours (UTC):**"
     },
     'uk': {
         'welcome': "Привіт! Я бот для транскрипції. Надішліть мені голосове повідомлення або відеоповідомлення, і я транскрибую його за допомогою Gemini.",
@@ -96,7 +101,12 @@ TRANSLATIONS = {
         'stats_chat_types': "\n**Типи чатів:**",
         'stats_user_rank': "{}. {} - {} запитів",
         'stats_no_data': "Статистика ще недоступна.",
-        'stats_unauthorized': "⛔ Ви не маєте доступу до перегляду статистики."
+        'stats_unauthorized': "⛔ Ви не маєте доступу до перегляду статистики.",
+        'stats_time_based': "\n**Використання за часом:**",
+        'stats_last_7_days': "Останні 7 днів:",
+        'stats_last_6_months': "Останні 6 місяців:",
+        'stats_by_year': "За роками:",
+        'stats_hourly': "\n**Пікові години (UTC):**"
     },
     'ru': {
         'welcome': "Привет! Я бот для транскрипции. Отправьте мне голосовое сообщение или видеосообщение, и я транскрибирую его с помощью Gemini.",
@@ -122,7 +132,12 @@ TRANSLATIONS = {
         'stats_chat_types': "\n**Типы чатов:**",
         'stats_user_rank': "{}. {} - {} запросов",
         'stats_no_data': "Статистика пока недоступна.",
-        'stats_unauthorized': "⛔ Вы не авторизованы для просмотра статистики."
+        'stats_unauthorized': "⛔ Вы не авторизованы для просмотра статистики.",
+        'stats_time_based': "\n**Использование по времени:**",
+        'stats_last_7_days': "Последние 7 дней:",
+        'stats_last_6_months': "Последние 6 месяцев:",
+        'stats_by_year': "По годам:",
+        'stats_hourly': "\n**Пиковые часы (UTC):**"
     },
     'es': {
         'welcome': "¡Hola! Soy un bot de transcripción. Envíame un mensaje de voz o una nota de video, y lo transcribiré usando Gemini.",
@@ -526,6 +541,38 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message += get_text(user_lang, 'stats_languages') + "\n"
             for lang, count in lang_stats.items():
                 message += f"• {lang}: {count}\n"
+        
+        # Time-based statistics
+        message += get_text(user_lang, 'stats_time_based') + "\n"
+        
+        # Last 7 days
+        daily_stats = analytics.get_daily_stats(7)
+        if daily_stats:
+            message += f"\n{get_text(user_lang, 'stats_last_7_days')}\n"
+            for day, count in daily_stats:
+                message += f"• {day}: {count}\n"
+        
+        # Last 6 months
+        monthly_stats = analytics.get_monthly_stats(6)
+        if monthly_stats:
+            message += f"\n{get_text(user_lang, 'stats_last_6_months')}\n"
+            for month, count in monthly_stats:
+                message += f"• {month}: {count}\n"
+        
+        # By year
+        yearly_stats = analytics.get_yearly_stats()
+        if yearly_stats:
+            message += f"\n{get_text(user_lang, 'stats_by_year')}\n"
+            for year, count in yearly_stats:
+                message += f"• {year}: {count}\n"
+        
+        # Hourly distribution (top 5 peak hours)
+        hourly_stats = analytics.get_hourly_distribution()
+        if hourly_stats:
+            message += get_text(user_lang, 'stats_hourly') + "\n"
+            sorted_hours = sorted(hourly_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+            for hour, count in sorted_hours:
+                message += f"• {hour:02d}:00 - {count} requests\n"
         
         await update.message.reply_text(message, parse_mode='Markdown')
         

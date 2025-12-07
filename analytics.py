@@ -201,3 +201,53 @@ class Analytics:
                 GROUP BY chat_type
             """)
             return dict(cursor.fetchall())
+    
+    def get_daily_stats(self, days: int = 7) -> List[Tuple[str, int]]:
+        """Get statistics for the last N days."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DATE(timestamp) as day, COUNT(*) as count
+                FROM events
+                WHERE timestamp >= datetime('now', '-' || ? || ' days')
+                GROUP BY DATE(timestamp)
+                ORDER BY day DESC
+            """, (days,))
+            return cursor.fetchall()
+    
+    def get_monthly_stats(self, months: int = 6) -> List[Tuple[str, int]]:
+        """Get statistics for the last N months."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT strftime('%Y-%m', timestamp) as month, COUNT(*) as count
+                FROM events
+                WHERE timestamp >= datetime('now', '-' || ? || ' months')
+                GROUP BY strftime('%Y-%m', timestamp)
+                ORDER BY month DESC
+            """, (months,))
+            return cursor.fetchall()
+    
+    def get_yearly_stats(self) -> List[Tuple[str, int]]:
+        """Get statistics by year."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT strftime('%Y', timestamp) as year, COUNT(*) as count
+                FROM events
+                GROUP BY strftime('%Y', timestamp)
+                ORDER BY year DESC
+            """)
+            return cursor.fetchall()
+    
+    def get_hourly_distribution(self) -> Dict[int, int]:
+        """Get distribution of requests by hour of day (0-23)."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT CAST(strftime('%H', timestamp) AS INTEGER) as hour, COUNT(*) as count
+                FROM events
+                GROUP BY hour
+                ORDER BY hour
+            """)
+            return dict(cursor.fetchall())
