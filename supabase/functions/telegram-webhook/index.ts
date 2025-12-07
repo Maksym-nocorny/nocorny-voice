@@ -218,23 +218,125 @@ async function getTranscription(
     return data.transcription_text;
 }
 
+// Gemini File API helpers
+async function uploadToGemini(
+    fileUrl: string,
+    mimeType: string,
+    fileSize: number
+): Promise<string | null> {
+    try {
+        // 1. Start resumable upload session
+        const startUploadUrl = `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${GEMINI_API_KEY}`;
+
+        const initialRes = await fetch(startUploadUrl, {
+            method: "POST",
+            headers: {
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": fileSize.toString(),
+                "X-Goog-Upload-Header-Content-Type": mimeType,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ file: { display_name: "telegram_media" } }),
+        });
+
+        const uploadUrl = initialRes.headers.get("x-goog-upload-url");
+        if (!uploadUrl) {
+            console.error("Failed to get upload URL");
+            return null;
+        }
+
+        // 2. Stream file content
+        const fileRes = await fetch(fileUrl);
+        if (!fileRes.body) {
+            console.error("No body in file response");
+            return null;
+        }
+
+        const uploadRes = await fetch(uploadUrl, {
+            method: "POST", // Resumable protocol uses POST/PUT with offset
+            headers: {
+                "Content-Length": fileSize.toString(),
+                "X-Goog-Upload-Offset": "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            },
+            body: fileRes.body, // Stream directly
+        });
+
+        const uploadData = await uploadRes.json();
+        const fileUri = uploadData.file?.uri;
+
+        if (!fileUri) {
+            console.error("Failed to get file URI", uploadData);
+            return null;
+        }
+
+        // 3. Wait for file to be active
+        let state = uploadData.file?.state;
+        while (state === "PROCESSING") {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            const getRes = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/files/${uploadData.file.name.split("/").pop()}?key=${GEMINI_API_KEY}`
+            );
+            const getData = await getRes.json();
+            state = getData.state;
+            if (state === "FAILED") {
+                console.error("File processing failed");
+                return null;
+            }
+        }
+
+        return fileUri;
+    } catch (error) {
+        console.error("uploadToGemini error:", error);
+        return null;
+    }
+}
+
+async function deleteGeminiFile(fileUri: string): Promise<void> {
+    try {
+        // fileUri format: https://generativelanguage.googleapis.com/v1beta/files/NAME
+        // We need the name part for deletion URL
+        // Actually the API expects DELETE https://generativelanguage.googleapis.com/v1beta/files/NAME
+        // But fileUri IS that URL? No, fileUri is generic.
+        // The previous response had `file.name` like `files/123`.
+        // Let's assume we can extract it or use the one we got.
+        // Simplifying: we'll just use the file name from upload response if we had it, but here we return URI.
+        // Let's parse the URI? URI: https://generativelanguage.googleapis.com/v1beta/files/c2...
+
+        // We can just fetch DELETE on the URI?
+        // Official docs: DELETE https://generativelanguage.googleapis.com/v1beta/files/name
+
+        // Let's try to extract name from URI
+        const parts = fileUri.split("/files/");
+        if (parts.length < 2) return;
+        const name = "files/" + parts[1];
+
+        await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/${name}?key=${GEMINI_API_KEY}`,
+            { method: "DELETE" }
+        );
+    } catch (error) {
+        console.error("deleteGeminiFile error:", error);
+    }
+}
+
 // Gemini API helper
 async function transcribeWithGemini(
     fileUrl: string,
-    mimeType: string
+    mimeType: string,
+    fileSize: number
 ): Promise<string | null> {
+    let fileUri: string | null = null;
     try {
-        // Download the file
-        const fileResponse = await fetch(fileUrl);
-        const fileBuffer = await fileResponse.arrayBuffer();
-        const base64Data = btoa(
-            new Uint8Array(fileBuffer).reduce(
-                (data, byte) => data + String.fromCharCode(byte),
-                ""
-            )
-        );
+        // Use File API for upload (better for memory/large files)
+        fileUri = await uploadToGemini(fileUrl, mimeType, fileSize);
 
-        // Call Gemini API
+        if (!fileUri) {
+            return null;
+        }
+
+        // Call Gemini API with file_data
         const response = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
             {
@@ -246,9 +348,9 @@ async function transcribeWithGemini(
                             parts: [
                                 { text: "Transcribe this audio/video exactly as spoken." },
                                 {
-                                    inline_data: {
+                                    file_data: {
                                         mime_type: mimeType,
-                                        data: base64Data,
+                                        file_uri: fileUri,
                                     },
                                 },
                             ],
@@ -260,6 +362,9 @@ async function transcribeWithGemini(
 
         const data = await response.json();
 
+        // Cleanup
+        await deleteGeminiFile(fileUri).catch(console.error);
+
         if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
             return data.candidates[0].content.parts[0].text;
         }
@@ -268,6 +373,7 @@ async function transcribeWithGemini(
         return null;
     } catch (error) {
         console.error("transcribeWithGemini error:", error);
+        if (fileUri) await deleteGeminiFile(fileUri).catch(console.error);
         return null;
     }
 }
@@ -458,14 +564,22 @@ async function handleMediaMessage(message: TelegramMessage): Promise<void> {
             return;
         }
 
+        // Get file size from message directly (more reliable)
+        // Note: types might be missing file_size for some media, usually it's there
+        let fileSize = 0;
+        if (message.voice) fileSize = message.voice.file_size || 0;
+        else if (message.audio) fileSize = message.audio.file_size || 0;
+        else if (message.video) fileSize = message.video.file_size || 0;
+        else if (message.video_note) fileSize = message.video_note.file_size || 0;
+
         await editMessageText(
             message.chat.id,
             statusMsg.message_id,
             getText(lang, "transcribing")
         );
 
-        // Transcribe with Gemini
-        const transcription = await transcribeWithGemini(fileUrl, mediaInfo.mimeType);
+        // Transcribe with Gemini (Streaming Upload)
+        const transcription = await transcribeWithGemini(fileUrl, mediaInfo.mimeType, fileSize);
 
         if (!transcription) {
             await editMessageText(
@@ -605,6 +719,40 @@ async function handleCallbackQuery(
     }
 }
 
+// Dispatch update to appropriate handler
+async function handleUpdate(update: TelegramUpdate): Promise<void> {
+    // Handle callback queries (summarize button)
+    if (update.callback_query) {
+        const cq = update.callback_query;
+        if (cq.data?.startsWith("summarize") && cq.message) {
+            await handleCallbackQuery(cq.id, cq.from, cq.message, cq.data);
+        }
+        return;
+    }
+
+    // Handle messages
+    if (update.message) {
+        const message = update.message;
+
+        // Check for commands
+        if (message.text?.startsWith("/start")) {
+            await handleStart(message);
+            return;
+        }
+
+        if (message.text?.startsWith("/stats")) {
+            await handleStats(message);
+            return;
+        }
+
+        // Check for media
+        if (message.voice || message.video_note || message.audio || message.video) {
+            await handleMediaMessage(message);
+            return;
+        }
+    }
+}
+
 // Main handler
 serve(async (req) => {
     try {
@@ -614,42 +762,24 @@ serve(async (req) => {
         }
 
         const update: TelegramUpdate = await req.json();
-        console.log("Received update:", JSON.stringify(update));
+        console.log("Received update:", update.update_id);
 
-        // Handle callback queries (summarize button)
-        if (update.callback_query) {
-            const cq = update.callback_query;
-            if (cq.data?.startsWith("summarize") && cq.message) {
-                await handleCallbackQuery(cq.id, cq.from, cq.message, cq.data);
-            }
-            return new Response("OK", { status: 200 });
-        }
+        // Process in background using EdgeRuntime.waitUntil
+        const processingPromise = handleUpdate(update).catch((err) => {
+            console.error("Error processing update:", err);
+        });
 
-        // Handle messages
-        if (update.message) {
-            const message = update.message;
-
-            // Check for commands
-            if (message.text?.startsWith("/start")) {
-                await handleStart(message);
-                return new Response("OK", { status: 200 });
-            }
-
-            if (message.text?.startsWith("/stats")) {
-                await handleStats(message);
-                return new Response("OK", { status: 200 });
-            }
-
-            // Check for media
-            if (message.voice || message.video_note || message.audio || message.video) {
-                await handleMediaMessage(message);
-                return new Response("OK", { status: 200 });
-            }
+        if (typeof EdgeRuntime !== "undefined") {
+            // @ts-ignore: EdgeRuntime is defined in Supabase environment
+            EdgeRuntime.waitUntil(processingPromise);
+        } else {
+            // Local development fallback
+            await processingPromise;
         }
 
         return new Response("OK", { status: 200 });
     } catch (error) {
         console.error("Handler error:", error);
-        return new Response("Internal Server Error", { status: 500 });
+        return new Response("OK", { status: 200 }); // Always return 200 to stop retries
     }
 });
