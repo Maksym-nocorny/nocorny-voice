@@ -1,12 +1,6 @@
 .env
-.env.test
 venv/
 __pycache__/
 *.pyc
 downloads/
 bot_analytics.db
-
-# Supabase
-supabase/.branches
-supabase/.temp
-.supabase

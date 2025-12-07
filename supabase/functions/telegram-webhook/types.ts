@@ -1,24 +1,4 @@
-// Telegram API Types
-
-export interface TelegramUpdate {
-    update_id: number;
-    message?: TelegramMessage;
-    callback_query?: TelegramCallbackQuery;
-    migrate_to_chat_id?: number;
-    migrate_from_chat_id?: number;
-}
-
-export interface TelegramMessage {
-    message_id: number;
-    from: TelegramUser;
-    chat: TelegramChat;
-    date: number;
-    text?: string;
-    voice?: TelegramVoice;
-    video_note?: TelegramVideoNote;
-    audio?: TelegramAudio;
-    video?: TelegramVideo;
-}
+// Types for Telegram Bot API
 
 export interface TelegramUser {
     id: number;
@@ -31,7 +11,7 @@ export interface TelegramUser {
 
 export interface TelegramChat {
     id: number;
-    type: 'private' | 'group' | 'supergroup' | 'channel';
+    type: "private" | "group" | "supergroup" | "channel";
     title?: string;
     username?: string;
     first_name?: string;
@@ -51,7 +31,6 @@ export interface TelegramVideoNote {
     file_unique_id: string;
     length: number;
     duration: number;
-    thumbnail?: TelegramPhotoSize;
     file_size?: number;
 }
 
@@ -59,8 +38,6 @@ export interface TelegramAudio {
     file_id: string;
     file_unique_id: string;
     duration: number;
-    performer?: string;
-    title?: string;
     mime_type?: string;
     file_size?: number;
 }
@@ -71,26 +48,59 @@ export interface TelegramVideo {
     width: number;
     height: number;
     duration: number;
-    thumbnail?: TelegramPhotoSize;
     mime_type?: string;
     file_size?: number;
 }
 
-export interface TelegramPhotoSize {
-    file_id: string;
-    file_unique_id: string;
-    width: number;
-    height: number;
-    file_size?: number;
+export interface TelegramMessage {
+    message_id: number;
+    from?: TelegramUser;
+    chat: TelegramChat;
+    date: number;
+    text?: string;
+    voice?: TelegramVoice;
+    video_note?: TelegramVideoNote;
+    audio?: TelegramAudio;
+    video?: TelegramVideo;
 }
 
 export interface TelegramCallbackQuery {
     id: string;
     from: TelegramUser;
     message?: TelegramMessage;
-    inline_message_id?: string;
     chat_instance: string;
     data?: string;
+}
+
+export interface TelegramUpdate {
+    update_id: number;
+    message?: TelegramMessage;
+    callback_query?: TelegramCallbackQuery;
+}
+
+export interface InlineKeyboardButton {
+    text: string;
+    callback_data?: string;
+}
+
+export interface InlineKeyboardMarkup {
+    inline_keyboard: InlineKeyboardButton[][];
+}
+
+export interface SendMessageParams {
+    chat_id: number;
+    text: string;
+    parse_mode?: "Markdown" | "MarkdownV2" | "HTML";
+    reply_markup?: InlineKeyboardMarkup;
+    reply_to_message_id?: number;
+}
+
+export interface EditMessageTextParams {
+    chat_id: number;
+    message_id: number;
+    text: string;
+    parse_mode?: "Markdown" | "MarkdownV2" | "HTML";
+    reply_markup?: InlineKeyboardMarkup;
 }
 
 export interface TelegramFile {
@@ -100,40 +110,10 @@ export interface TelegramFile {
     file_path?: string;
 }
 
-// Inline Keyboard Types
-export interface InlineKeyboardMarkup {
-    inline_keyboard: InlineKeyboardButton[][];
-}
-
-export interface InlineKeyboardButton {
-    text: string;
-    callback_data?: string;
-    url?: string;
-}
-
-// Analytics Types
-export interface UserRecord {
-    user_id: number;
-    username?: string;
-    first_name?: string;
-    last_name?: string;
-    language_code?: string;
-    first_seen: Date;
-    last_seen: Date;
-}
-
-export interface EventRecord {
-    id?: number;
-    user_id: number;
-    event_type: 'transcription' | 'summary';
-    media_type?: 'voice' | 'video_note' | 'audio' | 'video';
-    chat_type?: 'private' | 'group';
-    timestamp: Date;
-}
-
-export interface TotalStats {
-    total_transcriptions: number;
-    total_summaries: number;
-    total_users: number;
-    total_events: number;
+// Media info for processing
+export interface MediaInfo {
+    fileId: string;
+    fileExt: string;
+    mimeType: string;
+    mediaType: "voice" | "video_note" | "audio" | "video";
 }

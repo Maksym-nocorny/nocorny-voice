@@ -1,14 +1,15 @@
 {
     "compilerOptions": {
         "allowJs": true,
-        "esModuleInterop": true
-    },
-    "lint": {
-        "include": [
-            "supabase/functions/"
-        ]
+        "lib": [
+            "deno.window"
+        ],
+        "strict": true
     },
     "imports": {
-        "supabase": "https://esm.sh/@supabase/supabase-js@2"
+        "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2"
+    },
+    "tasks": {
+        "start": "supabase functions serve telegram-webhook --env-file .env"
     }
 }
