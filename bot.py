@@ -441,13 +441,7 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
         prompt = f"Summarize the following text concisely. The summary MUST be in the language '{user_lang}':\n\n{original_text}"
         response = model.generate_content([prompt])
         
-        # Track summary event
-        chat_type = 'private' if update.effective_chat.type == 'private' else 'group'
-        analytics.track_event(
-            user_id=user.id,
-            event_type='summary',
-            chat_type=chat_type
-        )
+
         
         # Delete status message
         await status_msg.delete()
