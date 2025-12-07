@@ -148,7 +148,7 @@ class Analytics:
     def get_chat_type_stats(self) -> Dict[str, int]:
         """Get statistics by chat type."""
         try:
-            res = self.supabase.table("events").select("chat_type").limit(1000).execute()
+            res = self.supabase.table("events").select("chat_type").eq("event_type", "transcription").limit(1000).execute()
             counts = {}
             for item in res.data:
                 ctype = item.get('chat_type')
@@ -163,7 +163,7 @@ class Analytics:
         """Get statistics for the last N days."""
         try:
             start_date = (datetime.now() - timedelta(days=days)).isoformat()
-            res = self.supabase.table("events").select("timestamp").gte("timestamp", start_date).limit(2000).execute()
+            res = self.supabase.table("events").select("timestamp").eq("event_type", "transcription").gte("timestamp", start_date).limit(2000).execute()
             
             counts = {}
             for item in res.data:
@@ -181,7 +181,7 @@ class Analytics:
         try:
             # Approximate months as 30 days
             start_date = (datetime.now() - timedelta(days=months*30)).isoformat()
-            res = self.supabase.table("events").select("timestamp").gte("timestamp", start_date).limit(5000).execute()
+            res = self.supabase.table("events").select("timestamp").eq("event_type", "transcription").gte("timestamp", start_date).limit(5000).execute()
             
             counts = {}
             for item in res.data:
@@ -197,7 +197,7 @@ class Analytics:
     def get_yearly_stats(self) -> List[Tuple[str, int]]:
         """Get statistics by year."""
         try:
-            res = self.supabase.table("events").select("timestamp").limit(5000).execute()
+            res = self.supabase.table("events").select("timestamp").eq("event_type", "transcription").limit(5000).execute()
             
             counts = {}
             for item in res.data:
@@ -214,7 +214,7 @@ class Analytics:
         """Get distribution of requests by hour of day (0-23)."""
         try:
             # Fetch recent events to approximate distribution logic
-            res = self.supabase.table("events").select("timestamp").limit(2000).execute()
+            res = self.supabase.table("events").select("timestamp").eq("event_type", "transcription").limit(2000).execute()
             
             counts = {}
             for item in res.data:
