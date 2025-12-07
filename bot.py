@@ -468,6 +468,10 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_unsupported_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Replies to unsupported message types."""
+    # Ignore group chats for unsupported content to avoid spam
+    if update.effective_chat.type != 'private':
+        return
+
     user = update.effective_user
     user_lang = user.language_code or 'en'
     await update.message.reply_text(get_text(user_lang, 'unsupported_content'))
