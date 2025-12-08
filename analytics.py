@@ -1,253 +1,299 @@
-import sqlite3
+import os
 import logging
 from datetime import datetime
-from pathlib import Path
 from typing import Optional, Dict, List, Tuple
+
+from supabase import create_client, Client
 
 logger = logging.getLogger(__name__)
 
+
 class Analytics:
-    """Analytics tracking for the Telegram bot."""
+    """Analytics tracking for the Telegram bot using Supabase."""
     
-    def __init__(self, db_path: str = "bot_analytics.db"):
-        """Initialize analytics with SQLite database."""
-        self.db_path = db_path
-        self._init_database()
+    def __init__(self):
+        """Initialize analytics with Supabase connection."""
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        
+        if not supabase_url or not supabase_key:
+            logger.warning("Supabase credentials not found. Analytics will be disabled.")
+            self.client = None
+            return
+        
+        self.client: Client = create_client(supabase_url, supabase_key)
+        logger.info("Supabase analytics initialized")
     
-    def _init_database(self):
-        """Create database tables if they don't exist."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            
-            # Users table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    language_code TEXT,
-                    first_seen TIMESTAMP,
-                    last_seen TIMESTAMP
-                )
-            """)
-            
-            # Events table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    event_type TEXT,
-                    media_type TEXT,
-                    chat_type TEXT,
-                    timestamp TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                )
-            """)
-            
-            # Create indexes for better query performance
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_events_user_id 
-                ON events(user_id)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_events_type 
-                ON events(event_type)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_events_timestamp 
-                ON events(timestamp)
-            """)
-            
-            conn.commit()
-            logger.info("Analytics database initialized")
+    def _is_enabled(self) -> bool:
+        """Check if analytics is enabled."""
+        return self.client is not None
     
     def track_user(self, user_id: int, username: Optional[str] = None, 
                    first_name: Optional[str] = None, last_name: Optional[str] = None,
                    language_code: Optional[str] = None):
         """Track or update user information."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            now = datetime.now()
+        if not self._is_enabled():
+            return
+        
+        try:
+            now = datetime.now().isoformat()
             
             # Check if user exists
-            cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-            exists = cursor.fetchone()
+            result = self.client.table('bot_users').select('user_id').eq('user_id', user_id).execute()
             
-            if exists:
+            if result.data:
                 # Update existing user
-                cursor.execute("""
-                    UPDATE users 
-                    SET username = ?, first_name = ?, last_name = ?, 
-                        language_code = ?, last_seen = ?
-                    WHERE user_id = ?
-                """, (username, first_name, last_name, language_code, now, user_id))
+                self.client.table('bot_users').update({
+                    'username': username,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'language_code': language_code,
+                    'last_seen': now
+                }).eq('user_id', user_id).execute()
             else:
                 # Insert new user
-                cursor.execute("""
-                    INSERT INTO users (user_id, username, first_name, last_name, 
-                                     language_code, first_seen, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (user_id, username, first_name, last_name, language_code, now, now))
-            
-            conn.commit()
+                self.client.table('bot_users').insert({
+                    'user_id': user_id,
+                    'username': username,
+                    'first_name': first_name,
+                    'last_name': last_name,
+                    'language_code': language_code,
+                    'first_seen': now,
+                    'last_seen': now
+                }).execute()
+        except Exception as e:
+            logger.error(f"Error tracking user: {e}")
     
     def track_event(self, user_id: int, event_type: str, 
                    media_type: Optional[str] = None, chat_type: Optional[str] = None):
         """Track an event (transcription, summary, etc.)."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO events (user_id, event_type, media_type, chat_type, timestamp)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, event_type, media_type, chat_type, datetime.now()))
-            conn.commit()
+        if not self._is_enabled():
+            return
+        
+        try:
+            self.client.table('bot_events').insert({
+                'user_id': user_id,
+                'event_type': event_type,
+                'media_type': media_type,
+                'chat_type': chat_type
+            }).execute()
+        except Exception as e:
+            logger.error(f"Error tracking event: {e}")
     
     def get_total_stats(self) -> Dict[str, int]:
         """Get overall statistics."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        if not self._is_enabled():
+            return {'total_transcriptions': 0, 'total_summaries': 0, 'total_users': 0, 'total_events': 0}
+        
+        try:
+            # Count transcriptions
+            trans_result = self.client.table('bot_events').select('id', count='exact').eq('event_type', 'transcription').execute()
+            total_transcriptions = trans_result.count or 0
             
-            # Total events by type
-            cursor.execute("""
-                SELECT event_type, COUNT(*) 
-                FROM events 
-                GROUP BY event_type
-            """)
-            event_counts = dict(cursor.fetchall())
+            # Count summaries
+            sum_result = self.client.table('bot_events').select('id', count='exact').eq('event_type', 'summary').execute()
+            total_summaries = sum_result.count or 0
             
-            # Total unique users
-            cursor.execute("SELECT COUNT(DISTINCT user_id) FROM users")
-            total_users = cursor.fetchone()[0]
+            # Count users
+            users_result = self.client.table('bot_users').select('user_id', count='exact').execute()
+            total_users = users_result.count or 0
             
-            # Total events
-            cursor.execute("SELECT COUNT(*) FROM events")
-            total_events = cursor.fetchone()[0]
+            # Count all events
+            events_result = self.client.table('bot_events').select('id', count='exact').execute()
+            total_events = events_result.count or 0
             
             return {
-                'total_transcriptions': event_counts.get('transcription', 0),
-                'total_summaries': event_counts.get('summary', 0),
+                'total_transcriptions': total_transcriptions,
+                'total_summaries': total_summaries,
                 'total_users': total_users,
                 'total_events': total_events
             }
+        except Exception as e:
+            logger.error(f"Error getting total stats: {e}")
+            return {'total_transcriptions': 0, 'total_summaries': 0, 'total_users': 0, 'total_events': 0}
     
     def get_media_type_stats(self) -> Dict[str, int]:
         """Get statistics by media type."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT media_type, COUNT(*) 
-                FROM events 
-                WHERE event_type = 'transcription' AND media_type IS NOT NULL
-                GROUP BY media_type
-            """)
-            return dict(cursor.fetchall())
+        if not self._is_enabled():
+            return {}
+        
+        try:
+            result = self.client.table('bot_events').select('media_type').eq('event_type', 'transcription').not_.is_('media_type', 'null').execute()
+            
+            stats = {}
+            for row in result.data:
+                media_type = row['media_type']
+                stats[media_type] = stats.get(media_type, 0) + 1
+            return stats
+        except Exception as e:
+            logger.error(f"Error getting media type stats: {e}")
+            return {}
     
     def get_top_users(self, limit: int = 10) -> List[Tuple[int, str, int]]:
         """Get top users by request count."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT u.user_id, u.username, COUNT(e.id) as request_count
-                FROM users u
-                LEFT JOIN events e ON u.user_id = e.user_id
-                GROUP BY u.user_id
-                ORDER BY request_count DESC
-                LIMIT ?
-            """, (limit,))
-            return cursor.fetchall()
+        if not self._is_enabled():
+            return []
+        
+        try:
+            # Get all events with user info
+            result = self.client.table('bot_events').select('user_id').execute()
+            
+            # Count events per user
+            user_counts = {}
+            for row in result.data:
+                user_id = row['user_id']
+                user_counts[user_id] = user_counts.get(user_id, 0) + 1
+            
+            # Get user details
+            users_result = self.client.table('bot_users').select('user_id, username').execute()
+            user_names = {u['user_id']: u['username'] for u in users_result.data}
+            
+            # Combine and sort
+            top_users = [(user_id, user_names.get(user_id), count) 
+                        for user_id, count in user_counts.items()]
+            top_users.sort(key=lambda x: x[2], reverse=True)
+            
+            return top_users[:limit]
+        except Exception as e:
+            logger.error(f"Error getting top users: {e}")
+            return []
     
     def get_user_stats(self, user_id: int) -> Dict[str, int]:
         """Get statistics for a specific user."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
+        if not self._is_enabled():
+            return {'transcriptions': 0, 'summaries': 0, 'total': 0}
+        
+        try:
+            result = self.client.table('bot_events').select('event_type').eq('user_id', user_id).execute()
             
-            # Count by event type
-            cursor.execute("""
-                SELECT event_type, COUNT(*) 
-                FROM events 
-                WHERE user_id = ?
-                GROUP BY event_type
-            """, (user_id,))
-            event_counts = dict(cursor.fetchall())
+            stats = {'transcription': 0, 'summary': 0}
+            for row in result.data:
+                event_type = row['event_type']
+                if event_type in stats:
+                    stats[event_type] += 1
             
             return {
-                'transcriptions': event_counts.get('transcription', 0),
-                'summaries': event_counts.get('summary', 0),
-                'total': sum(event_counts.values())
+                'transcriptions': stats.get('transcription', 0),
+                'summaries': stats.get('summary', 0),
+                'total': sum(stats.values())
             }
+        except Exception as e:
+            logger.error(f"Error getting user stats: {e}")
+            return {'transcriptions': 0, 'summaries': 0, 'total': 0}
     
     def get_language_distribution(self) -> Dict[str, int]:
         """Get distribution of user languages."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT language_code, COUNT(*) 
-                FROM users 
-                WHERE language_code IS NOT NULL
-                GROUP BY language_code
-                ORDER BY COUNT(*) DESC
-            """)
-            return dict(cursor.fetchall())
+        if not self._is_enabled():
+            return {}
+        
+        try:
+            result = self.client.table('bot_users').select('language_code').not_.is_('language_code', 'null').execute()
+            
+            stats = {}
+            for row in result.data:
+                lang = row['language_code']
+                stats[lang] = stats.get(lang, 0) + 1
+            return dict(sorted(stats.items(), key=lambda x: x[1], reverse=True))
+        except Exception as e:
+            logger.error(f"Error getting language distribution: {e}")
+            return {}
     
     def get_chat_type_stats(self) -> Dict[str, int]:
         """Get statistics by chat type (private vs group)."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT chat_type, COUNT(*) 
-                FROM events 
-                WHERE chat_type IS NOT NULL
-                GROUP BY chat_type
-            """)
-            return dict(cursor.fetchall())
+        if not self._is_enabled():
+            return {}
+        
+        try:
+            result = self.client.table('bot_events').select('chat_type').not_.is_('chat_type', 'null').execute()
+            
+            stats = {}
+            for row in result.data:
+                chat_type = row['chat_type']
+                stats[chat_type] = stats.get(chat_type, 0) + 1
+            return stats
+        except Exception as e:
+            logger.error(f"Error getting chat type stats: {e}")
+            return {}
     
     def get_daily_stats(self, days: int = 7) -> List[Tuple[str, int]]:
         """Get statistics for the last N days."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT DATE(timestamp) as day, COUNT(*) as count
-                FROM events
-                WHERE timestamp >= datetime('now', '-' || ? || ' days')
-                GROUP BY DATE(timestamp)
-                ORDER BY day DESC
-            """, (days,))
-            return cursor.fetchall()
+        if not self._is_enabled():
+            return []
+        
+        try:
+            from datetime import timedelta
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            
+            result = self.client.table('bot_events').select('created_at').gte('created_at', cutoff).execute()
+            
+            # Group by day
+            daily_counts = {}
+            for row in result.data:
+                day = row['created_at'][:10]  # Extract YYYY-MM-DD
+                daily_counts[day] = daily_counts.get(day, 0) + 1
+            
+            return sorted(daily_counts.items(), reverse=True)
+        except Exception as e:
+            logger.error(f"Error getting daily stats: {e}")
+            return []
     
     def get_monthly_stats(self, months: int = 6) -> List[Tuple[str, int]]:
         """Get statistics for the last N months."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT strftime('%Y-%m', timestamp) as month, COUNT(*) as count
-                FROM events
-                WHERE timestamp >= datetime('now', '-' || ? || ' months')
-                GROUP BY strftime('%Y-%m', timestamp)
-                ORDER BY month DESC
-            """, (months,))
-            return cursor.fetchall()
+        if not self._is_enabled():
+            return []
+        
+        try:
+            from datetime import timedelta
+            cutoff = (datetime.now() - timedelta(days=months * 30)).isoformat()
+            
+            result = self.client.table('bot_events').select('created_at').gte('created_at', cutoff).execute()
+            
+            # Group by month
+            monthly_counts = {}
+            for row in result.data:
+                month = row['created_at'][:7]  # Extract YYYY-MM
+                monthly_counts[month] = monthly_counts.get(month, 0) + 1
+            
+            return sorted(monthly_counts.items(), reverse=True)
+        except Exception as e:
+            logger.error(f"Error getting monthly stats: {e}")
+            return []
     
     def get_yearly_stats(self) -> List[Tuple[str, int]]:
         """Get statistics by year."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT strftime('%Y', timestamp) as year, COUNT(*) as count
-                FROM events
-                GROUP BY strftime('%Y', timestamp)
-                ORDER BY year DESC
-            """)
-            return cursor.fetchall()
+        if not self._is_enabled():
+            return []
+        
+        try:
+            result = self.client.table('bot_events').select('created_at').execute()
+            
+            # Group by year
+            yearly_counts = {}
+            for row in result.data:
+                year = row['created_at'][:4]  # Extract YYYY
+                yearly_counts[year] = yearly_counts.get(year, 0) + 1
+            
+            return sorted(yearly_counts.items(), reverse=True)
+        except Exception as e:
+            logger.error(f"Error getting yearly stats: {e}")
+            return []
     
     def get_hourly_distribution(self) -> Dict[int, int]:
         """Get distribution of requests by hour of day (0-23)."""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT CAST(strftime('%H', timestamp) AS INTEGER) as hour, COUNT(*) as count
-                FROM events
-                GROUP BY hour
-                ORDER BY hour
-            """)
-            return dict(cursor.fetchall())
+        if not self._is_enabled():
+            return {}
+        
+        try:
+            result = self.client.table('bot_events').select('created_at').execute()
+            
+            # Group by hour
+            hourly_counts = {}
+            for row in result.data:
+                # Parse ISO timestamp and extract hour
+                hour = int(row['created_at'][11:13])
+                hourly_counts[hour] = hourly_counts.get(hour, 0) + 1
+            
+            return dict(sorted(hourly_counts.items()))
+        except Exception as e:
+            logger.error(f"Error getting hourly distribution: {e}")
+            return {}
