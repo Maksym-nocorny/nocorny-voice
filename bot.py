@@ -75,10 +75,7 @@ TRANSLATIONS = {
         'stats_last_7_days': "Last 7 days:",
         'stats_last_6_months': "Last 6 months:",
         'stats_by_year': "By year:",
-        'stats_hourly': "\n**Peak Hours (UTC):**",
-        'chat_private': "Private Chat",
-        'chat_group': "Group Chat",
-        'unsupported_content': "I can only transcribe voice messages, video notes, and media files (MP3, WAV, OGG, M4A, MP4, MOV, AVI)."
+        'stats_hourly': "\n**Peak Hours (UTC):**"
     },
     'uk': {
         'welcome': "Привіт! Я бот для транскрипції. Надішліть мені голосове повідомлення або відеоповідомлення, і я транскрибую його за допомогою Gemini.",
@@ -109,10 +106,7 @@ TRANSLATIONS = {
         'stats_last_7_days': "Останні 7 днів:",
         'stats_last_6_months': "Останні 6 місяців:",
         'stats_by_year': "За роками:",
-        'stats_hourly': "\n**Пікові години (UTC):**",
-        'chat_private': "Приватний чат",
-        'chat_group': "Груповий чат",
-        'unsupported_content': "Я можу транскрибувати лише голосові, відеоповідомлення та медіафайли (MP3, WAV, OGG, M4A, MP4, MOV, AVI)."
+        'stats_hourly': "\n**Пікові години (UTC):**"
     },
     'ru': {
         'welcome': "Привет! Я бот для транскрипции. Отправьте мне голосовое сообщение или видеосообщение, и я транскрибирую его с помощью Gemini.",
@@ -143,10 +137,7 @@ TRANSLATIONS = {
         'stats_last_7_days': "Последние 7 дней:",
         'stats_last_6_months': "Последние 6 месяцев:",
         'stats_by_year': "По годам:",
-        'stats_hourly': "\n**Пиковые часы (UTC):**",
-        'chat_private': "Личный чат",
-        'chat_group': "Групповой чат",
-        'unsupported_content': "Я могу транскрибировать только голосовые, видеосообщения и медиафайлы (MP3, WAV, OGG, M4A, MP4, MOV, AVI)."
+        'stats_hourly': "\n**Пиковые часы (UTC):**"
     },
     'es': {
         'welcome': "¡Hola! Soy un bot de transcripción. Envíame un mensaje de voz o una nota de video, y lo transcribiré usando Gemini.",
@@ -450,7 +441,13 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
         prompt = f"Summarize the following text concisely. The summary MUST be in the language '{user_lang}':\n\n{original_text}"
         response = model.generate_content([prompt])
         
-
+        # Track summary event
+        chat_type = 'private' if update.effective_chat.type == 'private' else 'group'
+        analytics.track_event(
+            user_id=user.id,
+            event_type='summary',
+            chat_type=chat_type
+        )
         
         # Delete status message
         await status_msg.delete()
@@ -465,16 +462,6 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Error summarizing: {e}")
         await status_msg.edit_text(get_text(user_lang, 'summary_error', str(e)))
-
-async def handle_unsupported_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Replies to unsupported message types."""
-    # Ignore group chats for unsupported content to avoid spam
-    if update.effective_chat.type != 'private':
-        return
-
-    user = update.effective_user
-    user_lang = user.language_code or 'en'
-    await update.message.reply_text(get_text(user_lang, 'unsupported_content'))
 
 async def handle_chat_migration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle group to supergroup migration."""
@@ -538,7 +525,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat_stats:
             message += get_text(user_lang, 'stats_chat_types') + "\n"
             for chat_type, count in chat_stats.items():
-                message += f"• {get_text(user_lang, f'chat_{chat_type}', chat_type)}: {count}\n"
+                message += f"• {chat_type}: {count}\n"
         
         # Top users
         top_users = analytics.get_top_users(10)
@@ -609,18 +596,6 @@ if __name__ == '__main__':
     application.add_handler(migration_handler)  # Add migration handler before message handler
     application.add_handler(message_handler)
     application.add_handler(summary_handler)
-    
-    # Handle unsupported content (Text, Documents, Photos, etc) - excluding commands
-    unsupported_handler = MessageHandler(
-        (filters.TEXT & (~filters.COMMAND)) | 
-        filters.Document.ALL | 
-        filters.PHOTO | 
-        filters.Sticker.ALL |  
-        filters.LOCATION | 
-        filters.CONTACT, 
-        handle_unsupported_message
-    )
-    application.add_handler(unsupported_handler)
     
     # Check for Render environment
     PORT = os.getenv("PORT")
