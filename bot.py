@@ -283,7 +283,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
              file_id = update.message.video.file_id
              mime_type = update.message.video.mime_type or "video/mp4"
              # Determine file extension based on MIME type
-             mime_to_ext = {
+             video_mime_to_ext = {
                  "video/mp4": ".mp4",
                  "video/quicktime": ".mov",
                  "video/mov": ".mov",
@@ -297,8 +297,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  "video/wmv": ".wmv",
                  "video/x-ms-wmv": ".wmv"
              }
-             file_ext = mime_to_ext.get(mime_type, ".mp4")
+             file_ext = video_mime_to_ext.get(mime_type, ".mp4")
              media_type = "video"
+        elif update.message.document:
+            # Handle documents with audio/video MIME types (e.g., MOV files sent as documents)
+            doc = update.message.document
+            mime_type = doc.mime_type or ""
+            
+            # Supported audio MIME types for documents
+            audio_mime_to_ext = {
+                "audio/mpeg": ".mp3",
+                "audio/mp3": ".mp3",
+                "audio/ogg": ".ogg",
+                "audio/wav": ".wav",
+                "audio/x-wav": ".wav",
+                "audio/flac": ".flac",
+                "audio/aac": ".aac",
+                "audio/m4a": ".m4a",
+                "audio/x-m4a": ".m4a",
+                "audio/mp4": ".mp4",
+                "audio/webm": ".webm"
+            }
+            
+            # Supported video MIME types for documents
+            video_mime_to_ext = {
+                "video/mp4": ".mp4",
+                "video/quicktime": ".mov",
+                "video/mov": ".mov",
+                "video/avi": ".avi",
+                "video/x-msvideo": ".avi",
+                "video/webm": ".webm",
+                "video/mpeg": ".mpeg",
+                "video/x-flv": ".flv",
+                "video/flv": ".flv",
+                "video/3gpp": ".3gp",
+                "video/wmv": ".wmv",
+                "video/x-ms-wmv": ".wmv"
+            }
+            
+            if mime_type in audio_mime_to_ext:
+                file_id = doc.file_id
+                file_ext = audio_mime_to_ext[mime_type]
+                media_type = "audio_document"
+            elif mime_type in video_mime_to_ext:
+                file_id = doc.file_id
+                file_ext = video_mime_to_ext[mime_type]
+                media_type = "video_document"
+            else:
+                await status_message.edit_text(get_text(user_lang, 'unsupported'))
+                return
         else:
             await status_message.edit_text(get_text(user_lang, 'unsupported'))
             return
@@ -614,7 +661,7 @@ if __name__ == '__main__':
     
     start_handler = CommandHandler('start', start)
     stats_handler = CommandHandler('stats', stats)
-    message_handler = MessageHandler(filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO | filters.VIDEO, handle_message)
+    message_handler = MessageHandler(filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO | filters.VIDEO | filters.Document.ALL, handle_message)
     summary_handler = CallbackQueryHandler(handle_summary_callback, pattern="^summarize")
     migration_handler = MessageHandler(filters.StatusUpdate.MIGRATE, handle_chat_migration)
     
