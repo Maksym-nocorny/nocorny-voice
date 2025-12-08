@@ -78,7 +78,7 @@ TRANSLATIONS = {
         'stats_hourly': "\n**Peak Hours (UTC):**",
         'chat_private': "Private Chat",
         'chat_group': "Group Chat",
-        'unsupported_content': "I can only transcribe voice messages, video notes, audio and video files."
+        'unsupported_content': "I can only transcribe voice messages, video notes, and media files (MP3, WAV, OGG, M4A, MP4, MOV, AVI)."
     },
     'uk': {
         'welcome': "Привіт! Я бот для транскрипції. Надішліть мені голосове повідомлення або відеоповідомлення, і я транскрибую його за допомогою Gemini.",
@@ -112,7 +112,7 @@ TRANSLATIONS = {
         'stats_hourly': "\n**Пікові години (UTC):**",
         'chat_private': "Приватний чат",
         'chat_group': "Груповий чат",
-        'unsupported_content': "Я можу транскрибувати лише голосові повідомлення, відеоповідомлення, аудіо та відео."
+        'unsupported_content': "Я можу транскрибувати лише голосові, відеоповідомлення та медіафайли (MP3, WAV, OGG, M4A, MP4, MOV, AVI)."
     },
     'ru': {
         'welcome': "Привет! Я бот для транскрипции. Отправьте мне голосовое сообщение или видеосообщение, и я транскрибирую его с помощью Gemini.",
@@ -146,7 +146,7 @@ TRANSLATIONS = {
         'stats_hourly': "\n**Пиковые часы (UTC):**",
         'chat_private': "Личный чат",
         'chat_group': "Групповой чат",
-        'unsupported_content': "Я могу транскрибировать только голосовые сообщения, видеосообщения, аудио и видео."
+        'unsupported_content': "Я могу транскрибировать только голосовые, видеосообщения и медиафайлы (MP3, WAV, OGG, M4A, MP4, MOV, AVI)."
     },
     'es': {
         'welcome': "¡Hola! Soy un bot de transcripción. Envíame un mensaje de voz o una nota de video, y lo transcribiré usando Gemini.",
