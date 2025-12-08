@@ -2,7 +2,7 @@
 
 ## Overview
 
-The bot now includes built-in analytics tracking to monitor usage statistics.
+The bot includes built-in analytics tracking to monitor usage statistics, stored in Supabase PostgreSQL.
 
 ## Usage
 
@@ -13,6 +13,8 @@ Send `/stats` command to the bot to view analytics:
 - Top 10 most active users
 - Language distribution
 - Private vs group chat usage
+- Time-based statistics (daily, monthly, yearly)
+- Peak usage hours
 
 ## Data Tracked
 
@@ -23,8 +25,18 @@ Send `/stats` command to the bot to view analytics:
 
 ## Database
 
-Analytics data is stored in `bot_analytics.db` (SQLite) in the bot's root directory. The database is created automatically on first run and persists across restarts.
+Analytics data is stored in **Supabase PostgreSQL** with two tables:
+- `bot_users` - User profiles and activity timestamps
+- `bot_events` - Transcription and summary events
+
+Data persists across deployments and is accessible via Supabase dashboard.
+
+## Configuration
+
+Required environment variables:
+- `SUPABASE_URL` - Your Supabase project URL
+- `SUPABASE_KEY` - Your Supabase service role key
 
 ## Privacy
 
-All analytics are stored locally and are not shared with third parties. Only basic usage metrics are tracked to help understand bot usage patterns.
+All analytics are stored in your private Supabase project. Only basic usage metrics are tracked.
