@@ -47,7 +47,7 @@ last_transcriptions = {}
 # Translations
 TRANSLATIONS = {
     'en': {
-        'welcome': "Hi! I'm a transcription bot. Send me a voice message or a video note, and I'll transcribe it for you using Gemini.",
+        'welcome': "Hi! I'm a transcription bot. Send me a voice message, audio file, video, or video note, and I'll transcribe it for you using Gemini.",
         'downloading': "Downloading media...",
         'transcribing': "Transcribing with Gemini...",
         'unsupported': "Unsupported media type.",
@@ -78,7 +78,7 @@ TRANSLATIONS = {
         'stats_hourly': "\n**Peak Hours (UTC):**"
     },
     'uk': {
-        'welcome': "Привіт! Я бот для транскрипції. Надішліть мені голосове повідомлення або відеоповідомлення, і я транскрибую його за допомогою Gemini.",
+        'welcome': "Привіт! Я бот для транскрипції. Надішліть мені голосове повідомлення, аудіофайл, відео або відеоповідомлення, і я транскрибую його за допомогою Gemini.",
         'downloading': "Завантаження медіа...",
         'transcribing': "Транскрипція за допомогою Gemini...",
         'unsupported': "Непідтримуваний тип медіа.",
@@ -109,7 +109,7 @@ TRANSLATIONS = {
         'stats_hourly': "\n**Пікові години (UTC):**"
     },
     'ru': {
-        'welcome': "Привет! Я бот для транскрипции. Отправьте мне голосовое сообщение или видеосообщение, и я транскрибирую его с помощью Gemini.",
+        'welcome': "Привет! Я бот для транскрипции. Отправьте мне голосовое сообщение, аудиофайл, видео или видеосообщение, и я транскрибирую его с помощью Gemini.",
         'downloading': "Загрузка медиа...",
         'transcribing': "Транскрипция с помощью Gemini...",
         'unsupported': "Неподдерживаемый тип медиа.",
@@ -140,7 +140,7 @@ TRANSLATIONS = {
         'stats_hourly': "\n**Пиковые часы (UTC):**"
     },
     'es': {
-        'welcome': "¡Hola! Soy un bot de transcripción. Envíame un mensaje de voz o una nota de video, y lo transcribiré usando Gemini.",
+        'welcome': "¡Hola! Soy un bot de transcripción. Envíame un mensaje de voz, archivo de audio, video o nota de video, y lo transcribiré usando Gemini.",
         'downloading': "Descargando medios...",
         'transcribing': "Transcribiendo con Gemini...",
         'unsupported': "Tipo de medio no compatible.",
@@ -154,7 +154,7 @@ TRANSLATIONS = {
         'processing_failed': "Gemini no pudo procesar el archivo multimedia."
     },
     'de': {
-        'welcome': "Hallo! Ich bin ein Transkriptions-Bot. Sende mir eine Sprachnachricht oder eine Videonotiz, und ich transkribiere sie mit Gemini.",
+        'welcome': "Hallo! Ich bin ein Transkriptions-Bot. Sende mir eine Sprachnachricht, Audiodatei, Video oder Videonotiz, und ich transkribiere sie mit Gemini.",
         'downloading': "Medien werden heruntergeladen...",
         'transcribing': "Transkribieren mit Gemini...",
         'unsupported': "Nicht unterstützter Medientyp.",
@@ -168,7 +168,7 @@ TRANSLATIONS = {
         'processing_failed': "Gemini konnte die Mediendatei nicht verarbeiten."
     },
     'fr': {
-        'welcome': "Salut! Je suis un bot de transcription. Envoyez-moi un message vocal ou une note vidéo, et je le transcrirai avec Gemini.",
+        'welcome': "Salut! Je suis un bot de transcription. Envoyez-moi un message vocal, fichier audio, vidéo ou note vidéo, et je le transcrirai avec Gemini.",
         'downloading': "Téléchargement du média...",
         'transcribing': "Transcription avec Gemini...",
         'unsupported': "Type de média non pris en charge.",
@@ -182,7 +182,7 @@ TRANSLATIONS = {
         'processing_failed': "Gemini n'a pas pu traiter le fichier multimédia."
     },
     'it': {
-        'welcome': "Ciao! Sono un bot di trascrizione. Inviami un messaggio vocale o una nota video e lo trascriverò usando Gemini.",
+        'welcome': "Ciao! Sono un bot di trascrizione. Inviami un messaggio vocale, file audio, video o nota video e lo trascriverò usando Gemini.",
         'downloading': "Download del media...",
         'transcribing': "Trascrizione con Gemini...",
         'unsupported': "Tipo di media non supportato.",
@@ -196,7 +196,7 @@ TRANSLATIONS = {
         'processing_failed': "Gemini non è riuscito a elaborare il file multimediale."
     },
     'pl': {
-        'welcome': "Cześć! Jestem botem do transkrypcji. Wyślij mi wiadomość głosową lub notatkę wideo, a przepiszę ją za pomocą Gemini.",
+        'welcome': "Cześć! Jestem botem do transkrypcji. Wyślij mi wiadomość głosową, plik audio, wideo lub notatkę wideo, a przepiszę ją za pomocą Gemini.",
         'downloading': "Pobieranie mediów...",
         'transcribing': "Transkrypcja za pomocą Gemini...",
         'unsupported': "Nieobsługiwany typ mediów.",
@@ -264,13 +264,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media_type = "video_note"
         elif update.message.audio:
              file_id = update.message.audio.file_id
-             file_ext = ".mp3"
              mime_type = update.message.audio.mime_type or "audio/mpeg"
+             # Determine file extension based on MIME type
+             mime_to_ext = {
+                 "audio/mpeg": ".mp3",
+                 "audio/mp3": ".mp3",
+                 "audio/ogg": ".ogg",
+                 "audio/wav": ".wav",
+                 "audio/flac": ".flac",
+                 "audio/aac": ".aac",
+                 "audio/m4a": ".m4a",
+                 "audio/mp4": ".mp4",
+                 "audio/webm": ".webm"
+             }
+             file_ext = mime_to_ext.get(mime_type, ".mp3")
              media_type = "audio"
         elif update.message.video:
              file_id = update.message.video.file_id
-             file_ext = ".mp4"
              mime_type = update.message.video.mime_type or "video/mp4"
+             # Determine file extension based on MIME type
+             mime_to_ext = {
+                 "video/mp4": ".mp4",
+                 "video/quicktime": ".mov",
+                 "video/mov": ".mov",
+                 "video/avi": ".avi",
+                 "video/x-msvideo": ".avi",
+                 "video/webm": ".webm",
+                 "video/mpeg": ".mpeg",
+                 "video/x-flv": ".flv",
+                 "video/flv": ".flv",
+                 "video/3gpp": ".3gp",
+                 "video/wmv": ".wmv",
+                 "video/x-ms-wmv": ".wmv"
+             }
+             file_ext = mime_to_ext.get(mime_type, ".mp4")
              media_type = "video"
         else:
             await status_message.edit_text(get_text(user_lang, 'unsupported'))
