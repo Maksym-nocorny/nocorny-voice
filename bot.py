@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 import google.generativeai as genai
-from analytics import Analytics
 
 # Load environment variables
 load_dotenv()
@@ -23,7 +22,6 @@ logger = logging.getLogger(__name__)
 # Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")  # Optional: restrict /stats to admin only
 
 if not GEMINI_API_KEY:
     logger.error("GEMINI_API_KEY not found in .env file")
@@ -35,9 +33,6 @@ if not TELEGRAM_BOT_TOKEN:
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-
-# Initialize Analytics
-analytics = Analytics()
 
 # Store last transcription: {(chat_id, message_id): text}
 # For private chats, message_id is the transcription message id
@@ -222,14 +217,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_lang = user.language_code or 'en'
     
-    # Track user
-    analytics.track_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-        language_code=user_lang
-    )
     
     await update.message.reply_text(get_text(user_lang, 'welcome'))
 
@@ -238,15 +225,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_lang = user.language_code or 'en'
     
-    # Track user
-    analytics.track_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-        language_code=user_lang
-    )
+    # Check if we should ignore this message (Group chat + Audio/Video file)
+    is_group = update.effective_chat.type in ['group', 'supergroup']
+    is_voice_or_video_note = bool(update.message.voice or update.message.video_note)
     
+    if is_group and not is_voice_or_video_note:
+        # In groups, we only process Voice Messages and Video Notes
+        # We silently ignore Audio files and Video files to avoid spam
+        return
+
     status_message = await update.message.reply_text(get_text(user_lang, 'downloading'))
     
     try:
@@ -302,15 +289,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Cleanup local file
         os.remove(temp_path)
-        
-        # Track transcription event
-        chat_type = 'private' if update.effective_chat.type == 'private' else 'group'
-        analytics.track_event(
-            user_id=user.id,
-            event_type='transcription',
-            media_type=media_type,
-            chat_type=chat_type
-        )
         
         # Store transcription
         chat_id = update.effective_chat.id
@@ -399,15 +377,6 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
     user_lang = user.language_code or 'en'
     chat_id = update.effective_chat.id
     
-    # Track user
-    analytics.track_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-        language_code=user_lang
-    )
-    
     # Extract message_id from callback_data
     callback_data = query.data
     if callback_data.startswith("summarize_"):
@@ -441,14 +410,6 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
         prompt = f"Summarize the following text concisely. The summary MUST be in the language '{user_lang}':\n\n{original_text}"
         response = model.generate_content([prompt])
         
-        # Track summary event
-        chat_type = 'private' if update.effective_chat.type == 'private' else 'group'
-        analytics.track_event(
-            user_id=user.id,
-            event_type='summary',
-            chat_type=chat_type
-        )
-        
         # Delete status message
         await status_msg.delete()
         
@@ -478,126 +439,15 @@ async def handle_chat_migration(update: Update, context: ContextTypes.DEFAULT_TY
     
     logger.info(f"Migrated {len(keys_to_migrate)} transcriptions")
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Display bot statistics."""
-    user = update.effective_user
-    user_lang = user.language_code or 'en'
-    
-    # Check if user is admin (if ADMIN_USER_ID is set)
-    if ADMIN_USER_ID and str(user.id) != ADMIN_USER_ID:
-        await update.message.reply_text(get_text(user_lang, 'stats_unauthorized'))
-        logger.warning(f"Unauthorized stats access attempt by user {user.id} (@{user.username})")
-        return
-    
-    # Track user
-    analytics.track_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-        language_code=user_lang
-    )
-    
-    try:
-        # Get statistics
-        total_stats = analytics.get_total_stats()
-        
-        if total_stats['total_events'] == 0:
-            await update.message.reply_text(get_text(user_lang, 'stats_no_data'))
-            return
-        
-        # Build stats message
-        message = get_text(user_lang, 'stats_title') + "\n\n"
-        message += get_text(user_lang, 'stats_total') + "\n"
-        message += get_text(user_lang, 'stats_transcriptions', total_stats['total_transcriptions']) + "\n"
-        message += get_text(user_lang, 'stats_summaries', total_stats['total_summaries']) + "\n"
-        message += get_text(user_lang, 'stats_users', total_stats['total_users']) + "\n"
-        
-        # Media types
-        media_stats = analytics.get_media_type_stats()
-        if media_stats:
-            message += get_text(user_lang, 'stats_media_types') + "\n"
-            for media_type, count in media_stats.items():
-                message += f"• {media_type}: {count}\n"
-        
-        # Chat types
-        chat_stats = analytics.get_chat_type_stats()
-        if chat_stats:
-            message += get_text(user_lang, 'stats_chat_types') + "\n"
-            for chat_type, count in chat_stats.items():
-                message += f"• {chat_type}: {count}\n"
-        
-        # Top users
-        top_users = analytics.get_top_users(10)
-        if top_users:
-            message += get_text(user_lang, 'stats_top_users') + "\n"
-            for i, (user_id, username, count) in enumerate(top_users, 1):
-                # Escape underscores in usernames for Markdown
-                if username:
-                    safe_username = username.replace("_", "\\_")
-                    display_name = f"@{safe_username}"
-                else:
-                    display_name = f"User {user_id}"
-                message += get_text(user_lang, 'stats_user_rank', i, display_name, count) + "\n"
-        
-        # Language distribution
-        lang_stats = analytics.get_language_distribution()
-        if lang_stats:
-            message += get_text(user_lang, 'stats_languages') + "\n"
-            for lang, count in lang_stats.items():
-                message += f"• {lang}: {count}\n"
-        
-        # Time-based statistics
-        message += get_text(user_lang, 'stats_time_based') + "\n"
-        
-        # Last 7 days
-        daily_stats = analytics.get_daily_stats(7)
-        if daily_stats:
-            message += f"\n{get_text(user_lang, 'stats_last_7_days')}\n"
-            for day, count in daily_stats:
-                message += f"• {day}: {count}\n"
-        
-        # Last 6 months
-        monthly_stats = analytics.get_monthly_stats(6)
-        if monthly_stats:
-            message += f"\n{get_text(user_lang, 'stats_last_6_months')}\n"
-            for month, count in monthly_stats:
-                message += f"• {month}: {count}\n"
-        
-        # By year
-        yearly_stats = analytics.get_yearly_stats()
-        if yearly_stats:
-            message += f"\n{get_text(user_lang, 'stats_by_year')}\n"
-            for year, count in yearly_stats:
-                message += f"• {year}: {count}\n"
-        
-        # Hourly distribution (top 5 peak hours)
-        hourly_stats = analytics.get_hourly_distribution()
-        if hourly_stats:
-            message += get_text(user_lang, 'stats_hourly') + "\n"
-            sorted_hours = sorted(hourly_stats.items(), key=lambda x: x[1], reverse=True)[:5]
-            for hour, count in sorted_hours:
-                message += f"• {hour:02d}:00 - {count} requests\n"
-        
-        await update.message.reply_text(message, parse_mode='Markdown')
-        
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        await update.message.reply_text(get_text(user_lang, 'error', str(e)))
-
-
-
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
     start_handler = CommandHandler('start', start)
-    stats_handler = CommandHandler('stats', stats)
     message_handler = MessageHandler(filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO | filters.VIDEO, handle_message)
     summary_handler = CallbackQueryHandler(handle_summary_callback, pattern="^summarize")
     migration_handler = MessageHandler(filters.StatusUpdate.MIGRATE, handle_chat_migration)
     
     application.add_handler(start_handler)
-    application.add_handler(stats_handler)
     application.add_handler(migration_handler)  # Add migration handler before message handler
     application.add_handler(message_handler)
     application.add_handler(summary_handler)

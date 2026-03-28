@@ -1,4 +1,4 @@
 python-telegram-bot[webhooks]
 google-generativeai
 python-dotenv
-supabase
+
