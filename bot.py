@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 import google.generativeai as genai
+from google.api_core import exceptions
 
 # Load environment variables
 load_dotenv()
@@ -70,7 +71,8 @@ TRANSLATIONS = {
         'stats_last_7_days': "Last 7 days:",
         'stats_last_6_months': "Last 6 months:",
         'stats_by_year': "By year:",
-        'stats_hourly': "\n**Peak Hours (UTC):**"
+        'stats_hourly': "\n**Peak Hours (UTC):**",
+        'rate_limit_error': "Gemini is a bit busy right now due to high demand. ⏳ Please wait a minute and try again!"
     },
     'uk': {
         'welcome': "Привіт! Я бот для транскрипції. Надішліть мені голосове повідомлення, аудіофайл, відео або відеоповідомлення, і я транскрибую його за допомогою Gemini.",
@@ -101,7 +103,8 @@ TRANSLATIONS = {
         'stats_last_7_days': "Останні 7 днів:",
         'stats_last_6_months': "Останні 6 місяців:",
         'stats_by_year': "За роками:",
-        'stats_hourly': "\n**Пікові години (UTC):**"
+        'stats_hourly': "\n**Пікові години (UTC):**",
+        'rate_limit_error': "Gemini зараз трохи зайнятий через високий попит. ⏳ Будь ласка, зачекайте хвилинку і спробуйте ще раз!"
     },
     'ru': {
         'welcome': "Привет! Я бот для транскрипции. Отправьте мне голосовое сообщение, аудиофайл, видео или видеосообщение, и я транскрибирую его с помощью Gemini.",
@@ -132,7 +135,8 @@ TRANSLATIONS = {
         'stats_last_7_days': "Последние 7 дней:",
         'stats_last_6_months': "Последние 6 месяцев:",
         'stats_by_year': "По годам:",
-        'stats_hourly': "\n**Пиковые часы (UTC):**"
+        'stats_hourly': "\n**Пиковые часы (UTC):**",
+        'rate_limit_error': "Gemini сейчас немного занят из-за высокого спроса. ⏳ Пожалуйста, подождите минутку и попробуйте еще раз!"
     },
     'es': {
         'welcome': "¡Hola! Soy un bot de transcripción. Envíame un mensaje de voz, archivo de audio, video o nota de video, y lo transcribiré usando Gemini.",
@@ -146,7 +150,8 @@ TRANSLATIONS = {
         'summarizing': "**Transcripción:**\n\n{}\n\n_Resumiendo..._",
         'summary_label': "**Resumen:**\n\n{}",
         'summary_error': "Error al generar resumen: {}",
-        'processing_failed': "Gemini no pudo procesar el archivo multimedia."
+        'processing_failed': "Gemini no pudo procesar el archivo multimedia.",
+        'rate_limit_error': "Gemini está un poco ocupado en este momento debido a la alta demanda. ⏳ ¡Por favor, espera un minuto e inténtalo de nuevo!"
     },
     'de': {
         'welcome': "Hallo! Ich bin ein Transkriptions-Bot. Sende mir eine Sprachnachricht, Audiodatei, Video oder Videonotiz, und ich transkribiere sie mit Gemini.",
@@ -160,7 +165,8 @@ TRANSLATIONS = {
         'summarizing': "**Transkription:**\n\n{}\n\n_Zusammenfassen..._",
         'summary_label': "**Zusammenfassung:**\n\n{}",
         'summary_error': "Fehler beim Erstellen der Zusammenfassung: {}",
-        'processing_failed': "Gemini konnte die Mediendatei nicht verarbeiten."
+        'processing_failed': "Gemini konnte die Mediendatei nicht verarbeiten.",
+        'rate_limit_error': "Gemini ist momentan aufgrund hoher Nachfrage etwas beschäftigt. ⏳ Bitte warte eine Minute und versuche es erneut!"
     },
     'fr': {
         'welcome': "Salut! Je suis un bot de transcription. Envoyez-moi un message vocal, fichier audio, vidéo ou note vidéo, et je le transcrirai avec Gemini.",
@@ -174,7 +180,8 @@ TRANSLATIONS = {
         'summarizing': "**Transcription:**\n\n{}\n\n_Résumé en cours..._",
         'summary_label': "**Résumé:**\n\n{}",
         'summary_error': "Erreur lors de la génération du résumé: {}",
-        'processing_failed': "Gemini n'a pas pu traiter le fichier multimédia."
+        'processing_failed': "Gemini n'a pas pu traiter le fichier multimédia.",
+        'rate_limit_error': "Gemini est un peu occupé en ce moment en raison d'une forte demande. ⏳ Veuillez attendre une minute et réessayer !"
     },
     'it': {
         'welcome': "Ciao! Sono un bot di trascrizione. Inviami un messaggio vocale, file audio, video o nota video e lo trascriverò usando Gemini.",
@@ -188,7 +195,8 @@ TRANSLATIONS = {
         'summarizing': "**Trascrizione:**\n\n{}\n\n_Riassumendo..._",
         'summary_label': "**Riassunto:**\n\n{}",
         'summary_error': "Errore nella generazione del riassunto: {}",
-        'processing_failed': "Gemini non è riuscito a elaborare il file multimediale."
+        'processing_failed': "Gemini non è riuscito a elaborare il file multimediale.",
+        'rate_limit_error': "Gemini è un po' occupato al momento a causa dell'alta domanda. ⏳ Per favore, aspetta un minuto e riprova!"
     },
     'pl': {
         'welcome': "Cześć! Jestem botem do transkrypcji. Wyślij mi wiadomość głosową, plik audio, wideo lub notatkę wideo, a przepiszę ją za pomocą Gemini.",
@@ -202,7 +210,8 @@ TRANSLATIONS = {
         'summarizing': "**Transkrypcja:**\n\n{}\n\n_Podsumowuję..._",
         'summary_label': "**Podsumowanie:**\n\n{}",
         'summary_error': "Błąd generowania podsumowania: {}",
-        'processing_failed': "Gemini nie udało się przetworzyć pliku multimedialnego."
+        'processing_failed': "Gemini nie udało się przetworzyć pliku multimedialnego.",
+        'rate_limit_error': "Gemini jest teraz nieco zajęty ze względu na duże zainteresowanie. ⏳ Poczekaj chwilkę i spróbuj ponownie!"
     }
 }
 
@@ -284,8 +293,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError(get_text(user_lang, 'processing_failed'))
 
         # Generate content
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        response = model.generate_content(["Transcribe this audio/video exactly as spoken.", gemini_file])
+        try:
+            model = genai.GenerativeModel('gemini-2.5-flash-lite')
+            response = model.generate_content(["Transcribe this audio/video exactly as spoken.", gemini_file])
+        except exceptions.ResourceExhausted:
+            await status_message.edit_text(get_text(user_lang, 'rate_limit_error'))
+            return
         
         # Cleanup local file
         os.remove(temp_path)
@@ -406,9 +419,12 @@ async def handle_summary_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
         prompt = f"Summarize the following text concisely. The summary MUST be in the language '{user_lang}':\n\n{original_text}"
         response = model.generate_content([prompt])
+    except exceptions.ResourceExhausted:
+        await status_msg.edit_text(get_text(user_lang, 'rate_limit_error'))
+        return
         
         # Delete status message
         await status_msg.delete()
