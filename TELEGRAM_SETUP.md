@@ -29,7 +29,7 @@ Follow these step-by-step instructions to get your **Telegram Bot Token**.
 2.  In that message, find the section that says:
     > Use this token to access the HTTP API:
 3.  You will see a long string of characters that looks like this:
-    `792834012:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw`
+    `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`
 4.  **Copy this entire string**. This is your **API Token**.
 
 ## Step 4: Add Token to Your Project
@@ -39,7 +39,7 @@ Follow these step-by-step instructions to get your **Telegram Bot Token**.
 3.  Find the line `TELEGRAM_BOT_TOKEN=`.
 4.  Paste your token there. It should look like this:
     ```env
-    TELEGRAM_BOT_TOKEN=792834012:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw
+    TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
     ```
 5.  **Save** the file.
 
