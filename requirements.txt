@@ -1,4 +1,4 @@
-python-telegram-bot[webhooks]
-google-generativeai
-python-dotenv
-
+python-telegram-bot[webhooks]==22.5
+google-generativeai==0.8.5
+python-dotenv==1.2.1
+cachetools==6.2.2
