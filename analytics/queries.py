@@ -560,12 +560,19 @@ async def _latency_percentile(p: asyncpg.Pool, q: float, interval: str) -> int:
 
 
 async def _error_rate(p: asyncpg.Pool, interval: str) -> float:
+    # Denominator is outcome-based (success + known failure classes), not
+    # `transcribe_request`. The handler's outer try/except can record errors from
+    # before `transcribe_request` is tracked (download, L2 lookup) or after
+    # (cache write, send), so a request-based denominator under-counts and the
+    # ratio can exceed 1.
     val = await p.fetchval(f"""
         SELECT
             COALESCE(
                 count(*) FILTER (WHERE event_type IN
                     ('error_unknown','processing_failed','rate_limited_gemini'))::float /
-                NULLIF(count(*) FILTER (WHERE event_type='transcribe_request'),0),
+                NULLIF(count(*) FILTER (WHERE event_type IN
+                    ('transcribe_success','error_unknown',
+                     'processing_failed','rate_limited_gemini')),0),
                 0
             )
         FROM nocorny_voice.events
