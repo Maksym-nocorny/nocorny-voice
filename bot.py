@@ -7,6 +7,7 @@ import sys
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -21,7 +22,7 @@ from config import (
     WEBHOOK_URL,
 )
 from handlers.start import start
-from handlers.stats import stats_command
+from handlers.stats import stats_callback, stats_command
 from handlers.transcribe import handle_message
 from utils.logging_setup import setup_logging
 
@@ -56,6 +57,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CallbackQueryHandler(stats_callback, pattern="^stats:"))
     app.add_handler(
         MessageHandler(
             filters.VOICE | filters.VIDEO_NOTE | filters.AUDIO | filters.VIDEO,
