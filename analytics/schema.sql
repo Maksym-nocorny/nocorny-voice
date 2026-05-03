@@ -38,3 +38,13 @@ CREATE INDEX IF NOT EXISTS events_type_ts           ON nocorny_voice.events (eve
 CREATE INDEX IF NOT EXISTS events_success_user      ON nocorny_voice.events (user_id) WHERE event_type = 'transcribe_success';
 CREATE INDEX IF NOT EXISTS users_last_seen_desc     ON nocorny_voice.users (last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS users_total_events_desc  ON nocorny_voice.users (total_events DESC);
+
+CREATE TABLE IF NOT EXISTS nocorny_voice.transcription_cache (
+    content_hash   text         PRIMARY KEY,
+    text           text         NOT NULL,
+    created_at     timestamptz  NOT NULL DEFAULT now(),
+    last_hit_at    timestamptz  NOT NULL DEFAULT now(),
+    hit_count      integer      NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS transcription_cache_last_hit ON nocorny_voice.transcription_cache (last_hit_at);

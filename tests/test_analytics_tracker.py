@@ -142,7 +142,8 @@ async def test_drainer_calls_executemany_when_pool_present(monkeypatch):
     monkeypatch.setattr(analytics_pool, "get", lambda: FakePool())
 
     tracker.configure(queue_size=50, batch_size=10, flush_interval_sec=0.05,
-                      heartbeat_interval_sec=10_000, retention_days=90)
+                      heartbeat_interval_sec=10_000, retention_days=90,
+                      cache_l2_ttl_days=14)
     tracker.start()
     try:
         for _ in range(3):
@@ -190,7 +191,8 @@ async def test_drainer_survives_db_errors(monkeypatch):
     monkeypatch.setattr(analytics_pool, "get", lambda: FakePool())
 
     tracker.configure(queue_size=50, batch_size=10, flush_interval_sec=0.05,
-                      heartbeat_interval_sec=10_000, retention_days=90)
+                      heartbeat_interval_sec=10_000, retention_days=90,
+                      cache_l2_ttl_days=14)
     tracker.start()
     try:
         tracker.track("start_command", user=_user(), chat=_chat())

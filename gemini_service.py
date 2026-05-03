@@ -153,7 +153,7 @@ async def transcribe(file_path: str, mime_type: str) -> GeminiResult:
         async def _call():
             return await asyncio.to_thread(
                 model.generate_content,
-                ["Transcribe this audio/video.", gemini_file],
+                [gemini_file],
             )
 
         response = await _retry(_call)

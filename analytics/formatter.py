@@ -12,6 +12,7 @@ from .queries import (
     OverviewSection,
     PerfSection,
     TopUser,
+    TopUserByCost,
     TopUserByTokens,
     UsersSection,
 )
@@ -50,6 +51,12 @@ def _fmt_minutes(m: float) -> str:
     return f"{m:.1f}m"
 
 
+def _fmt_usd(x: float) -> str:
+    if x >= 1:
+        return f"${x:.2f}"
+    return f"${x:.4f}"
+
+
 def _fmt_top_users(users: list[TopUser]) -> str:
     if not users:
         return "  (none)"
@@ -65,6 +72,15 @@ def _fmt_top_users_tokens(users: list[TopUserByTokens]) -> str:
     lines = []
     for i, u in enumerate(users, 1):
         lines.append(f"  {i}. {_user_label(u)} — {_fmt_tokens(u.tokens)}")
+    return "\n".join(lines)
+
+
+def _fmt_top_users_cost(users: list[TopUserByCost]) -> str:
+    if not users:
+        return "  (none)"
+    lines = []
+    for i, u in enumerate(users, 1):
+        lines.append(f"  {i}. {_user_label(u)} — {_fmt_usd(u.cost_usd)}")
     return "\n".join(lines)
 
 
@@ -116,6 +132,11 @@ def render_overview(s: Optional[OverviewSection]) -> str:
 def render_users(s: Optional[UsersSection]) -> str:
     if s is None:
         return _empty("Analytics not available.")
+    cost_block = (
+        f"<b>Top users (30d, by cost)</b>\n{_fmt_top_users_cost(s.top_users_by_cost_30d)}\n\n"
+        if s.top_users_by_cost_30d and s.top_users_by_cost_30d[0].cost_usd > 0
+        else ""
+    )
     return (
         f"<b>Nocorny.voice — users</b>\n"
         f"<i>{_now_utc()}</i>\n\n"
@@ -126,6 +147,7 @@ def render_users(s: Optional[UsersSection]) -> str:
         f"<b>Top users (all-time, by events)</b>\n{_fmt_top_users(s.top_users_all)}\n\n"
         f"<b>Top users (30d, by events)</b>\n{_fmt_top_users(s.top_users_30d)}\n\n"
         f"<b>Top users (30d, by tokens)</b>\n{_fmt_top_users_tokens(s.top_users_by_tokens_30d)}\n\n"
+        f"{cost_block}"
         f"<b>Languages</b>\n{_fmt_grouped(s.languages)}"
     )
 
@@ -179,6 +201,17 @@ def render_perf(s: Optional[PerfSection]) -> str:
 def render_cost(s: Optional[CostSection]) -> str:
     if s is None:
         return _empty("Analytics not available.")
+    cost_block = ""
+    if s.price_per_1m_input > 0 or s.price_per_1m_output > 0:
+        cost_block = (
+            f"<b>Cost (USD)</b>\n"
+            f"  • Lifetime: {_fmt_usd(s.cost_usd_lifetime)}\n"
+            f"  • 30d:      {_fmt_usd(s.cost_usd_30d)}\n"
+            f"  • 24h:      {_fmt_usd(s.cost_usd_24h)}\n"
+            f"  • Avg/req (30d): {_fmt_usd(s.avg_cost_usd_per_request_30d)}\n"
+            f"  <i>at ${s.price_per_1m_input:.2f}/1M in · "
+            f"${s.price_per_1m_output:.2f}/1M out</i>\n\n"
+        )
     return (
         f"<b>Nocorny.voice — cost</b>\n"
         f"<i>{_now_utc()}</i>\n\n"
@@ -187,6 +220,7 @@ def render_cost(s: Optional[CostSection]) -> str:
         f"  • 30d:      {_fmt_tokens(s.total_tokens_30d)}\n"
         f"  • 24h:      {_fmt_tokens(s.total_tokens_24h)}\n"
         f"  • Avg/req (30d): {s.avg_tokens_per_request_30d:.0f}\n\n"
+        f"{cost_block}"
         f"<b>Audio processed</b>\n"
         f"  • Lifetime: {_fmt_minutes(s.minutes_lifetime)}\n"
         f"  • 30d:      {_fmt_minutes(s.minutes_30d)}\n\n"
