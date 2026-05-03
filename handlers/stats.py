@@ -41,14 +41,14 @@ def nav_keyboard(
         if page < total_pages:
             pg_row.append(InlineKeyboardButton("→", callback_data=f"stats:{current}:{page + 1}"))
         rows.append(pg_row)
-    nav_row = [
-        InlineKeyboardButton(
+    def _btn(key: str, label: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
             f"· {label} ·" if key == current else label,
             callback_data=f"stats:{key}:1",
         )
-        for key, label in _SECTIONS
-    ]
-    rows.append(nav_row)
+
+    rows.append([_btn("overview", "Overview"), _btn("users", "Users")])
+    rows.append([_btn("content", "Content"), _btn("perf", "Perf"), _btn("cost", "Cost")])
     return InlineKeyboardMarkup(rows)
 
 
