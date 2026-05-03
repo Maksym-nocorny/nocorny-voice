@@ -39,6 +39,7 @@ from .queries import (
     get_overview,
     get_perf_section,
     get_users_section,
+    TopGroup,
 )
 from .tracker import track
 
@@ -99,4 +100,5 @@ __all__ = [
     "render_content",
     "render_perf",
     "render_cost",
+    "TopGroup",
 ]

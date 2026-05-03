@@ -39,6 +39,18 @@ CREATE INDEX IF NOT EXISTS events_success_user      ON nocorny_voice.events (use
 CREATE INDEX IF NOT EXISTS users_last_seen_desc     ON nocorny_voice.users (last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS users_total_events_desc  ON nocorny_voice.users (total_events DESC);
 
+CREATE TABLE IF NOT EXISTS nocorny_voice.chats (
+    chat_id        bigint       PRIMARY KEY,
+    chat_type      text         NOT NULL,
+    chat_title     text,
+    username       text,
+    first_seen_at  timestamptz  NOT NULL DEFAULT now(),
+    last_seen_at   timestamptz  NOT NULL DEFAULT now(),
+    total_events   integer      NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS chats_total_events_desc ON nocorny_voice.chats (total_events DESC);
+
 CREATE TABLE IF NOT EXISTS nocorny_voice.transcription_cache (
     content_hash   text         PRIMARY KEY,
     text           text         NOT NULL,

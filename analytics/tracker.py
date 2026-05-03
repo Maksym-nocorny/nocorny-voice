@@ -22,7 +22,7 @@ from . import pool
 
 logger = logging.getLogger(__name__)
 
-# Two-statement upsert + insert. Using a single CTE keeps it to one round-trip per row.
+# Three-way upsert + insert in one CTE round-trip: users, chats, events.
 _TRACK_SQL = """
 WITH u AS (
     INSERT INTO nocorny_voice.users
@@ -37,6 +37,17 @@ WITH u AS (
         last_seen_at  = now(),
         total_events  = nocorny_voice.users.total_events + 1
     RETURNING user_id
+),
+c AS (
+    INSERT INTO nocorny_voice.chats
+        (chat_id, chat_type, chat_title, username, first_seen_at, last_seen_at, total_events)
+    VALUES ($6, $7, $19, $20, now(), now(), 1)
+    ON CONFLICT (chat_id) DO UPDATE SET
+        chat_type    = EXCLUDED.chat_type,
+        chat_title   = COALESCE(EXCLUDED.chat_title, nocorny_voice.chats.chat_title),
+        username     = COALESCE(EXCLUDED.username, nocorny_voice.chats.username),
+        last_seen_at = now(),
+        total_events = nocorny_voice.chats.total_events + 1
 )
 INSERT INTO nocorny_voice.events
     (ts, user_id, chat_id, chat_type, request_id, event_type,
@@ -77,6 +88,8 @@ class _Event:
     total_tokens: Optional[int] = None
     latency_ms: Optional[int] = None
     error_class: Optional[str] = None
+    chat_title: Optional[str] = None
+    chat_username: Optional[str] = None
 
     def as_args(self) -> tuple:
         return (
@@ -85,6 +98,7 @@ class _Event:
             self.media_type, self.duration_sec, self.file_size_bytes, self.mime_type,
             self.prompt_tokens, self.candidates_tokens, self.total_tokens,
             self.latency_ms, self.error_class,
+            self.chat_title, self.chat_username,
         )
 
 
@@ -173,6 +187,8 @@ def track(event_type: str, *, user: Optional[User], chat: Optional[Chat],
         event_type=event_type,
         latency_ms=latency_ms,
         error_class=error_class,
+        chat_title=getattr(chat, "title", None),
+        chat_username=getattr(chat, "username", None),
     )
     if info is not None:
         event.media_type = _media_type_from_info(info)

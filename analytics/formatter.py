@@ -11,6 +11,7 @@ from .queries import (
     CostSection,
     OverviewSection,
     PerfSection,
+    TopGroup,
     TopUser,
     TopUserByCost,
     TopUserByTokens,
@@ -81,6 +82,21 @@ def _fmt_top_users_cost(users: list[TopUserByCost]) -> str:
     lines = []
     for i, u in enumerate(users, 1):
         lines.append(f"  {i}. {_user_label(u)} — {_fmt_usd(u.cost_usd)}")
+    return "\n".join(lines)
+
+
+def _fmt_top_groups(groups: list[TopGroup]) -> str:
+    if not groups:
+        return "  (none yet — tracking starts after next deploy)"
+    lines = []
+    for i, g in enumerate(groups, 1):
+        if g.username:
+            label = f"@{escape_html(g.username)}"
+        elif g.chat_title:
+            label = escape_html(g.chat_title)
+        else:
+            label = f"<code>{g.chat_id}</code>"
+        lines.append(f"  {i}. {label} — {_fmt_int(g.total_events)}")
     return "\n".join(lines)
 
 
@@ -163,6 +179,7 @@ def render_content(s: Optional[ContentSection]) -> str:
         f"<i>{_now_utc()}</i>\n\n"
         f"<b>Media types</b>\n{_fmt_grouped(s.media_types)}\n\n"
         f"<b>Chat types</b>\n{_fmt_grouped(s.chat_types)}\n\n"
+        f"<b>Top supergroups (all-time)</b>\n{_fmt_top_groups(s.top_groups)}\n\n"
         f"<b>Duration buckets</b>\n{_fmt_grouped(s.duration_buckets)}\n\n"
         f"<b>Totals</b>\n"
         f"  • Lifetime: {_fmt_minutes(s.total_minutes_lifetime)} processed\n"
