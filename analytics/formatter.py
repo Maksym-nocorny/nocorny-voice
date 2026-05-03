@@ -57,11 +57,11 @@ def _fmt_usd(x: float) -> str:
     return f"${x:.4f}"
 
 
-def _fmt_top_users(users: list[TopUser]) -> str:
+def _fmt_top_users(users: list[TopUser], *, offset: int = 0) -> str:
     if not users:
         return "  (none)"
     lines = []
-    for i, u in enumerate(users, 1):
+    for i, u in enumerate(users, 1 + offset):
         lines.append(f"  {i}. {_user_label(u)} — {_fmt_int(u.total_events)}")
     return "\n".join(lines)
 
@@ -121,8 +121,7 @@ def render_overview(s: Optional[OverviewSection]) -> str:
         f"<b>Cost (24h)</b>\n"
         f"  • Tokens: {_fmt_tokens(s.total_tokens_24h)}\n"
         f"  • Minutes processed: {_fmt_minutes(s.minutes_24h)}\n"
-        f"  • RPM now: {_fmt_int(s.rpm_now)}  •  RPD today: {_fmt_int(s.rpd_today)}\n\n"
-        f"<i>Use /stats users | content | perf | cost for detail.</i>"
+        f"  • RPM now: {_fmt_int(s.rpm_now)}  •  RPD today: {_fmt_int(s.rpd_today)}"
     )
 
 
@@ -132,19 +131,33 @@ def render_overview(s: Optional[OverviewSection]) -> str:
 def render_users(s: Optional[UsersSection]) -> str:
     if s is None:
         return _empty("Analytics not available.")
+
+    page_info = f" — page {s.page}/{s.total_pages}" if s.total_pages > 1 else ""
+    offset = (s.page - 1) * s.page_size
+
+    if s.page > 1:
+        end = offset + len(s.top_users_all)
+        return (
+            f"<b>Nocorny.voice — users{page_info}</b>\n"
+            f"<i>{_now_utc()}</i>\n\n"
+            f"<b>All users (all-time, by events, #{offset + 1}–#{end})</b>\n"
+            f"{_fmt_top_users(s.top_users_all, offset=offset)}"
+        )
+
     cost_block = (
         f"<b>Top users (30d, by cost)</b>\n{_fmt_top_users_cost(s.top_users_by_cost_30d)}\n\n"
         if s.top_users_by_cost_30d and s.top_users_by_cost_30d[0].cost_usd > 0
         else ""
     )
+    all_time_label = "All users" if s.total_pages > 1 else "Top users"
     return (
-        f"<b>Nocorny.voice — users</b>\n"
+        f"<b>Nocorny.voice — users{page_info}</b>\n"
         f"<i>{_now_utc()}</i>\n\n"
         f"<b>Cohorts</b>\n"
         f"  • Total users: {_fmt_int(s.total_users)}\n"
         f"  • DAU {_fmt_int(s.dau)}  •  WAU {_fmt_int(s.wau)}  •  MAU {_fmt_int(s.mau)}\n"
         f"  • New today: {_fmt_int(s.new_users_today)}  •  new 7d: {_fmt_int(s.new_users_7d)}\n\n"
-        f"<b>Top users (all-time, by events)</b>\n{_fmt_top_users(s.top_users_all)}\n\n"
+        f"<b>{all_time_label} (all-time, by events)</b>\n{_fmt_top_users(s.top_users_all)}\n\n"
         f"<b>Top users (30d, by events)</b>\n{_fmt_top_users(s.top_users_30d)}\n\n"
         f"<b>Top users (30d, by tokens)</b>\n{_fmt_top_users_tokens(s.top_users_by_tokens_30d)}\n\n"
         f"{cost_block}"
@@ -207,6 +220,7 @@ def render_cost(s: Optional[CostSection]) -> str:
             f"<b>Cost (USD)</b>\n"
             f"  • Lifetime: {_fmt_usd(s.cost_usd_lifetime)}\n"
             f"  • 30d:      {_fmt_usd(s.cost_usd_30d)}\n"
+            f"  • 7d:       {_fmt_usd(s.cost_usd_7d)}\n"
             f"  • 24h:      {_fmt_usd(s.cost_usd_24h)}\n"
             f"  • Avg/req (30d): {_fmt_usd(s.avg_cost_usd_per_request_30d)}\n"
             f"  <i>at ${s.price_per_1m_input:.2f}/1M in · "
@@ -218,6 +232,7 @@ def render_cost(s: Optional[CostSection]) -> str:
         f"<b>Tokens</b>\n"
         f"  • Lifetime: {_fmt_tokens(s.total_tokens_lifetime)}\n"
         f"  • 30d:      {_fmt_tokens(s.total_tokens_30d)}\n"
+        f"  • 7d:       {_fmt_tokens(s.total_tokens_7d)}\n"
         f"  • 24h:      {_fmt_tokens(s.total_tokens_24h)}\n"
         f"  • Avg/req (30d): {s.avg_tokens_per_request_30d:.0f}\n\n"
         f"{cost_block}"

@@ -86,6 +86,9 @@ class UsersSection:
     top_users_by_tokens_30d: list[TopUserByTokens]
     top_users_by_cost_30d: list[TopUserByCost]
     languages: list[CountedRow]
+    page: int = 1
+    total_pages: int = 1
+    page_size: int = 50
 
 
 @dataclass
@@ -128,6 +131,8 @@ class CostSection:
     avg_cost_usd_per_request_30d: float
     price_per_1m_input: float
     price_per_1m_output: float
+    total_tokens_7d: int = 0
+    cost_usd_7d: float = 0.0
 
 
 # --------------------------------------------------------------------------- helpers
@@ -223,12 +228,15 @@ async def get_overview() -> Optional[OverviewSection]:
 # --------------------------------------------------------------------------- users
 
 
-async def get_users_section(limit: int = 20) -> Optional[UsersSection]:
+async def get_users_section(page: int = 1, page_size: int = 50) -> Optional[UsersSection]:
     p = pool.get()
     if p is None:
         return None
+    total_users = await _scalar(p, "SELECT count(*) FROM nocorny_voice.users")
+    total_pages = max(1, (total_users + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+
     results = await asyncio.gather(
-        _scalar(p, "SELECT count(*) FROM nocorny_voice.users"),
         _scalar(p,
             "SELECT count(DISTINCT user_id) FROM nocorny_voice.events "
             "WHERE ts >= now() - interval '1 day'"),
@@ -244,24 +252,27 @@ async def get_users_section(limit: int = 20) -> Optional[UsersSection]:
         _scalar(p,
             "SELECT count(*) FROM nocorny_voice.users "
             "WHERE first_seen_at >= now() - interval '7 days'"),
-        _top_users_all(p, limit),
-        _top_users_in(p, "30 days", limit),
-        _top_users_by_tokens(p, "30 days", limit),
-        _top_users_by_cost(p, "30 days", limit),
+        _top_users_all_page(p, page, page_size),
+        _top_users_in(p, "30 days", 20),
+        _top_users_by_tokens(p, "30 days", 20),
+        _top_users_by_cost(p, "30 days", 20),
         _languages(p),
     )
     return UsersSection(
-        total_users=results[0],
-        dau=results[1],
-        wau=results[2],
-        mau=results[3],
-        new_users_today=results[4],
-        new_users_7d=results[5],
-        top_users_all=results[6],
-        top_users_30d=results[7],
-        top_users_by_tokens_30d=results[8],
-        top_users_by_cost_30d=results[9],
-        languages=results[10],
+        total_users=total_users,
+        dau=results[0],
+        wau=results[1],
+        mau=results[2],
+        new_users_today=results[3],
+        new_users_7d=results[4],
+        top_users_all=results[5],
+        top_users_30d=results[6],
+        top_users_by_tokens_30d=results[7],
+        top_users_by_cost_30d=results[8],
+        languages=results[9],
+        page=page,
+        total_pages=total_pages,
+        page_size=page_size,
     )
 
 
@@ -375,6 +386,9 @@ async def get_cost_section() -> Optional[CostSection]:
             "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
         _scalar(p,
             "SELECT COALESCE(SUM(total_tokens),0) FROM nocorny_voice.events "
+            "WHERE event_type='transcribe_success' AND ts >= now() - interval '7 days'"),
+        _scalar(p,
+            "SELECT COALESCE(SUM(total_tokens),0) FROM nocorny_voice.events "
             "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
         _scalar_float(p,
             "SELECT COALESCE(AVG(total_tokens),0) FROM nocorny_voice.events "
@@ -400,6 +414,9 @@ async def get_cost_section() -> Optional[CostSection]:
             "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
         _scalar_float(p,
             f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
+            "WHERE event_type='transcribe_success' AND ts >= now() - interval '7 days'"),
+        _scalar_float(p,
+            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
             "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
         _scalar_float(p,
             f"SELECT COALESCE({avg_cost_select},0) FROM nocorny_voice.events "
@@ -408,16 +425,18 @@ async def get_cost_section() -> Optional[CostSection]:
     return CostSection(
         total_tokens_lifetime=results[0],
         total_tokens_30d=results[1],
-        total_tokens_24h=results[2],
-        avg_tokens_per_request_30d=results[3],
-        minutes_lifetime=results[4],
-        minutes_30d=results[5],
-        rpm_now=results[6],
-        rpd_today=results[7],
-        cost_usd_lifetime=results[8],
-        cost_usd_30d=results[9],
-        cost_usd_24h=results[10],
-        avg_cost_usd_per_request_30d=results[11],
+        total_tokens_7d=results[2],
+        total_tokens_24h=results[3],
+        avg_tokens_per_request_30d=results[4],
+        minutes_lifetime=results[5],
+        minutes_30d=results[6],
+        rpm_now=results[7],
+        rpd_today=results[8],
+        cost_usd_lifetime=results[9],
+        cost_usd_30d=results[10],
+        cost_usd_7d=results[11],
+        cost_usd_24h=results[12],
+        avg_cost_usd_per_request_30d=results[13],
         price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
         price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
@@ -426,12 +445,13 @@ async def get_cost_section() -> Optional[CostSection]:
 # --------------------------------------------------------------------------- subqueries
 
 
-async def _top_users_all(p: asyncpg.Pool, limit: int) -> list[TopUser]:
+async def _top_users_all_page(p: asyncpg.Pool, page: int, page_size: int) -> list[TopUser]:
     rows = await p.fetch(
         "SELECT user_id, username, first_name, total_events "
         "FROM nocorny_voice.users "
-        "ORDER BY total_events DESC LIMIT $1",
-        limit,
+        "ORDER BY total_events DESC LIMIT $1 OFFSET $2",
+        page_size,
+        (page - 1) * page_size,
     )
     return [TopUser(r["user_id"], r["username"], r["first_name"], r["total_events"])
             for r in rows]
