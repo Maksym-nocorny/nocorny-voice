@@ -434,6 +434,11 @@ async def _grouped(p: asyncpg.Pool, sql: str) -> list[CountedRow]:
     return [CountedRow(str(r["k"]), int(r["c"])) for r in rows]
 
 
+_DURATION_BUCKET_ORDER = {
+    "<30s": 1, "30s-2m": 2, "2-10m": 3, "10-30m": 4, ">30m": 5, "unknown": 6,
+}
+
+
 async def _duration_buckets(p: asyncpg.Pool) -> list[CountedRow]:
     rows = await p.fetch("""
         SELECT
@@ -449,17 +454,11 @@ async def _duration_buckets(p: asyncpg.Pool) -> list[CountedRow]:
         FROM nocorny_voice.events
         WHERE event_type='transcribe_success'
         GROUP BY 1
-        ORDER BY
-            CASE
-                WHEN duration_sec IS NULL THEN 6
-                WHEN duration_sec < 30 THEN 1
-                WHEN duration_sec < 120 THEN 2
-                WHEN duration_sec < 600 THEN 3
-                WHEN duration_sec < 1800 THEN 4
-                ELSE 5
-            END
     """)
-    return [CountedRow(r["k"], int(r["c"])) for r in rows]
+    # Six rows max — sort in Python.
+    counted = [CountedRow(r["k"], int(r["c"])) for r in rows]
+    counted.sort(key=lambda c: _DURATION_BUCKET_ORDER.get(c.label, 99))
+    return counted
 
 
 async def _cache_hit_rate(p: asyncpg.Pool, interval: str) -> float:
