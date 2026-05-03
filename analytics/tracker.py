@@ -12,9 +12,10 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from telegram import Chat, User
+if TYPE_CHECKING:
+    from telegram import Chat, User
 
 from utils.logging_setup import get_request_id
 
