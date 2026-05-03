@@ -51,3 +51,7 @@ def set_user(user_id: Optional[int]) -> None:
 
 def set_chat(chat_id: Optional[int]) -> None:
     _chat_id_var.set(chat_id)
+
+
+def get_request_id() -> Optional[str]:
+    return _request_id_var.get()

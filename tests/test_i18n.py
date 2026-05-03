@@ -30,13 +30,6 @@ def test_html_label_format():
     assert out == "<b>Transcription:</b>\n\nhello"
 
 
-def test_no_stats_keys_remaining():
-    """Analytics keys were removed; verify they don't exist anywhere."""
-    for lang_dict in TRANSLATIONS.values():
-        stats_keys = [k for k in lang_dict if k.startswith("stats_")]
-        assert stats_keys == [], f"unexpected stats keys: {stats_keys}"
-
-
 def test_all_languages_have_required_keys():
     required = set(TRANSLATIONS[DEFAULT_LANG].keys())
     for lang, d in TRANSLATIONS.items():

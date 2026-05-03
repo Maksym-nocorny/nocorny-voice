@@ -53,3 +53,14 @@ CACHE_TTL_SEC = _env_int("CACHE_TTL_SEC", 86400)             # 24h
 
 # --- Telegram ---
 TELEGRAM_MAX_MESSAGE_LEN = _env_int("TELEGRAM_MAX_MESSAGE_LEN", 4000)
+
+# --- Analytics (Neon Postgres) ---
+# Set DATABASE_URL to enable analytics. Bot runs fine without it (track() becomes a no-op).
+DATABASE_URL = os.getenv("DATABASE_URL") or None
+# Telegram user_id allowed to invoke /stats. Required only if DATABASE_URL is set.
+ADMIN_USER_ID = _env_int("ADMIN_USER_ID", 0) or None
+ANALYTICS_QUEUE_SIZE = _env_int("ANALYTICS_QUEUE_SIZE", 500)
+ANALYTICS_BATCH_SIZE = _env_int("ANALYTICS_BATCH_SIZE", 100)
+ANALYTICS_FLUSH_INTERVAL_SEC = _env_float("ANALYTICS_FLUSH_INTERVAL_SEC", 2.0)
+ANALYTICS_HEARTBEAT_INTERVAL_SEC = _env_int("ANALYTICS_HEARTBEAT_INTERVAL_SEC", 240)
+ANALYTICS_RETENTION_DAYS = _env_int("ANALYTICS_RETENTION_DAYS", 90)

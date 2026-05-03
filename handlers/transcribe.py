@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -11,6 +12,7 @@ from telegram import Message, Update
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
+import analytics
 import cache
 import gemini_service
 import rate_limit
@@ -131,6 +133,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     new_request_id()
     set_user(user.id)
     set_chat(chat.id)
+    t0 = time.monotonic()
 
     user_lang = user.language_code or "en"
     is_group = chat.type in ("group", "supergroup")
@@ -143,11 +146,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Per-user rate limit
     if not rate_limit.is_allowed(user.id):
         logger.info("rate_limit_user_blocked")
+        analytics.track("rate_limited_user", user=user, chat=chat)
         await update.message.reply_text(get_text(user_lang, "rate_limit_user"))
         return
 
     info = _extract_media_info(update.message)
     if info is None:
+        analytics.track("media_rejected_unsupported", user=user, chat=chat)
         await update.message.reply_text(get_text(user_lang, "unsupported"))
         return
 
@@ -156,6 +161,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if err:
         msg, reason = err
         logger.info("media_rejected reason=%s", reason)
+        reason_key = reason.split(" ", 1)[0]   # "too_long" | "too_large"
+        analytics.track(f"media_rejected_{reason_key}", user=user, chat=chat, info=info)
         await update.message.reply_text(msg)
         return
 
@@ -163,6 +170,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     cached_text = cache.get_transcription(info.file_unique_id)
     if cached_text is not None:
         logger.info("cache_hit file_unique_id=%s", info.file_unique_id)
+        analytics.track(
+            "cache_hit", user=user, chat=chat, info=info,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
         await _send_transcription(
             update, user_lang, cached_text, is_group, status_message=None
         )
@@ -179,21 +190,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await status_message.edit_text(get_text(user_lang, "transcribing"))
 
+        analytics.track("transcribe_request", user=user, chat=chat, info=info)
         try:
             result = await gemini_service.transcribe(temp_path, info.mime_type)
         except gemini_service.RateLimitedError:
+            analytics.track("rate_limited_gemini", user=user, chat=chat, info=info,
+                            latency_ms=int((time.monotonic() - t0) * 1000))
             await status_message.edit_text(get_text(user_lang, "rate_limit_error"))
             return
         except gemini_service.ProcessingFailedError:
+            analytics.track("processing_failed", user=user, chat=chat, info=info,
+                            latency_ms=int((time.monotonic() - t0) * 1000))
             await status_message.edit_text(get_text(user_lang, "processing_failed"))
             return
 
         cache.store_transcription(info.file_unique_id, result.text)
+        analytics.track(
+            "transcribe_success", user=user, chat=chat, info=info, result=result,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
         await _send_transcription(
             update, user_lang, result.text, is_group, status_message=status_message
         )
-    except Exception:
+    except Exception as e:
         logger.exception("transcribe_handler_error")
+        analytics.track(
+            "error_unknown", user=user, chat=chat, info=info,
+            error_class=type(e).__name__,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
         try:
             await status_message.edit_text(get_text(user_lang, "error_generic"))
         except TelegramError:
