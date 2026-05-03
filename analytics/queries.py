@@ -45,14 +45,6 @@ class TopUserByCost:
 
 
 @dataclass
-class TopGroup:
-    chat_id: int
-    chat_title: Optional[str]
-    username: Optional[str]
-    total_events: int
-
-
-@dataclass
 class CountedRow:
     label: str
     count: int
@@ -105,7 +97,6 @@ class ContentSection:
     duration_buckets: list[CountedRow]
     avg_duration_sec: float
     median_duration_sec: int
-    top_groups: list[TopGroup] = field(default_factory=list)
 
 
 @dataclass
@@ -307,7 +298,6 @@ async def get_content_section() -> Optional[ContentSection]:
             "SELECT COALESCE(percentile_disc(0.5) WITHIN GROUP (ORDER BY duration_sec),0) "
             "FROM nocorny_voice.events "
             "WHERE event_type='transcribe_success' AND duration_sec IS NOT NULL"),
-        _top_groups(p, limit=10),
     )
     return ContentSection(
         media_types=results[0],
@@ -317,7 +307,6 @@ async def get_content_section() -> Optional[ContentSection]:
         duration_buckets=results[4],
         avg_duration_sec=results[5],
         median_duration_sec=results[6],
-        top_groups=results[7],
     )
 
 
@@ -568,18 +557,6 @@ async def _latency_percentile(p: asyncpg.Pool, q: float, interval: str) -> int:
           AND ts >= now() - interval '{interval}'
     """, q)
     return int(val or 0)
-
-
-async def _top_groups(p: asyncpg.Pool, limit: int) -> list[TopGroup]:
-    rows = await p.fetch(
-        "SELECT chat_id, chat_title, username, total_events "
-        "FROM nocorny_voice.chats "
-        "WHERE chat_type = 'supergroup' "
-        "ORDER BY total_events DESC LIMIT $1",
-        limit,
-    )
-    return [TopGroup(r["chat_id"], r["chat_title"], r["username"], r["total_events"])
-            for r in rows]
 
 
 async def _error_rate(p: asyncpg.Pool, interval: str) -> float:
