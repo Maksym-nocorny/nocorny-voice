@@ -20,8 +20,10 @@ from .queries import (
 def _user_label(u) -> str:
     if u.username:
         return f"@{escape_html(u.username)}"
+    # No public username — render as a tg://user?id deep-link so the admin can
+    # tap through to the profile. Falls back to "user_<id>" if no first_name.
     name = (u.first_name or "").strip() or f"user_{u.user_id}"
-    return escape_html(name)
+    return f'<a href="tg://user?id={u.user_id}">{escape_html(name)}</a>'
 
 
 def _fmt_pct(x: float) -> str:

@@ -47,23 +47,34 @@ def test_render_overview_includes_key_sections():
 
 
 def test_top_user_label_falls_back_to_first_name_then_user_id():
-    no_username = TopUser(99, None, None, 5)
-    label = formatter._user_label(no_username)
+    no_username_no_name = TopUser(99, None, None, 5)
+    label = formatter._user_label(no_username_no_name)
     assert "user_99" in label
+    assert 'href="tg://user?id=99"' in label  # clickable deep-link
 
     only_first = TopUser(99, None, "Carol", 5)
-    assert "Carol" in formatter._user_label(only_first)
+    label = formatter._user_label(only_first)
+    assert ">Carol<" in label
+    assert 'href="tg://user?id=99"' in label
 
     with_username = TopUser(99, "carol", "Carol", 5)
+    # @username is already clickable in Telegram clients — keep it plain.
     assert formatter._user_label(with_username) == "@carol"
 
 
 def test_html_special_chars_in_username_are_escaped():
-    """Usernames can theoretically contain HTML-meta chars; must be escaped."""
-    nasty = TopUser(1, "<script>", "<b>", 1)
-    out = formatter._user_label(nasty)
+    """Usernames and first_names can contain HTML-meta chars; must be escaped."""
+    nasty_username = TopUser(1, "<script>", "<b>", 1)
+    out = formatter._user_label(nasty_username)
     assert "<script>" not in out
     assert "&lt;script&gt;" in out
+
+    # No username path — first_name still gets escaped inside the <a> tag.
+    nasty_first_name = TopUser(2, None, "<img onerror>", 1)
+    out = formatter._user_label(nasty_first_name)
+    assert "<img" not in out
+    assert "&lt;img onerror&gt;" in out
+    assert 'href="tg://user?id=2"' in out
 
 
 def test_render_users_handles_empty_lists():
