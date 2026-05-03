@@ -51,6 +51,11 @@ _RETENTION_SQL = (
     "DELETE FROM nocorny_voice.events WHERE ts < now() - ($1::int || ' days')::interval"
 )
 
+_L2_CACHE_RETENTION_SQL = (
+    "DELETE FROM nocorny_voice.transcription_cache "
+    "WHERE last_hit_at < now() - ($1::int || ' days')::interval"
+)
+
 
 @dataclass
 class _Event:
@@ -92,6 +97,7 @@ class _State:
     flush_interval_sec: float = 2.0
     heartbeat_interval_sec: int = 240
     retention_days: int = 90
+    cache_l2_ttl_days: int = 14
     last_full_log_ts: float = 0.0
     last_retention_ts: float = field(default_factory=lambda: 0.0)
     last_heartbeat_ts: float = field(default_factory=lambda: 0.0)
@@ -101,12 +107,14 @@ _state = _State()
 
 
 def configure(*, queue_size: int, batch_size: int, flush_interval_sec: float,
-              heartbeat_interval_sec: int, retention_days: int) -> None:
+              heartbeat_interval_sec: int, retention_days: int,
+              cache_l2_ttl_days: int) -> None:
     _state.queue_size = queue_size
     _state.batch_size = batch_size
     _state.flush_interval_sec = flush_interval_sec
     _state.heartbeat_interval_sec = heartbeat_interval_sec
     _state.retention_days = retention_days
+    _state.cache_l2_ttl_days = cache_l2_ttl_days
 
 
 def start() -> None:
@@ -236,7 +244,8 @@ async def _maybe_retention(now_mono: float) -> None:
     try:
         async with p.acquire() as conn:
             deleted = await conn.execute(_RETENTION_SQL, _state.retention_days)
-        logger.info("analytics_retention_cleanup result=%s", deleted)
+            l2_deleted = await conn.execute(_L2_CACHE_RETENTION_SQL, _state.cache_l2_ttl_days)
+        logger.info("analytics_retention_cleanup events=%s l2_cache=%s", deleted, l2_deleted)
     except Exception:  # noqa: BLE001
         logger.warning("analytics_retention_failed", exc_info=True)
 

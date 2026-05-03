@@ -22,6 +22,7 @@ from config import (
     ANALYTICS_HEARTBEAT_INTERVAL_SEC,
     ANALYTICS_QUEUE_SIZE,
     ANALYTICS_RETENTION_DAYS,
+    CACHE_L2_TTL_DAYS,
 )
 
 from . import pool, schema, tracker
@@ -61,6 +62,7 @@ async def init(database_url: Optional[str]) -> None:
             flush_interval_sec=ANALYTICS_FLUSH_INTERVAL_SEC,
             heartbeat_interval_sec=ANALYTICS_HEARTBEAT_INTERVAL_SEC,
             retention_days=ANALYTICS_RETENTION_DAYS,
+            cache_l2_ttl_days=CACHE_L2_TTL_DAYS,
         )
         tracker.start()
         _enabled = True

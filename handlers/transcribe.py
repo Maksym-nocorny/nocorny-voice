@@ -1,6 +1,7 @@
 """Voice/audio/video transcription handler — main bot logic."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -111,6 +112,11 @@ async def _send_transcription(
 
 def _validation_error(info: _MediaInfo, user_lang: str) -> Optional[Tuple[str, str]]:
     """Return (error_text, log_reason) if media fails validation, else None."""
+    if info.duration is not None and info.duration < 1:
+        return (
+            get_text(user_lang, "media_too_short"),
+            f"too_short duration={info.duration}",
+        )
     if info.duration and info.duration > MAX_DURATION_SEC:
         return (
             get_text(user_lang, "media_too_long", MAX_DURATION_SEC // 60),
@@ -179,7 +185,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Fresh request: download → transcribe → respond
+    # Fresh request: download → L2 cache check → transcribe → respond
     status_message = await update.message.reply_text(get_text(user_lang, "downloading"))
     temp_path: Optional[str] = None
     try:
@@ -187,6 +193,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         with tempfile.NamedTemporaryFile(suffix=info.file_ext, delete=False) as f:
             temp_path = f.name
         await new_file.download_to_drive(temp_path)
+
+        # L2: same content, different file_unique_id (e.g. forwarded between users
+        # or re-uploaded after restart). SHA-256 here adds ~150-300ms for 50MB but
+        # saves the entire Gemini call on hit.
+        content_hash = await asyncio.to_thread(cache.hash_file, temp_path)
+        l2_text = await cache.get_by_hash(content_hash)
+        if l2_text is not None:
+            logger.info("cache_l2_hit content_hash=%s", content_hash[:12])
+            cache.store_transcription(info.file_unique_id, l2_text)
+            analytics.track(
+                "cache_l2_hit", user=user, chat=chat, info=info,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+            await _send_transcription(
+                update, user_lang, l2_text, is_group, status_message=status_message
+            )
+            return
 
         await status_message.edit_text(get_text(user_lang, "transcribing"))
 
@@ -205,6 +228,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         cache.store_transcription(info.file_unique_id, result.text)
+        await cache.store_by_hash(content_hash, result.text)
         analytics.track(
             "transcribe_success", user=user, chat=chat, info=info, result=result,
             latency_ms=int((time.monotonic() - t0) * 1000),

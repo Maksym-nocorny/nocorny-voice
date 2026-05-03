@@ -12,6 +12,8 @@ from typing import Optional
 
 import asyncpg
 
+from config import PRICE_PER_1M_INPUT_TOKENS, PRICE_PER_1M_OUTPUT_TOKENS
+
 from . import pool
 
 
@@ -32,6 +34,14 @@ class TopUserByTokens:
     username: Optional[str]
     first_name: Optional[str]
     tokens: int
+
+
+@dataclass
+class TopUserByCost:
+    user_id: int
+    username: Optional[str]
+    first_name: Optional[str]
+    cost_usd: float
 
 
 @dataclass
@@ -74,6 +84,7 @@ class UsersSection:
     top_users_all: list[TopUser]
     top_users_30d: list[TopUser]
     top_users_by_tokens_30d: list[TopUserByTokens]
+    top_users_by_cost_30d: list[TopUserByCost]
     languages: list[CountedRow]
 
 
@@ -111,6 +122,12 @@ class CostSection:
     minutes_30d: float
     rpm_now: int
     rpd_today: int
+    cost_usd_lifetime: float
+    cost_usd_30d: float
+    cost_usd_24h: float
+    avg_cost_usd_per_request_30d: float
+    price_per_1m_input: float
+    price_per_1m_output: float
 
 
 # --------------------------------------------------------------------------- helpers
@@ -230,6 +247,7 @@ async def get_users_section(limit: int = 20) -> Optional[UsersSection]:
         _top_users_all(p, limit),
         _top_users_in(p, "30 days", limit),
         _top_users_by_tokens(p, "30 days", limit),
+        _top_users_by_cost(p, "30 days", limit),
         _languages(p),
     )
     return UsersSection(
@@ -242,7 +260,8 @@ async def get_users_section(limit: int = 20) -> Optional[UsersSection]:
         top_users_all=results[6],
         top_users_30d=results[7],
         top_users_by_tokens_30d=results[8],
-        languages=results[9],
+        top_users_by_cost_30d=results[9],
+        languages=results[10],
     )
 
 
@@ -339,6 +358,14 @@ async def get_cost_section() -> Optional[CostSection]:
     p = pool.get()
     if p is None:
         return None
+    cost_select = (
+        f"SUM(prompt_tokens) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
+        f"SUM(candidates_tokens) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
+    )
+    avg_cost_select = (
+        f"AVG(prompt_tokens) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
+        f"AVG(candidates_tokens) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
+    )
     results = await asyncio.gather(
         _scalar(p,
             "SELECT COALESCE(SUM(total_tokens),0) FROM nocorny_voice.events "
@@ -365,6 +392,18 @@ async def get_cost_section() -> Optional[CostSection]:
         _scalar(p,
             "SELECT count(*) FROM nocorny_voice.events "
             "WHERE event_type='transcribe_success' AND ts >= date_trunc('day', now())"),
+        _scalar_float(p,
+            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
+            "WHERE event_type='transcribe_success'"),
+        _scalar_float(p,
+            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
+            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
+        _scalar_float(p,
+            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
+            "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
+        _scalar_float(p,
+            f"SELECT COALESCE({avg_cost_select},0) FROM nocorny_voice.events "
+            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
     )
     return CostSection(
         total_tokens_lifetime=results[0],
@@ -375,6 +414,12 @@ async def get_cost_section() -> Optional[CostSection]:
         minutes_30d=results[5],
         rpm_now=results[6],
         rpd_today=results[7],
+        cost_usd_lifetime=results[8],
+        cost_usd_30d=results[9],
+        cost_usd_24h=results[10],
+        avg_cost_usd_per_request_30d=results[11],
+        price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
+        price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
 
 
@@ -418,6 +463,26 @@ async def _top_users_by_tokens(p: asyncpg.Pool, interval: str, limit: int
         limit,
     )
     return [TopUserByTokens(r["user_id"], r["username"], r["first_name"], int(r["t"]))
+            for r in rows]
+
+
+async def _top_users_by_cost(p: asyncpg.Pool, interval: str, limit: int
+                             ) -> list[TopUserByCost]:
+    cost_select = (
+        f"COALESCE(SUM(e.prompt_tokens),0) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
+        f"COALESCE(SUM(e.candidates_tokens),0) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
+    )
+    rows = await p.fetch(
+        "SELECT e.user_id, u.username, u.first_name, "
+        f"({cost_select}) AS c "
+        "FROM nocorny_voice.events e "
+        "LEFT JOIN nocorny_voice.users u USING (user_id) "
+        f"WHERE e.event_type='transcribe_success' AND e.ts >= now() - interval '{interval}' "
+        "GROUP BY e.user_id, u.username, u.first_name "
+        "ORDER BY c DESC LIMIT $1",
+        limit,
+    )
+    return [TopUserByCost(r["user_id"], r["username"], r["first_name"], float(r["c"]))
             for r in rows]
 
 
@@ -465,8 +530,13 @@ async def _cache_hit_rate(p: asyncpg.Pool, interval: str) -> float:
     val = await p.fetchval(f"""
         SELECT
             COALESCE(
-                count(*) FILTER (WHERE event_type='cache_hit')::float /
-                NULLIF(count(*) FILTER (WHERE event_type IN ('cache_hit','transcribe_success')),0),
+                count(*) FILTER (WHERE event_type IN ('cache_hit','cache_l2_hit'))::float /
+                NULLIF(
+                    count(*) FILTER (
+                        WHERE event_type IN ('cache_hit','cache_l2_hit','transcribe_success')
+                    ),
+                    0
+                ),
                 0
             )
         FROM nocorny_voice.events

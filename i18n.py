@@ -16,6 +16,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "rate_limit_user": "You're sending requests too fast. Please wait a moment.",
         "media_too_long": "The file is too long. Please send media shorter than {} minutes.",
         "media_too_large": "The file is too large. Please send media smaller than {} MB.",
+        "media_too_short": "The clip is too short to transcribe.",
     },
     "uk": {
         "welcome": "Привіт! Я бот для транскрипції. Надішліть мені голосове повідомлення, аудіофайл, відео або відеоповідомлення, і я транскрибую його за допомогою Gemini.",
@@ -29,6 +30,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "rate_limit_user": "Ви надсилаєте запити надто швидко. Зачекайте хвилинку.",
         "media_too_long": "Файл занадто довгий. Будь ласка, надішліть медіа коротше за {} хвилин.",
         "media_too_large": "Файл занадто великий. Надішліть медіа менше за {} МБ.",
+        "media_too_short": "Кліп занадто короткий для транскрипції.",
     },
     "ru": {
         "welcome": "Привет! Я бот для транскрипции. Отправьте мне голосовое сообщение, аудиофайл, видео или видеосообщение, и я транскрибирую его с помощью Gemini.",
@@ -42,6 +44,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "rate_limit_user": "Вы отправляете запросы слишком быстро. Подождите немного.",
         "media_too_long": "Файл слишком длинный. Пожалуйста, отправьте медиа короче {} минут.",
         "media_too_large": "Файл слишком большой. Отправьте медиа меньше {} МБ.",
+        "media_too_short": "Клип слишком короткий для транскрипции.",
     },
     "es": {
         "welcome": "¡Hola! Soy un bot de transcripción. Envíame un mensaje de voz, archivo de audio, video o nota de video, y lo transcribiré usando Gemini.",
@@ -55,6 +58,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "rate_limit_user": "Estás enviando solicitudes demasiado rápido. Espera un momento.",
         "media_too_long": "El archivo es demasiado largo. Por favor, envía medios de menos de {} minutos.",
         "media_too_large": "El archivo es demasiado grande. Por favor, envía medios de menos de {} MB.",
+        "media_too_short": "El clip es demasiado corto para transcribir.",
     },
     "de": {
         "welcome": "Hallo! Ich bin ein Transkriptions-Bot. Sende mir eine Sprachnachricht, Audiodatei, Video oder Videonotiz, und ich transkribiere sie mit Gemini.",
@@ -68,6 +72,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "rate_limit_user": "Du sendest Anfragen zu schnell. Bitte warte einen Moment.",
         "media_too_long": "Die Datei ist zu lang. Bitte sende Medien kürzer als {} Minuten.",
         "media_too_large": "Die Datei ist zu groß. Bitte sende Medien kleiner als {} MB.",
+        "media_too_short": "Der Clip ist zu kurz zum Transkribieren.",
     },
     "fr": {
         "welcome": "Salut! Je suis un bot de transcription. Envoyez-moi un message vocal, fichier audio, vidéo ou note vidéo, et je le transcrirai avec Gemini.",
@@ -81,6 +86,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "rate_limit_user": "Vous envoyez des requêtes trop rapidement. Veuillez patienter.",
         "media_too_long": "Le fichier est trop long. Veuillez envoyer des médias de moins de {} minutes.",
         "media_too_large": "Le fichier est trop volumineux. Veuillez envoyer des médias de moins de {} Mo.",
+        "media_too_short": "Le clip est trop court à transcrire.",
     },
     "it": {
         "welcome": "Ciao! Sono un bot di trascrizione. Inviami un messaggio vocale, file audio, video o nota video e lo trascriverò usando Gemini.",
@@ -94,6 +100,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "rate_limit_user": "Stai inviando richieste troppo velocemente. Attendi un momento.",
         "media_too_long": "Il file è troppo lungo. Per favore, invia file più corti di {} minuti.",
         "media_too_large": "Il file è troppo grande. Per favore, invia file più piccoli di {} MB.",
+        "media_too_short": "Il clip è troppo corto da trascrivere.",
     },
     "pl": {
         "welcome": "Cześć! Jestem botem do transkrypcji. Wyślij mi wiadomość głosową, plik audio, wideo lub notatkę wideo, a przepiszę ją za pomocą Gemini.",
@@ -107,6 +114,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "rate_limit_user": "Wysyłasz zapytania zbyt szybko. Poczekaj chwilę.",
         "media_too_long": "Plik jest za długi. Proszę wysłać media krótsze niż {} minut.",
         "media_too_large": "Plik jest za duży. Proszę wysłać media mniejsze niż {} MB.",
+        "media_too_short": "Klip jest za krótki, aby go przepisać.",
     },
 }
 

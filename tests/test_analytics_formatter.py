@@ -9,6 +9,7 @@ from analytics.queries import (
     OverviewSection,
     PerfSection,
     TopUser,
+    TopUserByCost,
     TopUserByTokens,
     UsersSection,
 )
@@ -82,11 +83,42 @@ def test_render_users_handles_empty_lists():
         total_users=0, dau=0, wau=0, mau=0,
         new_users_today=0, new_users_7d=0,
         top_users_all=[], top_users_30d=[], top_users_by_tokens_30d=[],
+        top_users_by_cost_30d=[],
         languages=[],
     )
     out = formatter.render_users(s)
     assert "Top users" in out
     assert "(none)" in out
+
+
+def test_render_users_includes_cost_when_pricing_active():
+    s = UsersSection(
+        total_users=1, dau=1, wau=1, mau=1,
+        new_users_today=0, new_users_7d=0,
+        top_users_all=[], top_users_30d=[], top_users_by_tokens_30d=[],
+        top_users_by_cost_30d=[
+            TopUserByCost(7, "alice", "Alice", 0.0123),
+            TopUserByCost(8, None, "Bob", 0.0042),
+        ],
+        languages=[],
+    )
+    out = formatter.render_users(s)
+    assert "by cost" in out
+    assert "@alice" in out
+    assert "$0.0123" in out
+
+
+def test_render_users_hides_cost_when_top_is_zero():
+    """If pricing is disabled (price=0), top_users_by_cost_30d entries are 0 → hide."""
+    s = UsersSection(
+        total_users=1, dau=1, wau=1, mau=1,
+        new_users_today=0, new_users_7d=0,
+        top_users_all=[], top_users_30d=[], top_users_by_tokens_30d=[],
+        top_users_by_cost_30d=[TopUserByCost(7, "alice", "Alice", 0.0)],
+        languages=[],
+    )
+    out = formatter.render_users(s)
+    assert "by cost" not in out
 
 
 def test_render_content_with_data():
@@ -125,8 +157,30 @@ def test_render_cost_with_data():
         avg_tokens_per_request_30d=850.5,
         minutes_lifetime=1500.0, minutes_30d=300.0,
         rpm_now=2, rpd_today=87,
+        cost_usd_lifetime=1.234, cost_usd_30d=0.2468,
+        cost_usd_24h=0.012, avg_cost_usd_per_request_30d=0.000085,
+        price_per_1m_input=0.10, price_per_1m_output=0.40,
     )
     out = formatter.render_cost(s)
     assert "10.00M" in out
     assert "2.00M" in out
     assert "RPD today: 87" in out
+    assert "$1.23" in out      # lifetime cost >= $1 → 2 decimals
+    assert "$0.2468" in out    # 30d cost < $1 → 4 decimals
+    assert "0.10/1M" in out    # pricing footnote
+
+
+def test_render_cost_hides_usd_when_pricing_zero():
+    s = CostSection(
+        total_tokens_lifetime=10_000_000, total_tokens_30d=2_000_000,
+        total_tokens_24h=120_000,
+        avg_tokens_per_request_30d=850.5,
+        minutes_lifetime=1500.0, minutes_30d=300.0,
+        rpm_now=2, rpd_today=87,
+        cost_usd_lifetime=0.0, cost_usd_30d=0.0,
+        cost_usd_24h=0.0, avg_cost_usd_per_request_30d=0.0,
+        price_per_1m_input=0.0, price_per_1m_output=0.0,
+    )
+    out = formatter.render_cost(s)
+    assert "Cost (USD)" not in out
+    assert "10.00M" in out      # tokens still shown
