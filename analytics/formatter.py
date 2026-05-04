@@ -104,6 +104,11 @@ def _empty(message: str) -> str:
 def render_overview(s: Optional[OverviewSection]) -> str:
     if s is None:
         return _empty("Analytics not available (DATABASE_URL not configured).")
+    pricing_active = s.price_per_1m_input > 0 or s.price_per_1m_output > 0
+    cost_lines = (
+        f"  • USD 24h: {_fmt_usd(s.cost_usd_24h)}  •  30d: {_fmt_usd(s.cost_usd_30d)}\n"
+        if pricing_active else ""
+    )
     return (
         f"<b>Nocorny.voice — overview</b>\n"
         f"<i>{_now_utc()}</i>\n\n"
@@ -113,15 +118,12 @@ def render_overview(s: Optional[OverviewSection]) -> str:
         f"  • DAU {_fmt_int(s.dau)}  •  WAU {_fmt_int(s.wau)}  •  MAU {_fmt_int(s.mau)}\n"
         f"  • Users: {_fmt_int(s.total_users)} total, {_fmt_int(s.new_users_today)} new today\n\n"
         f"<b>Top users (24h)</b>\n{_fmt_top_users(s.top_users_24h)}\n\n"
-        f"<b>Performance (24h)</b>\n"
-        f"  • Cache hit rate: {_fmt_pct(s.cache_hit_rate_24h)}\n"
-        f"  • Latency p50/p95: {s.latency_p50_ms}ms / {s.latency_p95_ms}ms\n"
-        f"  • Error rate: {_fmt_pct(s.error_rate_24h)}\n"
-        f"  • Rate-limited: {_fmt_int(s.rate_limited_24h)}\n\n"
-        f"<b>Cost (24h)</b>\n"
-        f"  • Tokens: {_fmt_tokens(s.total_tokens_24h)}\n"
-        f"  • Minutes processed: {_fmt_minutes(s.minutes_24h)}\n"
-        f"  • RPM now: {_fmt_int(s.rpm_now)}  •  RPD today: {_fmt_int(s.rpd_today)}"
+        f"<b>Cost</b>\n"
+        f"  • Tokens 24h: {_fmt_tokens(s.total_tokens_24h)}\n"
+        f"  • Minutes 24h: {_fmt_minutes(s.minutes_24h)}\n"
+        f"{cost_lines}"
+        f"  • RPM now: {_fmt_int(s.rpm_now)}  •  RPD today: {_fmt_int(s.rpd_today)}\n\n"
+        f"<i>Error rate (24h): {_fmt_pct(s.error_rate_24h)}</i>"
     )
 
 

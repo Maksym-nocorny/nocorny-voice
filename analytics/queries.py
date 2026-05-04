@@ -62,15 +62,15 @@ class OverviewSection:
     new_users_today: int
     total_users: int
     top_users_24h: list[TopUser] = field(default_factory=list)
-    cache_hit_rate_24h: float = 0.0
-    latency_p50_ms: int = 0
-    latency_p95_ms: int = 0
     error_rate_24h: float = 0.0
-    rate_limited_24h: int = 0
     total_tokens_24h: int = 0
     minutes_24h: float = 0.0
     rpm_now: int = 0
     rpd_today: int = 0
+    cost_usd_24h: float = 0.0
+    cost_usd_30d: float = 0.0
+    price_per_1m_input: float = 0.0
+    price_per_1m_output: float = 0.0
 
 
 @dataclass
@@ -155,6 +155,10 @@ async def get_overview() -> Optional[OverviewSection]:
     p = pool.get()
     if p is None:
         return None
+    cost_select = (
+        f"SUM(prompt_tokens) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
+        f"SUM(candidates_tokens) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
+    )
     results = await asyncio.gather(
         _scalar(p,
             "SELECT count(*) FROM nocorny_voice.events "
@@ -182,13 +186,7 @@ async def get_overview() -> Optional[OverviewSection]:
             "WHERE first_seen_at >= date_trunc('day', now())"),
         _scalar(p, "SELECT count(*) FROM nocorny_voice.users"),
         _top_users_in(p, "1 day", limit=5),
-        _cache_hit_rate(p, "24 hours"),
-        _latency_percentile(p, 0.5, "24 hours"),
-        _latency_percentile(p, 0.95, "24 hours"),
         _error_rate(p, "24 hours"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE event_type='rate_limited_user' AND ts >= now() - interval '24 hours'"),
         _scalar(p,
             "SELECT COALESCE(SUM(total_tokens),0) FROM nocorny_voice.events "
             "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
@@ -201,6 +199,12 @@ async def get_overview() -> Optional[OverviewSection]:
         _scalar(p,
             "SELECT count(*) FROM nocorny_voice.events "
             "WHERE event_type='transcribe_success' AND ts >= date_trunc('day', now())"),
+        _scalar_float(p,
+            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
+            "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
+        _scalar_float(p,
+            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
+            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
     )
     return OverviewSection(
         today=results[0],
@@ -213,15 +217,15 @@ async def get_overview() -> Optional[OverviewSection]:
         new_users_today=results[7],
         total_users=results[8],
         top_users_24h=results[9],
-        cache_hit_rate_24h=results[10],
-        latency_p50_ms=results[11],
-        latency_p95_ms=results[12],
-        error_rate_24h=results[13],
-        rate_limited_24h=results[14],
-        total_tokens_24h=results[15],
-        minutes_24h=results[16],
-        rpm_now=results[17],
-        rpd_today=results[18],
+        error_rate_24h=results[10],
+        total_tokens_24h=results[11],
+        minutes_24h=results[12],
+        rpm_now=results[13],
+        rpd_today=results[14],
+        cost_usd_24h=results[15],
+        cost_usd_30d=results[16],
+        price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
+        price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
 
 

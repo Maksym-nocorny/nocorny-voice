@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telegram.error import BadRequest
 
 import analytics
 from handlers import stats as stats_handler
@@ -26,6 +27,24 @@ def _make_context(args=None):
     ctx = MagicMock()
     ctx.args = args or []
     return ctx
+
+
+def _make_callback_update(user_id, callback_data):
+    user = SimpleNamespace(id=user_id, language_code="en")
+    chat = MagicMock()
+    chat.send_message = AsyncMock()
+    msg = MagicMock()
+    msg.chat = chat
+    msg.delete = AsyncMock()
+    query = MagicMock()
+    query.data = callback_data
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    query.message = msg
+    update = MagicMock()
+    update.effective_user = user
+    update.callback_query = query
+    return update, query, msg, chat
 
 
 @pytest.fixture(autouse=True)
@@ -128,3 +147,63 @@ async def test_overview_caches_for_5_seconds(monkeypatch):
     await stats_handler.stats_command(update, _make_context())
     await stats_handler.stats_command(update, _make_context())
     assert call_count["n"] == 1
+
+
+async def test_callback_edits_existing_message_to_switch_screens(monkeypatch):
+    monkeypatch.setattr("handlers.stats.ADMIN_USER_ID", 42)
+    monkeypatch.setattr(analytics, "is_enabled", lambda: True)
+    monkeypatch.setattr(analytics, "get_users_section", AsyncMock(return_value="data"))
+    monkeypatch.setattr(analytics, "render_users", lambda s: "USERS")
+
+    update, query, msg, chat = _make_callback_update(42, "stats:users:1")
+    await stats_handler.stats_callback(update, _make_context())
+
+    query.edit_message_text.assert_awaited_once()
+    sent = query.edit_message_text.call_args
+    assert sent.args[0] == "USERS"
+    assert sent.kwargs.get("parse_mode") == "HTML"
+    chat.send_message.assert_not_called()
+    msg.delete.assert_not_called()
+
+
+async def test_callback_swallows_message_not_modified(monkeypatch):
+    monkeypatch.setattr("handlers.stats.ADMIN_USER_ID", 42)
+    monkeypatch.setattr(analytics, "is_enabled", lambda: True)
+    monkeypatch.setattr(analytics, "get_users_section", AsyncMock(return_value="data"))
+    monkeypatch.setattr(analytics, "render_users", lambda s: "USERS")
+
+    update, query, msg, chat = _make_callback_update(42, "stats:users:1")
+    query.edit_message_text = AsyncMock(
+        side_effect=BadRequest("Message is not modified")
+    )
+
+    await stats_handler.stats_callback(update, _make_context())
+    chat.send_message.assert_not_called()
+    msg.delete.assert_not_called()
+
+
+async def test_callback_falls_back_to_resend_for_multi_chunk(monkeypatch):
+    monkeypatch.setattr("handlers.stats.ADMIN_USER_ID", 42)
+    monkeypatch.setattr("handlers.stats.TELEGRAM_MAX_MESSAGE_LEN", 10)
+    monkeypatch.setattr(analytics, "is_enabled", lambda: True)
+    monkeypatch.setattr(analytics, "get_users_section", AsyncMock(return_value="data"))
+    monkeypatch.setattr(analytics, "render_users", lambda s: "line1\nline2\nline3\nline4")
+
+    update, query, msg, chat = _make_callback_update(42, "stats:users:1")
+    await stats_handler.stats_callback(update, _make_context())
+
+    query.edit_message_text.assert_not_called()
+    msg.delete.assert_awaited_once()
+    assert chat.send_message.await_count >= 1
+
+
+async def test_callback_noop_does_nothing(monkeypatch):
+    monkeypatch.setattr("handlers.stats.ADMIN_USER_ID", 42)
+    monkeypatch.setattr(analytics, "is_enabled", lambda: True)
+
+    update, query, msg, chat = _make_callback_update(42, "stats:noop:0")
+    await stats_handler.stats_callback(update, _make_context())
+
+    query.edit_message_text.assert_not_called()
+    chat.send_message.assert_not_called()
+    msg.delete.assert_not_called()

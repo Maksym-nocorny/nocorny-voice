@@ -6,6 +6,7 @@ import time
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 import analytics
@@ -116,9 +117,27 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     chunks = list(chunk_text(text, TELEGRAM_MAX_MESSAGE_LEN))
+    if len(chunks) == 1:
+        try:
+            await query.edit_message_text(
+                chunks[0], parse_mode="HTML", reply_markup=keyboard
+            )
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            logger.debug("stats_edit_failed sub=%s: %s", sub, e)
+
+    # Multi-chunk (rare): replace the original message with a fresh batch so the
+    # screen-switching feel still holds.
+    try:
+        await query.message.delete()
+    except Exception:
+        logger.debug("stats_delete_failed sub=%s", sub, exc_info=True)
+    chat = query.message.chat
     for i, chunk in enumerate(chunks):
         km = keyboard if i == len(chunks) - 1 else None
-        await query.message.reply_text(chunk, parse_mode="HTML", reply_markup=km)
+        await chat.send_message(chunk, parse_mode="HTML", reply_markup=km)
 
 
 async def _render_with_keyboard(sub: str, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
