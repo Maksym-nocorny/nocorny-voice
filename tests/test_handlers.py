@@ -170,7 +170,7 @@ async def test_cache_hit_skips_gemini_and_responds(monkeypatch):
     transcribe_spy = AsyncMock()
     monkeypatch.setattr(gemini_service, "transcribe", transcribe_spy)
 
-    cache.store_transcription("uniq_a", "previously transcribed text")
+    cache.store_transcription("uniq_a", "previously transcribed text", "en")
     update, context, _, _ = _make_update_context(voice=_make_voice())
 
     await t.handle_message(update, context)
@@ -203,7 +203,9 @@ async def test_private_voice_transcription_full_flow(monkeypatch):
     # No reply_markup since the summarize feature has been removed
     assert final_call.kwargs.get("reply_markup") is None
 
-    assert cache.get_transcription("uniq_a") == "hello world"
+    cached = cache.get_transcription("uniq_a")
+    assert cached is not None
+    assert cached.text == "hello world"
 
 
 async def test_group_voice_replies_without_button(monkeypatch):

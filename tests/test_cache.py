@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import cache
+from cache import CachedTranscription
 
 
 @pytest.fixture(autouse=True)
@@ -17,7 +18,14 @@ def _clear_cache():
 
 def test_store_and_get_transcription():
     cache.store_transcription("file_abc", "hello world")
-    assert cache.get_transcription("file_abc") == "hello world"
+    cached = cache.get_transcription("file_abc")
+    assert cached == CachedTranscription("hello world", None)
+
+
+def test_store_and_get_transcription_with_language():
+    cache.store_transcription("file_abc", "привіт", "uk")
+    cached = cache.get_transcription("file_abc")
+    assert cached == CachedTranscription("привіт", "uk")
 
 
 def test_get_missing_returns_none():
@@ -75,7 +83,7 @@ async def test_store_by_hash_is_noop_when_pool_unavailable():
 @pytest.mark.asyncio
 async def test_get_by_hash_swallows_postgres_errors():
     fake_pool = AsyncMock()
-    fake_pool.fetchval = AsyncMock(side_effect=RuntimeError("neon down"))
+    fake_pool.fetchrow = AsyncMock(side_effect=RuntimeError("neon down"))
     with patch("cache.analytics_pool.get", return_value=fake_pool):
         assert await cache.get_by_hash("abc123") is None
 
@@ -93,30 +101,43 @@ async def test_store_by_hash_swallows_postgres_errors():
 @pytest.mark.asyncio
 async def test_get_by_hash_returns_text_on_hit():
     fake_pool = AsyncMock()
-    fake_pool.fetchval = AsyncMock(return_value="cached transcript")
+    fake_pool.fetchrow = AsyncMock(
+        return_value={"text": "cached transcript", "detected_language": "en"}
+    )
     with patch("cache.analytics_pool.get", return_value=fake_pool):
         result = await cache.get_by_hash("abc123")
-    assert result == "cached transcript"
-    fake_pool.fetchval.assert_awaited_once()
+    assert result == CachedTranscription("cached transcript", "en")
+    fake_pool.fetchrow.assert_awaited_once()
     # Hash is the first SQL arg
-    assert fake_pool.fetchval.await_args.args[1] == "abc123"
+    assert fake_pool.fetchrow.await_args.args[1] == "abc123"
 
 
 @pytest.mark.asyncio
 async def test_get_by_hash_returns_none_on_miss():
     fake_pool = AsyncMock()
-    fake_pool.fetchval = AsyncMock(return_value=None)
+    fake_pool.fetchrow = AsyncMock(return_value=None)
     with patch("cache.analytics_pool.get", return_value=fake_pool):
         assert await cache.get_by_hash("missing") is None
 
 
 @pytest.mark.asyncio
-async def test_store_by_hash_passes_hash_and_text():
+async def test_store_by_hash_passes_hash_text_and_language():
+    fake_pool = AsyncMock()
+    fake_pool.execute = AsyncMock(return_value="INSERT 0 1")
+    with patch("cache.analytics_pool.get", return_value=fake_pool):
+        await cache.store_by_hash("hash_xyz", "the transcript", "uk")
+    fake_pool.execute.assert_awaited_once()
+    args = fake_pool.execute.await_args.args
+    assert args[1] == "hash_xyz"
+    assert args[2] == "the transcript"
+    assert args[3] == "uk"
+
+
+@pytest.mark.asyncio
+async def test_store_by_hash_defaults_language_to_none():
     fake_pool = AsyncMock()
     fake_pool.execute = AsyncMock(return_value="INSERT 0 1")
     with patch("cache.analytics_pool.get", return_value=fake_pool):
         await cache.store_by_hash("hash_xyz", "the transcript")
     fake_pool.execute.assert_awaited_once()
-    args = fake_pool.execute.await_args.args
-    assert args[1] == "hash_xyz"
-    assert args[2] == "the transcript"
+    assert fake_pool.execute.await_args.args[3] is None
