@@ -28,10 +28,11 @@ def _sample_overview():
             TopUser(7, "alice", "Alice", 23),
             TopUser(8, None, "Bob", 11),
         ],
-        cache_hit_rate_24h=0.314, latency_p50_ms=4200, latency_p95_ms=11800,
-        error_rate_24h=0.007, rate_limited_24h=11,
+        error_rate_24h=0.007,
         total_tokens_24h=1_234_567, minutes_24h=42.5,
         rpm_now=3, rpd_today=87,
+        cost_usd_24h=0.1234, cost_usd_30d=2.4567,
+        price_per_1m_input=0.10, price_per_1m_output=0.40,
     )
 
 
@@ -39,12 +40,26 @@ def test_render_overview_includes_key_sections():
     out = formatter.render_overview(_sample_overview())
     assert "<b>Volume</b>" in out
     assert "<b>Top users (24h)</b>" in out
-    assert "<b>Performance (24h)</b>" in out
-    assert "<b>Cost (24h)</b>" in out
+    assert "<b>Cost</b>" in out
+    assert "Performance" not in out
     assert "@alice" in out
     assert "Bob" in out
-    assert "31.4%" in out  # cache hit rate (0.314 → 31.4%)
     assert "1.23M" in out   # tokens formatted
+    assert "$0.1234" in out  # 24h cost (<$1 → 4 decimals)
+    assert "$2.46" in out    # 30d cost (≥$1 → 2 decimals)
+    assert "Error rate (24h)" in out
+    assert "0.7%" in out     # error_rate 0.007 → 0.7%
+
+
+def test_render_overview_hides_usd_when_pricing_zero():
+    s = _sample_overview()
+    s.price_per_1m_input = 0.0
+    s.price_per_1m_output = 0.0
+    s.cost_usd_24h = 0.0
+    s.cost_usd_30d = 0.0
+    out = formatter.render_overview(s)
+    assert "USD" not in out
+    assert "Tokens 24h" in out  # tokens still shown
 
 
 def test_top_user_label_falls_back_to_first_name_then_user_id():
