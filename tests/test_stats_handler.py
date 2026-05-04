@@ -109,6 +109,28 @@ async def test_subcommand_users_dispatched(monkeypatch):
     assert msg.reply_text.call_args.args[0] == "USERS"
 
 
+async def test_subcommand_all_users_dispatched_with_page(monkeypatch):
+    monkeypatch.setattr("handlers.stats.ADMIN_USER_ID", 42)
+    monkeypatch.setattr(analytics, "is_enabled", lambda: True)
+
+    seen_pages = []
+
+    async def fake_all(page=1, page_size=50):
+        seen_pages.append(page)
+        return SimpleNamespace(page=page, total_pages=3)
+
+    monkeypatch.setattr(analytics, "get_all_users_section", fake_all)
+    monkeypatch.setattr(analytics, "render_all_users", lambda s: "ALL")
+
+    update, msg = _make_update(user_id=42)
+    await stats_handler.stats_command(update, _make_context(args=["all_users", "2"]))
+    assert seen_pages == [2]
+    assert msg.reply_text.call_args.args[0] == "ALL"
+    # Pagination keyboard should be attached on a multi-page result.
+    keyboard = msg.reply_text.call_args.kwargs.get("reply_markup")
+    assert keyboard is not None
+
+
 async def test_unknown_subcommand_returns_help(monkeypatch):
     monkeypatch.setattr("handlers.stats.ADMIN_USER_ID", 42)
     monkeypatch.setattr(analytics, "is_enabled", lambda: True)

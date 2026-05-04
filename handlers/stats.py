@@ -22,6 +22,7 @@ _OVERVIEW_TTL_SEC = 5.0
 _SECTIONS = [
     ("overview", "Overview"),
     ("users", "Users"),
+    ("all_users", "All users"),
     ("content", "Content"),
     ("perf", "Perf"),
     ("cost", "Cost"),
@@ -48,7 +49,8 @@ def nav_keyboard(
             callback_data=f"stats:{key}:1",
         )
 
-    rows.append([_btn("overview", "Overview"), _btn("users", "Users")])
+    rows.append([_btn("overview", "Overview"), _btn("users", "Users"),
+                 _btn("all_users", "All users")])
     rows.append([_btn("content", "Content"), _btn("perf", "Perf"), _btn("cost", "Cost")])
     return InlineKeyboardMarkup(rows)
 
@@ -151,11 +153,14 @@ async def _render_with_keyboard(sub: str, page: int = 1) -> tuple[str, InlineKey
             _overview_cache = (now, text)
         return text, nav_keyboard("overview")
     if sub in ("users", "u"):
-        s = await analytics.get_users_section(page=page)
-        text = analytics.render_users(s)
+        text = analytics.render_users(await analytics.get_users_section())
+        return text, nav_keyboard("users")
+    if sub in ("all_users", "all", "a"):
+        s = await analytics.get_all_users_section(page=page)
+        text = analytics.render_all_users(s)
         _page = getattr(s, "page", page)
         _total_pages = getattr(s, "total_pages", 1)
-        return text, nav_keyboard("users", page=_page, total_pages=_total_pages)
+        return text, nav_keyboard("all_users", page=_page, total_pages=_total_pages)
     if sub in ("content", "c"):
         text = analytics.render_content(await analytics.get_content_section())
         return text, nav_keyboard("content")
@@ -167,11 +172,12 @@ async def _render_with_keyboard(sub: str, page: int = 1) -> tuple[str, InlineKey
         return text, nav_keyboard("cost")
     return (
         "Unknown subcommand. Use one of:\n"
-        "  /stats           — overview\n"
-        "  /stats users     — cohorts and all users\n"
-        "  /stats content   — media types, durations, languages\n"
-        "  /stats perf      — latency, errors, cache, rate-limits\n"
-        "  /stats cost      — tokens, minutes, RPM/RPD"
+        "  /stats             — overview\n"
+        "  /stats users       — cohorts, top 30d, languages\n"
+        "  /stats all_users   — paginated list of all users\n"
+        "  /stats content     — media types, durations, languages\n"
+        "  /stats perf        — latency, errors, cache, rate-limits\n"
+        "  /stats cost        — tokens, minutes, RPM/RPD"
     ), nav_keyboard("overview")
 
 

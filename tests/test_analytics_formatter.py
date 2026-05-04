@@ -3,14 +3,14 @@ from __future__ import annotations
 
 from analytics import formatter
 from analytics.queries import (
+    AllUsersSection,
     ContentSection,
     CostSection,
     CountedRow,
     OverviewSection,
     PerfSection,
     TopUser,
-    TopUserByCost,
-    TopUserByTokens,
+    TopUserUsage,
     UsersSection,
 )
 
@@ -97,8 +97,7 @@ def test_render_users_handles_empty_lists():
     s = UsersSection(
         total_users=0, dau=0, wau=0, mau=0,
         new_users_today=0, new_users_7d=0,
-        top_users_all=[], top_users_30d=[], top_users_by_tokens_30d=[],
-        top_users_by_cost_30d=[],
+        top_users_30d=[],
         languages=[],
     )
     out = formatter.render_users(s)
@@ -106,34 +105,87 @@ def test_render_users_handles_empty_lists():
     assert "(none)" in out
 
 
-def test_render_users_includes_cost_when_pricing_active():
+def test_render_users_merges_tokens_and_cost_when_pricing_active():
     s = UsersSection(
         total_users=1, dau=1, wau=1, mau=1,
         new_users_today=0, new_users_7d=0,
-        top_users_all=[], top_users_30d=[], top_users_by_tokens_30d=[],
-        top_users_by_cost_30d=[
-            TopUserByCost(7, "alice", "Alice", 0.0123),
-            TopUserByCost(8, None, "Bob", 0.0042),
+        top_users_30d=[
+            TopUserUsage(7, "alice", "Alice", total_events=12, tokens=72_500, cost_usd=0.0089),
+            TopUserUsage(8, None, "Bob", total_events=3, tokens=4_200, cost_usd=0.0006),
         ],
         languages=[],
+        price_per_1m_input=0.10, price_per_1m_output=0.40,
     )
     out = formatter.render_users(s)
-    assert "by cost" in out
+    # Header advertises the merged columns
+    assert "ev · tokens · USD" in out
     assert "@alice" in out
-    assert "$0.0123" in out
+    # Single row contains all three metrics
+    assert "12 ev · 72.5K · $0.0089" in out
+    # No more separate sections
+    assert "by cost" not in out
+    assert "by tokens" not in out
 
 
-def test_render_users_hides_cost_when_top_is_zero():
-    """If pricing is disabled (price=0), top_users_by_cost_30d entries are 0 → hide."""
+def test_render_users_hides_cost_when_pricing_zero():
     s = UsersSection(
         total_users=1, dau=1, wau=1, mau=1,
         new_users_today=0, new_users_7d=0,
-        top_users_all=[], top_users_30d=[], top_users_by_tokens_30d=[],
-        top_users_by_cost_30d=[TopUserByCost(7, "alice", "Alice", 0.0)],
+        top_users_30d=[
+            TopUserUsage(7, "alice", "Alice", total_events=5, tokens=1_000, cost_usd=0.0),
+        ],
         languages=[],
+        price_per_1m_input=0.0, price_per_1m_output=0.0,
     )
     out = formatter.render_users(s)
-    assert "by cost" not in out
+    assert "USD" not in out
+    assert "$" not in out
+    assert "5 ev · 1.0K" in out
+
+
+def test_render_all_users_paginates():
+    s = AllUsersSection(
+        total_users=120,
+        top_users_all=[
+            TopUserUsage(7, "alice", "Alice", total_events=200, tokens=10_000, cost_usd=0.01),
+        ],
+        page=2, total_pages=3, page_size=50,
+        price_per_1m_input=0.10, price_per_1m_output=0.40,
+    )
+    out = formatter.render_all_users(s)
+    assert "all users" in out
+    assert "page 2/3" in out
+    # Offset numbering: page 2 starts at #51
+    assert "51." in out
+    assert "@alice" in out
+    assert "200 ev · 10.0K · $0.0100" in out
+
+
+def test_render_all_users_no_pagination_indicator_on_single_page():
+    s = AllUsersSection(
+        total_users=3,
+        top_users_all=[
+            TopUserUsage(1, "a", "A", total_events=5, tokens=100, cost_usd=0.0),
+            TopUserUsage(2, "b", "B", total_events=3, tokens=50, cost_usd=0.0),
+        ],
+        page=1, total_pages=1, page_size=50,
+        price_per_1m_input=0.0, price_per_1m_output=0.0,
+    )
+    out = formatter.render_all_users(s)
+    assert "page" not in out.lower()
+    # Header without USD when pricing is off
+    assert "ev · tokens" in out
+    assert "USD" not in out
+
+
+def test_render_all_users_handles_empty():
+    s = AllUsersSection(
+        total_users=0, top_users_all=[],
+        page=1, total_pages=1, page_size=50,
+    )
+    out = formatter.render_all_users(s)
+    assert "Total users:" in out
+    assert "(none)" in out
 
 
 def test_render_content_with_data():
