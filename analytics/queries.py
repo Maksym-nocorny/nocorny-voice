@@ -29,18 +29,13 @@ class TopUser:
 
 
 @dataclass
-class TopUserByTokens:
+class TopUserUsage:
+    """Per-user usage metrics: events, tokens, cost — joined for one row."""
     user_id: int
     username: Optional[str]
     first_name: Optional[str]
+    total_events: int
     tokens: int
-
-
-@dataclass
-class TopUserByCost:
-    user_id: int
-    username: Optional[str]
-    first_name: Optional[str]
     cost_usd: float
 
 
@@ -81,14 +76,22 @@ class UsersSection:
     mau: int
     new_users_today: int
     new_users_7d: int
-    top_users_all: list[TopUser]
-    top_users_30d: list[TopUser]
-    top_users_by_tokens_30d: list[TopUserByTokens]
-    top_users_by_cost_30d: list[TopUserByCost]
+    top_users_30d: list[TopUserUsage]
     languages: list[CountedRow]
+    price_per_1m_input: float = 0.0
+    price_per_1m_output: float = 0.0
+
+
+@dataclass
+class AllUsersSection:
+    """Paginated all-time list with per-user events/tokens/cost."""
+    total_users: int
+    top_users_all: list[TopUserUsage]
     page: int = 1
     total_pages: int = 1
     page_size: int = 50
+    price_per_1m_input: float = 0.0
+    price_per_1m_output: float = 0.0
 
 
 @dataclass
@@ -232,15 +235,12 @@ async def get_overview() -> Optional[OverviewSection]:
 # --------------------------------------------------------------------------- users
 
 
-async def get_users_section(page: int = 1, page_size: int = 50) -> Optional[UsersSection]:
+async def get_users_section() -> Optional[UsersSection]:
     p = pool.get()
     if p is None:
         return None
-    total_users = await _scalar(p, "SELECT count(*) FROM nocorny_voice.users")
-    total_pages = max(1, (total_users + page_size - 1) // page_size)
-    page = max(1, min(page, total_pages))
-
     results = await asyncio.gather(
+        _scalar(p, "SELECT count(*) FROM nocorny_voice.users"),
         _scalar(p,
             "SELECT count(DISTINCT user_id) FROM nocorny_voice.events "
             "WHERE ts >= now() - interval '1 day'"),
@@ -256,27 +256,40 @@ async def get_users_section(page: int = 1, page_size: int = 50) -> Optional[User
         _scalar(p,
             "SELECT count(*) FROM nocorny_voice.users "
             "WHERE first_seen_at >= now() - interval '7 days'"),
-        _top_users_all_page(p, page, page_size),
-        _top_users_in(p, "30 days", 20),
-        _top_users_by_tokens(p, "30 days", 20),
-        _top_users_by_cost(p, "30 days", 20),
+        _top_users_usage_in(p, "30 days", 10),
         _languages(p),
     )
     return UsersSection(
-        total_users=total_users,
-        dau=results[0],
-        wau=results[1],
-        mau=results[2],
-        new_users_today=results[3],
-        new_users_7d=results[4],
-        top_users_all=results[5],
+        total_users=results[0],
+        dau=results[1],
+        wau=results[2],
+        mau=results[3],
+        new_users_today=results[4],
+        new_users_7d=results[5],
         top_users_30d=results[6],
-        top_users_by_tokens_30d=results[7],
-        top_users_by_cost_30d=results[8],
-        languages=results[9],
+        languages=results[7],
+        price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
+        price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
+    )
+
+
+async def get_all_users_section(page: int = 1, page_size: int = 50
+                                ) -> Optional[AllUsersSection]:
+    p = pool.get()
+    if p is None:
+        return None
+    total_users = await _scalar(p, "SELECT count(*) FROM nocorny_voice.users")
+    total_pages = max(1, (total_users + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    rows = await _top_users_all_page_with_usage(p, page, page_size)
+    return AllUsersSection(
+        total_users=total_users,
+        top_users_all=rows,
         page=page,
         total_pages=total_pages,
         page_size=page_size,
+        price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
+        price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
 
 
@@ -449,18 +462,6 @@ async def get_cost_section() -> Optional[CostSection]:
 # --------------------------------------------------------------------------- subqueries
 
 
-async def _top_users_all_page(p: asyncpg.Pool, page: int, page_size: int) -> list[TopUser]:
-    rows = await p.fetch(
-        "SELECT user_id, username, first_name, total_events "
-        "FROM nocorny_voice.users "
-        "ORDER BY total_events DESC LIMIT $1 OFFSET $2",
-        page_size,
-        (page - 1) * page_size,
-    )
-    return [TopUser(r["user_id"], r["username"], r["first_name"], r["total_events"])
-            for r in rows]
-
-
 async def _top_users_in(p: asyncpg.Pool, interval: str, limit: int) -> list[TopUser]:
     rows = await p.fetch(
         "SELECT e.user_id, u.username, u.first_name, count(*) AS c "
@@ -475,39 +476,63 @@ async def _top_users_in(p: asyncpg.Pool, interval: str, limit: int) -> list[TopU
             for r in rows]
 
 
-async def _top_users_by_tokens(p: asyncpg.Pool, interval: str, limit: int
-                               ) -> list[TopUserByTokens]:
-    rows = await p.fetch(
-        "SELECT e.user_id, u.username, u.first_name, COALESCE(SUM(e.total_tokens),0) AS t "
-        "FROM nocorny_voice.events e "
-        "LEFT JOIN nocorny_voice.users u USING (user_id) "
-        f"WHERE e.event_type='transcribe_success' AND e.ts >= now() - interval '{interval}' "
-        "GROUP BY e.user_id, u.username, u.first_name "
-        "ORDER BY t DESC LIMIT $1",
-        limit,
-    )
-    return [TopUserByTokens(r["user_id"], r["username"], r["first_name"], int(r["t"]))
-            for r in rows]
-
-
-async def _top_users_by_cost(p: asyncpg.Pool, interval: str, limit: int
-                             ) -> list[TopUserByCost]:
+async def _top_users_usage_in(p: asyncpg.Pool, interval: str, limit: int
+                              ) -> list[TopUserUsage]:
+    """Top users in a window with events/tokens/cost computed from transcribe_success."""
     cost_select = (
         f"COALESCE(SUM(e.prompt_tokens),0) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
         f"COALESCE(SUM(e.candidates_tokens),0) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
     )
     rows = await p.fetch(
         "SELECT e.user_id, u.username, u.first_name, "
+        "count(*) AS ev, "
+        "COALESCE(SUM(e.total_tokens),0) AS tk, "
         f"({cost_select}) AS c "
         "FROM nocorny_voice.events e "
         "LEFT JOIN nocorny_voice.users u USING (user_id) "
         f"WHERE e.event_type='transcribe_success' AND e.ts >= now() - interval '{interval}' "
         "GROUP BY e.user_id, u.username, u.first_name "
-        "ORDER BY c DESC LIMIT $1",
+        "ORDER BY tk DESC LIMIT $1",
         limit,
     )
-    return [TopUserByCost(r["user_id"], r["username"], r["first_name"], float(r["c"]))
-            for r in rows]
+    return [TopUserUsage(
+        r["user_id"], r["username"], r["first_name"],
+        int(r["ev"]), int(r["tk"]), float(r["c"]),
+    ) for r in rows]
+
+
+async def _top_users_all_page_with_usage(p: asyncpg.Pool, page: int, page_size: int
+                                         ) -> list[TopUserUsage]:
+    """Page through all users sorted by lifetime total_events; left-join lifetime usage."""
+    cost_select = (
+        f"COALESCE(SUM(e.prompt_tokens),0) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
+        f"COALESCE(SUM(e.candidates_tokens),0) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
+    )
+    rows = await p.fetch(
+        "WITH page_users AS ("
+        "  SELECT user_id, username, first_name, total_events "
+        "  FROM nocorny_voice.users "
+        "  ORDER BY total_events DESC LIMIT $1 OFFSET $2"
+        "), usage AS ("
+        "  SELECT e.user_id, "
+        "    COALESCE(SUM(e.total_tokens),0) AS tk, "
+        f"   ({cost_select}) AS c "
+        "  FROM nocorny_voice.events e "
+        "  WHERE e.event_type='transcribe_success' "
+        "    AND e.user_id IN (SELECT user_id FROM page_users) "
+        "  GROUP BY e.user_id"
+        ") "
+        "SELECT p.user_id, p.username, p.first_name, p.total_events, "
+        "       COALESCE(u.tk, 0) AS tk, COALESCE(u.c, 0) AS c "
+        "FROM page_users p LEFT JOIN usage u USING (user_id) "
+        "ORDER BY p.total_events DESC",
+        page_size,
+        (page - 1) * page_size,
+    )
+    return [TopUserUsage(
+        r["user_id"], r["username"], r["first_name"],
+        int(r["total_events"]), int(r["tk"]), float(r["c"]),
+    ) for r in rows]
 
 
 async def _languages(p: asyncpg.Pool) -> list[CountedRow]:

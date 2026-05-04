@@ -7,13 +7,13 @@ from typing import Optional
 from utils.markdown import escape_html
 
 from .queries import (
+    AllUsersSection,
     ContentSection,
     CostSection,
     OverviewSection,
     PerfSection,
     TopUser,
-    TopUserByCost,
-    TopUserByTokens,
+    TopUserUsage,
     UsersSection,
 )
 
@@ -66,21 +66,19 @@ def _fmt_top_users(users: list[TopUser], *, offset: int = 0) -> str:
     return "\n".join(lines)
 
 
-def _fmt_top_users_tokens(users: list[TopUserByTokens]) -> str:
+def _fmt_top_users_usage(users: list[TopUserUsage], *,
+                         show_cost: bool, offset: int = 0) -> str:
     if not users:
         return "  (none)"
     lines = []
-    for i, u in enumerate(users, 1):
-        lines.append(f"  {i}. {_user_label(u)} — {_fmt_tokens(u.tokens)}")
-    return "\n".join(lines)
-
-
-def _fmt_top_users_cost(users: list[TopUserByCost]) -> str:
-    if not users:
-        return "  (none)"
-    lines = []
-    for i, u in enumerate(users, 1):
-        lines.append(f"  {i}. {_user_label(u)} — {_fmt_usd(u.cost_usd)}")
+    for i, u in enumerate(users, 1 + offset):
+        ev = _fmt_int(u.total_events)
+        tk = _fmt_tokens(u.tokens)
+        if show_cost:
+            metrics = f"{ev} ev · {tk} · {_fmt_usd(u.cost_usd)}"
+        else:
+            metrics = f"{ev} ev · {tk}"
+        lines.append(f"  {i}. {_user_label(u)} — {metrics}")
     return "\n".join(lines)
 
 
@@ -133,37 +131,39 @@ def render_overview(s: Optional[OverviewSection]) -> str:
 def render_users(s: Optional[UsersSection]) -> str:
     if s is None:
         return _empty("Analytics not available.")
-
-    page_info = f" — page {s.page}/{s.total_pages}" if s.total_pages > 1 else ""
-    offset = (s.page - 1) * s.page_size
-
-    if s.page > 1:
-        end = offset + len(s.top_users_all)
-        return (
-            f"<b>Nocorny.voice — users{page_info}</b>\n"
-            f"<i>{_now_utc()}</i>\n\n"
-            f"<b>All users (all-time, by events, #{offset + 1}–#{end})</b>\n"
-            f"{_fmt_top_users(s.top_users_all, offset=offset)}"
-        )
-
-    cost_block = (
-        f"<b>Top users (30d, by cost)</b>\n{_fmt_top_users_cost(s.top_users_by_cost_30d)}\n\n"
-        if s.top_users_by_cost_30d and s.top_users_by_cost_30d[0].cost_usd > 0
-        else ""
-    )
-    all_time_label = "All users" if s.total_pages > 1 else "Top users"
+    show_cost = s.price_per_1m_input > 0 or s.price_per_1m_output > 0
+    header = "ev · tokens · USD" if show_cost else "ev · tokens"
     return (
-        f"<b>Nocorny.voice — users{page_info}</b>\n"
+        f"<b>Nocorny.voice — users</b>\n"
         f"<i>{_now_utc()}</i>\n\n"
         f"<b>Cohorts</b>\n"
         f"  • Total users: {_fmt_int(s.total_users)}\n"
         f"  • DAU {_fmt_int(s.dau)}  •  WAU {_fmt_int(s.wau)}  •  MAU {_fmt_int(s.mau)}\n"
         f"  • New today: {_fmt_int(s.new_users_today)}  •  new 7d: {_fmt_int(s.new_users_7d)}\n\n"
-        f"<b>{all_time_label} (all-time, by events)</b>\n{_fmt_top_users(s.top_users_all)}\n\n"
-        f"<b>Top users (30d, by events)</b>\n{_fmt_top_users(s.top_users_30d)}\n\n"
-        f"<b>Top users (30d, by tokens)</b>\n{_fmt_top_users_tokens(s.top_users_by_tokens_30d)}\n\n"
-        f"{cost_block}"
+        f"<b>Top users (30d) — {header}</b>\n"
+        f"{_fmt_top_users_usage(s.top_users_30d, show_cost=show_cost)}\n\n"
         f"<b>Languages</b>\n{_fmt_grouped(s.languages)}"
+    )
+
+
+# --------------------------------------------------------------------------- all users
+
+
+def render_all_users(s: Optional[AllUsersSection]) -> str:
+    if s is None:
+        return _empty("Analytics not available.")
+    show_cost = s.price_per_1m_input > 0 or s.price_per_1m_output > 0
+    page_info = f" — page {s.page}/{s.total_pages}" if s.total_pages > 1 else ""
+    offset = (s.page - 1) * s.page_size
+    end = offset + len(s.top_users_all)
+    range_info = f", #{offset + 1}–#{end}" if s.total_users > 0 else ""
+    header = "ev · tokens · USD" if show_cost else "ev · tokens"
+    return (
+        f"<b>Nocorny.voice — all users{page_info}</b>\n"
+        f"<i>{_now_utc()}</i>\n\n"
+        f"<b>Total users:</b> {_fmt_int(s.total_users)}\n\n"
+        f"<b>By all-time events{range_info} — {header}</b>\n"
+        f"{_fmt_top_users_usage(s.top_users_all, show_cost=show_cost, offset=offset)}"
     )
 
 

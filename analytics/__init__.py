@@ -27,6 +27,7 @@ from config import (
 
 from . import pool, schema, tracker
 from .formatter import (
+    render_all_users,
     render_content,
     render_cost,
     render_overview,
@@ -34,6 +35,7 @@ from .formatter import (
     render_users,
 )
 from .queries import (
+    get_all_users_section,
     get_content_section,
     get_cost_section,
     get_overview,
@@ -91,11 +93,13 @@ __all__ = [
     "track",
     "get_overview",
     "get_users_section",
+    "get_all_users_section",
     "get_content_section",
     "get_perf_section",
     "get_cost_section",
     "render_overview",
     "render_users",
+    "render_all_users",
     "render_content",
     "render_perf",
     "render_cost",
