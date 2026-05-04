@@ -28,14 +28,15 @@ Since you have already created the repository `https://github.com/maksymusmax/no
 4.  **Settings**:
     - **Name**: `nocorny-voice`
     - **Runtime**: Python 3
-    - **Build Command**: `apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt`
+    - **Build Command**: `pip install -r requirements.txt`
     - **Start Command**: `python bot.py`
     - **Plan**: Free
 
-    > **Why ffmpeg?** The bot splits long audio (>4 min by default) into chunks
-    > before sending to Gemini, which prevents the model from looping/hallucinating
-    > on multi-minute files. Without `ffmpeg`, long files still work but go through
-    > the single-shot path and may fail with `transcribe_degraded`.
+    > **ffmpeg** is bundled via the `imageio-ffmpeg` Python package (in
+    > `requirements.txt`), so no `apt-get` is needed. The bot uses ffmpeg to
+    > split long audio (>4 min by default) into chunks before sending to
+    > Gemini, which prevents flash-lite from looping/hallucinating on
+    > multi-minute files.
 5.  **Environment Variables**:
     - `GEMINI_API_KEY`: (Copy from your .env file)
     - `TELEGRAM_BOT_TOKEN`: (Copy from your .env file)
