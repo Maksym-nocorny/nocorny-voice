@@ -39,7 +39,10 @@ def _sample_overview():
 
 def test_render_overview_includes_key_sections():
     out = formatter.render_overview(_sample_overview())
-    assert "<b>Volume</b>" in out
+    assert "<b>Requests</b>" in out
+    assert "Last hour: 3" in out
+    assert "Last 24h:  87" in out
+    assert "Last 7d:   512" in out
     assert "<b>Top users (24h)</b>" in out
     assert "<b>Cost</b>" in out
     assert "Performance" not in out
