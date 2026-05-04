@@ -12,6 +12,7 @@ from .queries import (
     CostSection,
     OverviewSection,
     PerfSection,
+    TopGroup,
     TopUser,
     TopUserUsage,
     UsersSection,
@@ -82,6 +83,29 @@ def _fmt_top_users_usage(users: list[TopUserUsage], *,
     return "\n".join(lines)
 
 
+_GROUP_TYPE_TAG = {
+    "group": "group",
+    "supergroup": "supergroup",
+    "channel": "channel",
+}
+
+
+def _group_label(g: TopGroup) -> str:
+    name = (g.title or "").strip() or f"chat_{g.chat_id}"
+    tag = _GROUP_TYPE_TAG.get(g.chat_type, g.chat_type)
+    return (f"{escape_html(name)} <i>({escape_html(tag)})</i>"
+            f" · <code>{g.chat_id}</code>")
+
+
+def _fmt_top_groups(groups: list[TopGroup], *, offset: int = 0) -> str:
+    if not groups:
+        return "  (none)"
+    lines = []
+    for i, g in enumerate(groups, 1 + offset):
+        lines.append(f"  {i}. {_group_label(g)} — {_fmt_int(g.total_events)}")
+    return "\n".join(lines)
+
+
 def _fmt_grouped(rows, *, label: str = "") -> str:
     if not rows:
         return "  (none)"
@@ -133,6 +157,7 @@ def render_users(s: Optional[UsersSection]) -> str:
         return _empty("Analytics not available.")
     show_cost = s.price_per_1m_input > 0 or s.price_per_1m_output > 0
     header = "ev · tokens · USD" if show_cost else "ev · tokens"
+    groups_header = f"<b>Groups using the bot ({_fmt_int(s.total_groups)} total) — events</b>"
     return (
         f"<b>Nocorny.voice — users</b>\n"
         f"<i>{_now_utc()}</i>\n\n"
@@ -142,6 +167,8 @@ def render_users(s: Optional[UsersSection]) -> str:
         f"  • New today: {_fmt_int(s.new_users_today)}  •  new 7d: {_fmt_int(s.new_users_7d)}\n\n"
         f"<b>Top users (30d) — {header}</b>\n"
         f"{_fmt_top_users_usage(s.top_users_30d, show_cost=show_cost)}\n\n"
+        f"{groups_header}\n"
+        f"{_fmt_top_groups(s.top_groups)}\n\n"
         f"<b>Languages</b>\n{_fmt_grouped(s.languages)}"
     )
 

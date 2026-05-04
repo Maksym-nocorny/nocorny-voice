@@ -32,12 +32,35 @@ CREATE TABLE IF NOT EXISTS nocorny_voice.events (
     error_class        text
 );
 
+CREATE TABLE IF NOT EXISTS nocorny_voice.chats (
+    chat_id        bigint       PRIMARY KEY,
+    chat_type      text         NOT NULL,
+    title          text,
+    first_seen_at  timestamptz  NOT NULL DEFAULT now(),
+    last_seen_at   timestamptz  NOT NULL DEFAULT now(),
+    total_events   integer      NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS events_ts_desc           ON nocorny_voice.events (ts DESC);
 CREATE INDEX IF NOT EXISTS events_user_ts           ON nocorny_voice.events (user_id, ts DESC);
 CREATE INDEX IF NOT EXISTS events_type_ts           ON nocorny_voice.events (event_type, ts DESC);
 CREATE INDEX IF NOT EXISTS events_success_user      ON nocorny_voice.events (user_id) WHERE event_type = 'transcribe_success';
 CREATE INDEX IF NOT EXISTS users_last_seen_desc     ON nocorny_voice.users (last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS users_total_events_desc  ON nocorny_voice.users (total_events DESC);
+CREATE INDEX IF NOT EXISTS chats_total_events_desc  ON nocorny_voice.chats (total_events DESC);
+CREATE INDEX IF NOT EXISTS chats_type               ON nocorny_voice.chats (chat_type);
+
+-- Backfill chats from historical events. Only runs for chats not yet present
+-- (ON CONFLICT DO NOTHING). Live tracker updates take over from there.
+INSERT INTO nocorny_voice.chats (chat_id, chat_type, total_events, first_seen_at, last_seen_at)
+SELECT chat_id,
+       (array_agg(chat_type ORDER BY ts DESC))[1],
+       count(*),
+       min(ts),
+       max(ts)
+FROM nocorny_voice.events
+GROUP BY chat_id
+ON CONFLICT (chat_id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS nocorny_voice.transcription_cache (
     content_hash   text         PRIMARY KEY,

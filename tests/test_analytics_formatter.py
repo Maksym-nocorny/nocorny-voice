@@ -9,6 +9,7 @@ from analytics.queries import (
     CountedRow,
     OverviewSection,
     PerfSection,
+    TopGroup,
     TopUser,
     TopUserUsage,
     UsersSection,
@@ -102,7 +103,48 @@ def test_render_users_handles_empty_lists():
     )
     out = formatter.render_users(s)
     assert "Top users" in out
+    assert "Groups using the bot" in out
     assert "(none)" in out
+
+
+def test_render_users_lists_top_groups():
+    s = UsersSection(
+        total_users=10, dau=2, wau=5, mau=8,
+        new_users_today=0, new_users_7d=1,
+        top_users_30d=[],
+        languages=[],
+        top_groups=[
+            TopGroup(chat_id=-1001234, chat_type="supergroup",
+                     title="Devs UA", total_events=42),
+            TopGroup(chat_id=-99, chat_type="group",
+                     title=None, total_events=3),
+        ],
+        total_groups=2,
+    )
+    out = formatter.render_users(s)
+    assert "Groups using the bot (2 total)" in out
+    assert "Devs UA" in out
+    assert "supergroup" in out
+    assert "<code>-1001234</code>" in out
+    # Title falls back to a chat_<id> placeholder when title is missing.
+    assert "chat_-99" in out
+    assert "42" in out
+
+
+def test_render_users_escapes_group_titles():
+    s = UsersSection(
+        total_users=1, dau=1, wau=1, mau=1,
+        new_users_today=0, new_users_7d=0,
+        top_users_30d=[], languages=[],
+        top_groups=[
+            TopGroup(chat_id=-1, chat_type="supergroup",
+                     title="<script>x</script>", total_events=1),
+        ],
+        total_groups=1,
+    )
+    out = formatter.render_users(s)
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
 
 
 def test_render_users_merges_tokens_and_cost_when_pricing_active():
