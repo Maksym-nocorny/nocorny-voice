@@ -643,7 +643,8 @@ async def _error_rate(p: asyncpg.Pool, interval: str) -> float:
         SELECT
             COALESCE(
                 count(*) FILTER (WHERE event_type IN
-                    ('error_unknown','processing_failed','rate_limited_gemini'))::float /
+                    ('error_unknown','processing_failed','rate_limited_gemini',
+                     'transcribe_degraded'))::float /
                 NULLIF(count(*) FILTER (WHERE event_type='transcribe_request'),0),
                 0
             )

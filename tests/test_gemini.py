@@ -1,7 +1,7 @@
 """Tests for pure helpers in gemini_service (no Gemini API calls)."""
 from __future__ import annotations
 
-from gemini_service import _split_language_prefix
+from gemini_service import _is_likely_loop, _split_language_prefix
 
 
 def test_strips_lang_marker_and_returns_code():
@@ -46,3 +46,37 @@ def test_strips_leading_whitespace_after_marker():
     text, lang = _split_language_prefix("LANG:de\n   Hallo")
     assert text == "Hallo"
     assert lang == "de"
+
+
+# --- _is_likely_loop -------------------------------------------------------
+
+
+def test_loop_detected_when_at_max_tokens():
+    # 8192 / 8192 = 100% — clearly capped, almost always a runaway.
+    assert _is_likely_loop(out_tokens=8192, duration_sec=600, max_tokens=8192)
+
+
+def test_loop_detected_when_close_to_max_tokens():
+    # 7800 / 8192 ≈ 95.2% — also flagged.
+    assert _is_likely_loop(out_tokens=7800, duration_sec=600, max_tokens=8192)
+
+
+def test_loop_detected_when_rate_too_high():
+    # 1000 tokens for 50 seconds = 20 tok/s — way above the 8/s threshold.
+    assert _is_likely_loop(out_tokens=1000, duration_sec=50, max_tokens=8192)
+
+
+def test_normal_long_speech_not_flagged():
+    # 2000 tokens over 600s = 3.3 tok/s — comfortably normal speech.
+    assert not _is_likely_loop(out_tokens=2000, duration_sec=600, max_tokens=8192)
+
+
+def test_short_normal_speech_not_flagged():
+    # 200 tokens over 60s = 3.3 tok/s.
+    assert not _is_likely_loop(out_tokens=200, duration_sec=60, max_tokens=8192)
+
+
+def test_unknown_duration_only_uses_token_cap():
+    # Without duration we can only check the cap signal.
+    assert not _is_likely_loop(out_tokens=200, duration_sec=None, max_tokens=8192)
+    assert _is_likely_loop(out_tokens=8192, duration_sec=None, max_tokens=8192)

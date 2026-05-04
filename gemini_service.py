@@ -1,20 +1,34 @@
-"""Wraps Gemini API: singleton model, async wrapper, retries, usage logging."""
+"""Wraps Gemini API: singleton model, async wrapper, retries, usage logging.
+
+For long files (> TRANSCRIBE_CHUNK_SEC) we split via ffmpeg and transcribe
+chunks in parallel. This avoids the flash-lite hallucination loops we observed
+on multi-minute audio (model would repeat tokens until hitting MAX_TOKENS).
+"""
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
+import os
 import random
+import shutil
+import tempfile
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple
 
 import google.generativeai as genai
 from google.api_core import exceptions
 
 from config import (
+    FFMPEG_PATH,
     GEMINI_API_KEY,
     GEMINI_RETRY_ATTEMPTS,
     GEMINI_RETRY_BASE_DELAY,
     MODEL_NAME,
+    TRANSCRIBE_CHUNK_CONCURRENCY,
+    TRANSCRIBE_CHUNK_SEC,
+    TRANSCRIBE_MAX_OUT_FRACTION,
+    TRANSCRIBE_MAX_OUT_PER_SEC,
     TRANSCRIBE_MAX_TOKENS,
     TRANSCRIBE_TEMPERATURE,
 )
@@ -53,6 +67,14 @@ class ProcessingFailedError(Exception):
     """Gemini Files API reported FAILED state for the uploaded file."""
 
 
+class TranscriptionDegradedError(Exception):
+    """Gemini hallucinated/looped or returned a blocked/truncated response.
+
+    Distinct from ProcessingFailedError so the handler can show a more
+    specific message and analytics can track these separately.
+    """
+
+
 @dataclass
 class GeminiResult:
     text: str
@@ -64,6 +86,7 @@ class GeminiResult:
 
 _configured = False
 _transcribe_model: Optional[genai.GenerativeModel] = None
+_ffmpeg_path: Optional[str] = None  # resolved on first use; "" means unavailable
 
 
 def _configure_once() -> None:
@@ -117,6 +140,22 @@ def _log_usage(operation: str, response) -> Tuple[int, int, int]:
     return p, c, t
 
 
+def _is_likely_loop(out_tokens: int, duration_sec: Optional[int],
+                    max_tokens: int = TRANSCRIBE_MAX_TOKENS) -> bool:
+    """Heuristic: did the model run away generating repetitive output?
+
+    Two signals (either triggers):
+      1. Output is at >=95% of max_tokens (response was capped — almost always bad).
+      2. Output rate > N tokens/sec (real speech tops out ~5-7).
+    """
+    if max_tokens > 0 and out_tokens >= int(max_tokens * TRANSCRIBE_MAX_OUT_FRACTION):
+        return True
+    if duration_sec and duration_sec > 0:
+        if out_tokens / duration_sec > TRANSCRIBE_MAX_OUT_PER_SEC:
+            return True
+    return False
+
+
 async def _retry(
     coro_factory: Callable[[], Awaitable],
     *,
@@ -143,9 +182,159 @@ async def _retry(
     raise RateLimitedError(str(last_exc) if last_exc else "rate limited")
 
 
-async def transcribe(file_path: str, mime_type: str) -> GeminiResult:
-    """Upload media to Gemini, wait for processing, transcribe, clean up."""
+def _ffmpeg_binary() -> Optional[str]:
+    """Resolve ffmpeg path once. Returns None if unavailable."""
+    global _ffmpeg_path
+    if _ffmpeg_path is None:
+        resolved = shutil.which(FFMPEG_PATH) or ""
+        _ffmpeg_path = resolved
+        if resolved:
+            logger.info("ffmpeg_resolved path=%s", resolved)
+        else:
+            logger.warning("ffmpeg_not_found path=%s — chunking disabled", FFMPEG_PATH)
+    return _ffmpeg_path or None
+
+
+async def _split_audio(file_path: str, chunk_sec: int) -> Tuple[List[str], str, str]:
+    """Split audio into chunks via ffmpeg. Re-encodes to opus mono 16kHz so
+    chunk boundaries are clean regardless of the source codec.
+
+    Returns (chunk_paths, mime_type, temp_dir). Caller owns temp_dir cleanup.
+    Raises RuntimeError on ffmpeg failure.
+    """
+    ffmpeg = _ffmpeg_binary()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not available")
+
+    temp_dir = tempfile.mkdtemp(prefix="nv_chunks_")
+    pattern = os.path.join(temp_dir, "chunk_%04d.ogg")
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg, "-y", "-i", file_path,
+        "-vn",
+        "-ac", "1", "-ar", "16000",
+        "-c:a", "libopus", "-b:a", "32k", "-application", "voip",
+        "-f", "segment", "-segment_time", str(chunk_sec),
+        "-reset_timestamps", "1",
+        pattern,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    chunks = sorted(glob.glob(os.path.join(temp_dir, "chunk_*.ogg")))
+    if proc.returncode != 0 or not chunks:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        tail = (stderr or b"")[-300:].decode("utf-8", errors="replace")
+        raise RuntimeError(f"ffmpeg failed (rc={proc.returncode}): {tail}")
+    logger.info("ffmpeg_split chunks=%d chunk_sec=%d", len(chunks), chunk_sec)
+    return chunks, "audio/ogg", temp_dir
+
+
+async def transcribe(
+    file_path: str,
+    mime_type: str,
+    duration_sec: Optional[int] = None,
+) -> GeminiResult:
+    """Public entry: single-shot for short files, chunked for long ones."""
     _configure_once()
+
+    chunking = (
+        TRANSCRIBE_CHUNK_SEC > 0
+        and duration_sec is not None
+        and duration_sec > TRANSCRIBE_CHUNK_SEC
+        and _ffmpeg_binary() is not None
+    )
+
+    if not chunking:
+        # Short file or ffmpeg unavailable → original single-shot path.
+        return await _transcribe_one(file_path, mime_type, duration_sec)
+
+    return await _transcribe_chunked(file_path, duration_sec)
+
+
+async def _transcribe_chunked(file_path: str, duration_sec: int) -> GeminiResult:
+    """Split, transcribe each chunk in parallel (bounded), assemble."""
+    try:
+        chunk_paths, chunk_mime, temp_dir = await _split_audio(file_path, TRANSCRIBE_CHUNK_SEC)
+    except RuntimeError as e:
+        logger.warning("ffmpeg_split_failed falling_back_to_single_shot exc=%s", e)
+        return await _transcribe_one(file_path, "audio/ogg", duration_sec)
+
+    try:
+        sem = asyncio.Semaphore(max(1, TRANSCRIBE_CHUNK_CONCURRENCY))
+        n = len(chunk_paths)
+
+        async def _do(idx: int, path: str) -> GeminiResult:
+            async with sem:
+                # Per-chunk duration is at most TRANSCRIBE_CHUNK_SEC; the last
+                # one may be shorter but using the cap is fine for loop
+                # detection (it only loosens the per-second threshold).
+                logger.info("chunk_transcribe_start idx=%d/%d", idx + 1, n)
+                return await _transcribe_one(path, chunk_mime, TRANSCRIBE_CHUNK_SEC)
+
+        results = await asyncio.gather(
+            *[_do(i, p) for i, p in enumerate(chunk_paths)],
+            return_exceptions=True,
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # Re-raise the first hard error if any chunk failed unrecoverably.
+    for r in results:
+        if isinstance(r, (RateLimitedError, ProcessingFailedError)):
+            raise r
+
+    # Surviving chunks (degraded ones contribute a placeholder).
+    parts: List[str] = []
+    p_total = c_total = t_total = 0
+    detected: Optional[str] = None
+    degraded_count = 0
+    for idx, r in enumerate(results):
+        if isinstance(r, TranscriptionDegradedError):
+            degraded_count += 1
+            parts.append(f"[фрагмент {idx + 1}: не вдалося розпізнати]")
+            continue
+        if isinstance(r, BaseException):
+            # Unexpected — treat as degraded chunk, keep the rest.
+            logger.warning("chunk_unexpected_error idx=%d exc=%s", idx, r)
+            degraded_count += 1
+            parts.append(f"[фрагмент {idx + 1}: не вдалося розпізнати]")
+            continue
+        # success
+        parts.append(r.text)
+        p_total += r.prompt_tokens
+        c_total += r.candidates_tokens
+        t_total += r.total_tokens
+        if detected is None and r.detected_language:
+            detected = r.detected_language
+
+    if degraded_count == len(results):
+        # All chunks failed — propagate so the user sees an error, not garbage.
+        raise TranscriptionDegradedError(
+            f"all {len(results)} chunks degraded (duration={duration_sec}s)"
+        )
+
+    logger.info(
+        "transcribe_chunked_done chunks=%d degraded=%d duration=%ds tokens=%d",
+        len(results), degraded_count, duration_sec, t_total,
+    )
+    return GeminiResult(
+        text="\n".join(parts).strip(),
+        prompt_tokens=p_total,
+        candidates_tokens=c_total,
+        total_tokens=t_total,
+        detected_language=detected,
+    )
+
+
+async def _transcribe_one(
+    file_path: str,
+    mime_type: str,
+    duration_sec: Optional[int],
+) -> GeminiResult:
+    """Single Gemini call with ValueError catch + loop detection.
+
+    Raises TranscriptionDegradedError on response.text() failure or detected loops.
+    """
     gemini_file = await asyncio.to_thread(
         genai.upload_file, path=file_path, mime_type=mime_type
     )
@@ -172,7 +361,32 @@ async def transcribe(file_path: str, mime_type: str) -> GeminiResult:
             logger.warning("gemini_delete_file_failed name=%s exc=%s", gemini_file.name, e)
 
     p, c, t = _log_usage("transcribe", response)
-    text, detected_language = _split_language_prefix((response.text or "").strip())
+
+    # Loop check BEFORE touching response.text — bad responses often raise
+    # there too, but the rate signal is more informative.
+    if _is_likely_loop(c, duration_sec):
+        finish = _finish_reason(response)
+        logger.warning(
+            "transcribe_loop_detected duration=%s out_tokens=%d finish=%s",
+            duration_sec, c, finish,
+        )
+        raise TranscriptionDegradedError(
+            f"loop detected: out={c} duration={duration_sec} finish={finish}"
+        )
+
+    try:
+        raw = (response.text or "").strip()
+    except ValueError as e:
+        finish = _finish_reason(response)
+        logger.warning(
+            "transcribe_response_text_failed duration=%s finish=%s exc=%s",
+            duration_sec, finish, e,
+        )
+        raise TranscriptionDegradedError(
+            f"response.text raised: finish={finish}"
+        ) from None
+
+    text, detected_language = _split_language_prefix(raw)
     return GeminiResult(
         text=text,
         prompt_tokens=p,
@@ -180,6 +394,18 @@ async def transcribe(file_path: str, mime_type: str) -> GeminiResult:
         total_tokens=t,
         detected_language=detected_language,
     )
+
+
+def _finish_reason(response) -> str:
+    """Best-effort extraction of finish_reason for diagnostic logging."""
+    try:
+        cands = getattr(response, "candidates", None) or []
+        if cands:
+            fr = getattr(cands[0], "finish_reason", None)
+            return getattr(fr, "name", str(fr))
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown"
 
 
 def _split_language_prefix(raw: str) -> Tuple[str, Optional[str]]:

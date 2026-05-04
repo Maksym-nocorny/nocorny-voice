@@ -217,7 +217,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         analytics.track("transcribe_request", user=user, chat=chat, info=info)
         try:
-            result = await gemini_service.transcribe(temp_path, info.mime_type)
+            result = await gemini_service.transcribe(
+                temp_path, info.mime_type, duration_sec=info.duration
+            )
         except gemini_service.RateLimitedError:
             analytics.track("rate_limited_gemini", user=user, chat=chat, info=info,
                             latency_ms=int((time.monotonic() - t0) * 1000))
@@ -227,6 +229,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             analytics.track("processing_failed", user=user, chat=chat, info=info,
                             latency_ms=int((time.monotonic() - t0) * 1000))
             await status_message.edit_text(get_text(user_lang, "processing_failed"))
+            return
+        except gemini_service.TranscriptionDegradedError:
+            analytics.track("transcribe_degraded", user=user, chat=chat, info=info,
+                            latency_ms=int((time.monotonic() - t0) * 1000))
+            await status_message.edit_text(get_text(user_lang, "transcribe_degraded"))
             return
 
         cache.store_transcription(info.file_unique_id, result.text, result.detected_language)
