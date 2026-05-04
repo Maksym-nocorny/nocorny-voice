@@ -248,16 +248,21 @@ async def transcribe(
         # Short file or ffmpeg unavailable → original single-shot path.
         return await _transcribe_one(file_path, mime_type, duration_sec)
 
-    return await _transcribe_chunked(file_path, duration_sec)
+    return await _transcribe_chunked(file_path, mime_type, duration_sec)
 
 
-async def _transcribe_chunked(file_path: str, duration_sec: int) -> GeminiResult:
-    """Split, transcribe each chunk in parallel (bounded), assemble."""
+async def _transcribe_chunked(file_path: str, mime_type: str,
+                              duration_sec: int) -> GeminiResult:
+    """Split, transcribe each chunk in parallel (bounded), assemble.
+
+    `mime_type` is the source file's MIME (used for the single-shot fallback
+    if ffmpeg fails). Chunks themselves are always opus/ogg after re-encoding.
+    """
     try:
         chunk_paths, chunk_mime, temp_dir = await _split_audio(file_path, TRANSCRIBE_CHUNK_SEC)
     except RuntimeError as e:
         logger.warning("ffmpeg_split_failed falling_back_to_single_shot exc=%s", e)
-        return await _transcribe_one(file_path, "audio/ogg", duration_sec)
+        return await _transcribe_one(file_path, mime_type, duration_sec)
 
     try:
         sem = asyncio.Semaphore(max(1, TRANSCRIBE_CHUNK_CONCURRENCY))
