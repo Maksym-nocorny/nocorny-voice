@@ -46,6 +46,14 @@ class CountedRow:
 
 
 @dataclass
+class TopGroup:
+    chat_id: int
+    chat_type: str
+    title: Optional[str]
+    total_events: int
+
+
+@dataclass
 class OverviewSection:
     today: int
     last_24h: int
@@ -78,6 +86,8 @@ class UsersSection:
     new_users_7d: int
     top_users_30d: list[TopUserUsage]
     languages: list[CountedRow]
+    top_groups: list[TopGroup] = field(default_factory=list)
+    total_groups: int = 0
     price_per_1m_input: float = 0.0
     price_per_1m_output: float = 0.0
 
@@ -258,6 +268,10 @@ async def get_users_section() -> Optional[UsersSection]:
             "WHERE first_seen_at >= now() - interval '7 days'"),
         _top_users_usage_in(p, "30 days", 10),
         _languages(p),
+        _top_groups(p, limit=15),
+        _scalar(p,
+            "SELECT count(*) FROM nocorny_voice.chats "
+            "WHERE chat_type IN ('group','supergroup','channel')"),
     )
     return UsersSection(
         total_users=results[0],
@@ -268,6 +282,8 @@ async def get_users_section() -> Optional[UsersSection]:
         new_users_7d=results[5],
         top_users_30d=results[6],
         languages=results[7],
+        top_groups=results[8],
+        total_groups=results[9],
         price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
         price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
@@ -533,6 +549,18 @@ async def _top_users_all_page_with_usage(p: asyncpg.Pool, page: int, page_size: 
         r["user_id"], r["username"], r["first_name"],
         int(r["total_events"]), int(r["tk"]), float(r["c"]),
     ) for r in rows]
+
+
+async def _top_groups(p: asyncpg.Pool, limit: int) -> list[TopGroup]:
+    rows = await p.fetch(
+        "SELECT chat_id, chat_type, title, total_events "
+        "FROM nocorny_voice.chats "
+        "WHERE chat_type IN ('group','supergroup','channel') "
+        "ORDER BY total_events DESC LIMIT $1",
+        limit,
+    )
+    return [TopGroup(int(r["chat_id"]), str(r["chat_type"]),
+                     r["title"], int(r["total_events"])) for r in rows]
 
 
 async def _languages(p: asyncpg.Pool) -> list[CountedRow]:

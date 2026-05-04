@@ -18,8 +18,8 @@ def _user(uid=7, username="alice", lang="en"):
     )
 
 
-def _chat(cid=42, ctype="private"):
-    return SimpleNamespace(id=cid, type=ctype)
+def _chat(cid=42, ctype="private", title=None):
+    return SimpleNamespace(id=cid, type=ctype, title=title)
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +56,19 @@ def test_track_enqueues_event_with_user_fields():
     assert event.username == "alice"
     assert event.chat_id == 42
     assert event.chat_type == "private"
+    assert event.chat_title is None
+
+
+def test_track_captures_group_chat_title():
+    tracker._state.queue = asyncio.Queue(maxsize=10)
+    chat = _chat(cid=-100123, ctype="supergroup", title="Devs UA")
+    tracker.track("transcribe_success", user=_user(), chat=chat)
+    event = tracker._state.queue.get_nowait()
+    assert event.chat_id == -100123
+    assert event.chat_type == "supergroup"
+    assert event.chat_title == "Devs UA"
+    # The title is forwarded as the last positional arg ($20) for the chats upsert.
+    assert event.as_args()[-1] == "Devs UA"
 
 
 def test_track_with_info_and_result_extracts_fields():
