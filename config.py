@@ -35,6 +35,22 @@ MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 TRANSCRIBE_MAX_TOKENS = _env_int("TRANSCRIBE_MAX_TOKENS", 8192)
 TRANSCRIBE_TEMPERATURE = _env_float("TRANSCRIBE_TEMPERATURE", 0.0)
 
+# --- Long-audio chunking (mitigates flash-lite hallucinations on long files) ---
+# Files longer than this are split into chunks of the same length via ffmpeg.
+# Set to 0 to disable chunking entirely.
+TRANSCRIBE_CHUNK_SEC = _env_int("TRANSCRIBE_CHUNK_SEC", 240)
+# Max parallel Gemini transcribe calls when chunking. Keep modest to avoid rate limits.
+TRANSCRIBE_CHUNK_CONCURRENCY = _env_int("TRANSCRIBE_CHUNK_CONCURRENCY", 3)
+# Path to ffmpeg binary; resolved via PATH if just "ffmpeg".
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
+
+# --- Hallucination / loop detection ---
+# Reject responses whose output token rate exceeds this (real speech tops out
+# around 5-7 tokens/sec; >8 means the model is repeating itself).
+TRANSCRIBE_MAX_OUT_PER_SEC = _env_float("TRANSCRIBE_MAX_OUT_PER_SEC", 8.0)
+# Reject responses whose output is at this fraction of MAX_TOKENS — likely truncated runaway.
+TRANSCRIBE_MAX_OUT_FRACTION = _env_float("TRANSCRIBE_MAX_OUT_FRACTION", 0.95)
+
 # --- Pricing (Google AI paid-tier rates per 1M tokens). Set to 0 to hide cost in /stats. ---
 PRICE_PER_1M_INPUT_TOKENS = _env_float("PRICE_PER_1M_INPUT_TOKENS", 0.10)
 PRICE_PER_1M_OUTPUT_TOKENS = _env_float("PRICE_PER_1M_OUTPUT_TOKENS", 0.40)
