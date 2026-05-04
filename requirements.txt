@@ -4,3 +4,5 @@ python-dotenv==1.2.1
 cachetools==6.2.2
 asyncpg==0.30.0
 cffi>=1.17
+# Bundled ffmpeg binary so chunking works on Render Free without apt-get.
+imageio-ffmpeg==0.6.0

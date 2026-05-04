@@ -183,14 +183,28 @@ async def _retry(
 
 
 def _ffmpeg_binary() -> Optional[str]:
-    """Resolve ffmpeg path once. Returns None if unavailable."""
+    """Resolve ffmpeg path once. Returns None if unavailable.
+
+    Lookup order:
+      1. System ffmpeg via PATH (or `FFMPEG_PATH` if it's an absolute path).
+      2. Bundled binary from `imageio_ffmpeg` (works on Render Free where
+         apt-get is unavailable).
+    """
     global _ffmpeg_path
     if _ffmpeg_path is None:
         resolved = shutil.which(FFMPEG_PATH) or ""
-        _ffmpeg_path = resolved
         if resolved:
             logger.info("ffmpeg_resolved path=%s", resolved)
         else:
+            try:
+                import imageio_ffmpeg
+                resolved = imageio_ffmpeg.get_ffmpeg_exe() or ""
+                if resolved:
+                    logger.info("ffmpeg_via_imageio path=%s", resolved)
+            except Exception as e:  # noqa: BLE001 — package missing or download failed
+                logger.warning("ffmpeg_imageio_unavailable exc=%s", e)
+        _ffmpeg_path = resolved
+        if not resolved:
             logger.warning("ffmpeg_not_found path=%s — chunking disabled", FFMPEG_PATH)
     return _ffmpeg_path or None
 
