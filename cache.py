@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 from cachetools import TTLCache
@@ -20,17 +21,26 @@ from config import CACHE_MAX_SIZE, CACHE_TTL_SEC
 
 logger = logging.getLogger(__name__)
 
-# L1: file_unique_id -> transcribed text
+
+@dataclass
+class CachedTranscription:
+    text: str
+    detected_language: Optional[str] = None
+
+
+# L1: file_unique_id -> CachedTranscription
 transcription_cache: TTLCache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SEC)
 
 
 # --- L1 (in-memory, by file_unique_id) ---
 
-def store_transcription(file_unique_id: str, text: str) -> None:
-    transcription_cache[file_unique_id] = text
+def store_transcription(
+    file_unique_id: str, text: str, detected_language: Optional[str] = None
+) -> None:
+    transcription_cache[file_unique_id] = CachedTranscription(text, detected_language)
 
 
-def get_transcription(file_unique_id: str) -> Optional[str]:
+def get_transcription(file_unique_id: str) -> Optional[CachedTranscription]:
     return transcription_cache.get(file_unique_id)
 
 
@@ -57,35 +67,46 @@ _GET_BY_HASH_SQL = """
 UPDATE nocorny_voice.transcription_cache
 SET last_hit_at = now(), hit_count = hit_count + 1
 WHERE content_hash = $1
-RETURNING text
+RETURNING text, detected_language
 """
 
+# Backfill detected_language on second-and-later inserts where the first insert
+# happened before language detection existed.
 _STORE_BY_HASH_SQL = """
-INSERT INTO nocorny_voice.transcription_cache (content_hash, text)
-VALUES ($1, $2)
+INSERT INTO nocorny_voice.transcription_cache (content_hash, text, detected_language)
+VALUES ($1, $2, $3)
 ON CONFLICT (content_hash) DO UPDATE
-SET last_hit_at = now(), hit_count = nocorny_voice.transcription_cache.hit_count + 1
+SET last_hit_at = now(),
+    hit_count = nocorny_voice.transcription_cache.hit_count + 1,
+    detected_language = COALESCE(
+        nocorny_voice.transcription_cache.detected_language, EXCLUDED.detected_language
+    )
 """
 
 
-async def get_by_hash(content_hash: str) -> Optional[str]:
+async def get_by_hash(content_hash: str) -> Optional[CachedTranscription]:
     """L2 lookup. Returns None on miss OR if Postgres unavailable."""
     p = analytics_pool.get()
     if p is None:
         return None
     try:
-        return await p.fetchval(_GET_BY_HASH_SQL, content_hash)
+        row = await p.fetchrow(_GET_BY_HASH_SQL, content_hash)
     except Exception:  # noqa: BLE001 — graceful degradation
         logger.warning("cache_l2_get_failed hash=%s", content_hash[:12], exc_info=True)
         return None
+    if row is None:
+        return None
+    return CachedTranscription(row["text"], row["detected_language"])
 
 
-async def store_by_hash(content_hash: str, text: str) -> None:
+async def store_by_hash(
+    content_hash: str, text: str, detected_language: Optional[str] = None
+) -> None:
     """L2 store. Silently swallows errors — bot keeps working without L2."""
     p = analytics_pool.get()
     if p is None:
         return
     try:
-        await p.execute(_STORE_BY_HASH_SQL, content_hash, text)
+        await p.execute(_STORE_BY_HASH_SQL, content_hash, text, detected_language)
     except Exception:  # noqa: BLE001 — graceful degradation
         logger.warning("cache_l2_store_failed hash=%s", content_hash[:12], exc_info=True)

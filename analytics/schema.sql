@@ -29,22 +29,29 @@ CREATE TABLE IF NOT EXISTS nocorny_voice.events (
     candidates_tokens  integer,
     total_tokens       integer,
     latency_ms         integer,
-    error_class        text
+    error_class        text,
+    detected_language  text
 );
+
+ALTER TABLE nocorny_voice.events ADD COLUMN IF NOT EXISTS detected_language text;
 
 CREATE INDEX IF NOT EXISTS events_ts_desc           ON nocorny_voice.events (ts DESC);
 CREATE INDEX IF NOT EXISTS events_user_ts           ON nocorny_voice.events (user_id, ts DESC);
 CREATE INDEX IF NOT EXISTS events_type_ts           ON nocorny_voice.events (event_type, ts DESC);
 CREATE INDEX IF NOT EXISTS events_success_user      ON nocorny_voice.events (user_id) WHERE event_type = 'transcribe_success';
+CREATE INDEX IF NOT EXISTS events_detected_language ON nocorny_voice.events (detected_language) WHERE detected_language IS NOT NULL;
 CREATE INDEX IF NOT EXISTS users_last_seen_desc     ON nocorny_voice.users (last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS users_total_events_desc  ON nocorny_voice.users (total_events DESC);
 
 CREATE TABLE IF NOT EXISTS nocorny_voice.transcription_cache (
-    content_hash   text         PRIMARY KEY,
-    text           text         NOT NULL,
-    created_at     timestamptz  NOT NULL DEFAULT now(),
-    last_hit_at    timestamptz  NOT NULL DEFAULT now(),
-    hit_count      integer      NOT NULL DEFAULT 0
+    content_hash       text         PRIMARY KEY,
+    text               text         NOT NULL,
+    created_at         timestamptz  NOT NULL DEFAULT now(),
+    last_hit_at        timestamptz  NOT NULL DEFAULT now(),
+    hit_count          integer      NOT NULL DEFAULT 0,
+    detected_language  text
 );
+
+ALTER TABLE nocorny_voice.transcription_cache ADD COLUMN IF NOT EXISTS detected_language text;
 
 CREATE INDEX IF NOT EXISTS transcription_cache_last_hit ON nocorny_voice.transcription_cache (last_hit_at);

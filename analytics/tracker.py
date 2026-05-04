@@ -42,10 +42,12 @@ WITH u AS (
 INSERT INTO nocorny_voice.events
     (ts, user_id, chat_id, chat_type, request_id, event_type,
      media_type, duration_sec, file_size_bytes, mime_type,
-     prompt_tokens, candidates_tokens, total_tokens, latency_ms, error_class)
+     prompt_tokens, candidates_tokens, total_tokens, latency_ms, error_class,
+     detected_language)
 VALUES (now(), $1, $6, $7, $8, $9,
         $10, $11, $12, $13,
-        $14, $15, $16, $17, $18)
+        $14, $15, $16, $17, $18,
+        $19)
 """
 
 _RETENTION_SQL = (
@@ -78,6 +80,7 @@ class _Event:
     total_tokens: Optional[int] = None
     latency_ms: Optional[int] = None
     error_class: Optional[str] = None
+    detected_language: Optional[str] = None
 
     def as_args(self) -> tuple:
         return (
@@ -85,7 +88,7 @@ class _Event:
             self.chat_id, self.chat_type, self.request_id, self.event_type,
             self.media_type, self.duration_sec, self.file_size_bytes, self.mime_type,
             self.prompt_tokens, self.candidates_tokens, self.total_tokens,
-            self.latency_ms, self.error_class,
+            self.latency_ms, self.error_class, self.detected_language,
         )
 
 
@@ -152,11 +155,14 @@ async def stop() -> None:
 def track(event_type: str, *, user: Optional[User], chat: Optional[Chat],
           info: Any = None, result: Any = None,
           latency_ms: Optional[int] = None,
-          error_class: Optional[str] = None) -> None:
+          error_class: Optional[str] = None,
+          detected_language: Optional[str] = None) -> None:
     """Enqueue an event. Synchronous; never raises.
 
     `info` accepts a `_MediaInfo`-like object with duration/file_size/mime_type/media_type.
-    `result` accepts a `GeminiResult`-like object with token counts.
+    `result` accepts a `GeminiResult`-like object with token counts and
+    optional `detected_language`. An explicit `detected_language` argument
+    wins (used for cache-hit events where there is no fresh Gemini result).
     """
     queue = _state.queue
     if queue is None or user is None or chat is None or getattr(user, "is_bot", False):
@@ -174,6 +180,7 @@ def track(event_type: str, *, user: Optional[User], chat: Optional[Chat],
         event_type=event_type,
         latency_ms=latency_ms,
         error_class=error_class,
+        detected_language=detected_language,
     )
     if info is not None:
         event.media_type = _media_type_from_info(info)
@@ -184,6 +191,8 @@ def track(event_type: str, *, user: Optional[User], chat: Optional[Chat],
         event.prompt_tokens = getattr(result, "prompt_tokens", None)
         event.candidates_tokens = getattr(result, "candidates_tokens", None)
         event.total_tokens = getattr(result, "total_tokens", None)
+        if event.detected_language is None:
+            event.detected_language = getattr(result, "detected_language", None)
 
     try:
         queue.put_nowait(event)
