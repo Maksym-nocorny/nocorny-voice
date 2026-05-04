@@ -24,9 +24,16 @@ logger = logging.getLogger(__name__)
 
 _TRANSCRIBE_INSTRUCTION = (
     "You are a verbatim transcription engine. "
-    "Output ONLY the transcribed text exactly as spoken in the original language. "
+    "On the first line, output exactly: LANG:<ISO 639-1 code> "
+    "(use the lowercase two-letter code of the spoken language, "
+    "e.g. LANG:en, LANG:uk, LANG:es; for regional variants append a hyphen, "
+    "e.g. LANG:pt-br). "
+    "On the next line and onwards, output ONLY the transcribed text, "
+    "exactly as spoken in the original language. "
     "No preamble, no commentary, no headers, no markdown."
 )
+
+_LANG_PREFIX = "LANG:"
 
 _RETRY_EXCEPTIONS = (exceptions.ResourceExhausted, exceptions.ServiceUnavailable)
 
@@ -52,6 +59,7 @@ class GeminiResult:
     prompt_tokens: int
     candidates_tokens: int
     total_tokens: int
+    detected_language: Optional[str] = None
 
 
 _configured = False
@@ -164,9 +172,37 @@ async def transcribe(file_path: str, mime_type: str) -> GeminiResult:
             logger.warning("gemini_delete_file_failed name=%s exc=%s", gemini_file.name, e)
 
     p, c, t = _log_usage("transcribe", response)
+    text, detected_language = _split_language_prefix((response.text or "").strip())
     return GeminiResult(
-        text=(response.text or "").strip(),
+        text=text,
         prompt_tokens=p,
         candidates_tokens=c,
         total_tokens=t,
+        detected_language=detected_language,
     )
+
+
+def _split_language_prefix(raw: str) -> Tuple[str, Optional[str]]:
+    """Strip the leading 'LANG:xx' marker from Gemini's output.
+
+    Returns (text_without_marker, language_code_or_None). If the marker is
+    missing or malformed, returns the input unchanged with language=None so
+    the bot still sends a sensible reply.
+    """
+    if not raw.startswith(_LANG_PREFIX):
+        return raw, None
+    newline = raw.find("\n")
+    if newline == -1:
+        # Whole response was just the marker — no transcription.
+        candidate = raw[len(_LANG_PREFIX):].strip().lower()
+        return "", _normalise_lang(candidate)
+    candidate = raw[len(_LANG_PREFIX):newline].strip().lower()
+    return raw[newline + 1:].lstrip(), _normalise_lang(candidate)
+
+
+def _normalise_lang(code: str) -> Optional[str]:
+    if not (2 <= len(code) <= 10):
+        return None
+    if not all(ch.isalnum() or ch == "-" for ch in code):
+        return None
+    return code

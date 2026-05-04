@@ -173,15 +173,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # Cache hit short-circuit: respond immediately without touching Gemini
-    cached_text = cache.get_transcription(info.file_unique_id)
-    if cached_text is not None:
+    cached = cache.get_transcription(info.file_unique_id)
+    if cached is not None:
         logger.info("cache_hit file_unique_id=%s", info.file_unique_id)
         analytics.track(
             "cache_hit", user=user, chat=chat, info=info,
             latency_ms=int((time.monotonic() - t0) * 1000),
+            detected_language=cached.detected_language,
         )
         await _send_transcription(
-            update, user_lang, cached_text, is_group, status_message=None
+            update, user_lang, cached.text, is_group, status_message=None
         )
         return
 
@@ -198,16 +199,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # or re-uploaded after restart). SHA-256 here adds ~150-300ms for 50MB but
         # saves the entire Gemini call on hit.
         content_hash = await asyncio.to_thread(cache.hash_file, temp_path)
-        l2_text = await cache.get_by_hash(content_hash)
-        if l2_text is not None:
+        l2 = await cache.get_by_hash(content_hash)
+        if l2 is not None:
             logger.info("cache_l2_hit content_hash=%s", content_hash[:12])
-            cache.store_transcription(info.file_unique_id, l2_text)
+            cache.store_transcription(info.file_unique_id, l2.text, l2.detected_language)
             analytics.track(
                 "cache_l2_hit", user=user, chat=chat, info=info,
                 latency_ms=int((time.monotonic() - t0) * 1000),
+                detected_language=l2.detected_language,
             )
             await _send_transcription(
-                update, user_lang, l2_text, is_group, status_message=status_message
+                update, user_lang, l2.text, is_group, status_message=status_message
             )
             return
 
@@ -227,8 +229,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await status_message.edit_text(get_text(user_lang, "processing_failed"))
             return
 
-        cache.store_transcription(info.file_unique_id, result.text)
-        await cache.store_by_hash(content_hash, result.text)
+        cache.store_transcription(info.file_unique_id, result.text, result.detected_language)
+        await cache.store_by_hash(content_hash, result.text, result.detected_language)
         analytics.track(
             "transcribe_success", user=user, chat=chat, info=info, result=result,
             latency_ms=int((time.monotonic() - t0) * 1000),

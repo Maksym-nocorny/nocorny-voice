@@ -147,6 +147,25 @@ def test_render_users_escapes_group_titles():
     assert "&lt;script&gt;" in out
 
 
+def test_render_users_renders_languages_with_full_names():
+    s = UsersSection(
+        total_users=10, dau=1, wau=1, mau=1,
+        new_users_today=0, new_users_7d=0,
+        top_users_30d=[],
+        languages=[
+            CountedRow("uk", 7),
+            CountedRow("en", 3),
+            CountedRow("pt-br", 1),
+            CountedRow("xx", 1),  # unknown code falls through to raw
+        ],
+    )
+    out = formatter.render_users(s)
+    assert "Ukrainian: 7" in out
+    assert "English: 3" in out
+    assert "Portuguese (Brazil): 1" in out
+    assert "xx: 1" in out  # graceful fallback
+
+
 def test_render_users_merges_tokens_and_cost_when_pricing_active():
     s = UsersSection(
         total_users=1, dau=1, wau=1, mau=1,

@@ -10,6 +10,7 @@ from .queries import (
     AllUsersSection,
     ContentSection,
     CostSection,
+    CountedRow,
     OverviewSection,
     PerfSection,
     TopGroup,
@@ -17,6 +18,41 @@ from .queries import (
     TopUserUsage,
     UsersSection,
 )
+
+
+# ISO 639-1 → English name. Covers languages we've actually seen plus the
+# common long tail. Unknown codes fall through to the raw code.
+_LANGUAGE_NAMES: dict[str, str] = {
+    "ar": "Arabic", "be": "Belarusian", "bg": "Bulgarian", "bn": "Bengali",
+    "ca": "Catalan", "cs": "Czech", "da": "Danish", "de": "German",
+    "el": "Greek", "en": "English", "es": "Spanish", "et": "Estonian",
+    "fa": "Persian", "fi": "Finnish", "fr": "French", "ga": "Irish",
+    "he": "Hebrew", "hi": "Hindi", "hr": "Croatian", "hu": "Hungarian",
+    "hy": "Armenian", "id": "Indonesian", "it": "Italian", "ja": "Japanese",
+    "ka": "Georgian", "kk": "Kazakh", "ko": "Korean", "lt": "Lithuanian",
+    "lv": "Latvian", "mk": "Macedonian", "ms": "Malay", "nl": "Dutch",
+    "no": "Norwegian", "pl": "Polish", "pt": "Portuguese", "ro": "Romanian",
+    "ru": "Russian", "sk": "Slovak", "sl": "Slovenian", "sq": "Albanian",
+    "sr": "Serbian", "sv": "Swedish", "th": "Thai", "tr": "Turkish",
+    "uk": "Ukrainian", "uz": "Uzbek", "vi": "Vietnamese", "zh": "Chinese",
+}
+
+_REGIONAL_NAMES: dict[str, str] = {
+    "pt-br": "Portuguese (Brazil)", "pt-pt": "Portuguese (Portugal)",
+    "en-gb": "English (UK)", "en-us": "English (US)",
+    "zh-cn": "Chinese (Simplified)", "zh-tw": "Chinese (Traditional)",
+    "es-mx": "Spanish (Mexico)", "es-es": "Spanish (Spain)",
+}
+
+
+def _language_name(code: str) -> str:
+    code_lower = code.lower()
+    if code_lower in _REGIONAL_NAMES:
+        return _REGIONAL_NAMES[code_lower]
+    base = code_lower.split("-", 1)[0]
+    if base in _LANGUAGE_NAMES:
+        return _LANGUAGE_NAMES[base]
+    return code
 
 
 def _user_label(u) -> str:
@@ -112,6 +148,15 @@ def _fmt_grouped(rows, *, label: str = "") -> str:
     return "\n".join(f"  • {escape_html(r.label)}: {_fmt_int(r.count)}" for r in rows)
 
 
+def _fmt_languages(rows: list[CountedRow]) -> str:
+    if not rows:
+        return "  (none)"
+    return "\n".join(
+        f"  • {escape_html(_language_name(r.label))}: {_fmt_int(r.count)}"
+        for r in rows
+    )
+
+
 def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -169,7 +214,7 @@ def render_users(s: Optional[UsersSection]) -> str:
         f"{_fmt_top_users_usage(s.top_users_30d, show_cost=show_cost)}\n\n"
         f"{groups_header}\n"
         f"{_fmt_top_groups(s.top_groups)}\n\n"
-        f"<b>Languages</b>\n{_fmt_grouped(s.languages)}"
+        f"<b>Languages</b>\n{_fmt_languages(s.languages)}"
     )
 
 

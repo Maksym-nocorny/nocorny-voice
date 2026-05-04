@@ -565,8 +565,10 @@ async def _top_groups(p: asyncpg.Pool, limit: int) -> list[TopGroup]:
 
 async def _languages(p: asyncpg.Pool) -> list[CountedRow]:
     rows = await p.fetch(
-        "SELECT COALESCE(language_code,'unknown') AS k, count(*) AS c "
-        "FROM nocorny_voice.users GROUP BY 1 ORDER BY c DESC"
+        "SELECT detected_language AS k, count(DISTINCT user_id) AS c "
+        "FROM nocorny_voice.events "
+        "WHERE detected_language IS NOT NULL "
+        "GROUP BY 1 ORDER BY c DESC"
     )
     return [CountedRow(r["k"], int(r["c"])) for r in rows]
 

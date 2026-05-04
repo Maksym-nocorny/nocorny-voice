@@ -67,7 +67,7 @@ def test_track_captures_group_chat_title():
     assert event.chat_id == -100123
     assert event.chat_type == "supergroup"
     assert event.chat_title == "Devs UA"
-    # And the title is forwarded as the last positional arg ($19) for SQL.
+    # The title is forwarded as the last positional arg ($20) for the chats upsert.
     assert event.as_args()[-1] == "Devs UA"
 
 
@@ -76,7 +76,7 @@ def test_track_with_info_and_result_extracts_fields():
     info = SimpleNamespace(file_id="x", file_unique_id="u", file_ext=".ogg",
                            mime_type="audio/ogg", duration=15, file_size=2048)
     result = SimpleNamespace(text="hello", prompt_tokens=10, candidates_tokens=5,
-                             total_tokens=15)
+                             total_tokens=15, detected_language="uk")
     tracker.track("transcribe_success", user=_user(), chat=_chat(),
                   info=info, result=result, latency_ms=1234)
     event = tracker._state.queue.get_nowait()
@@ -87,6 +87,18 @@ def test_track_with_info_and_result_extracts_fields():
     assert event.prompt_tokens == 10
     assert event.total_tokens == 15
     assert event.latency_ms == 1234
+    assert event.detected_language == "uk"
+
+
+def test_track_explicit_detected_language_wins_over_result():
+    """Cache-hit path passes detected_language explicitly; no Gemini result."""
+    tracker._state.queue = asyncio.Queue(maxsize=10)
+    info = SimpleNamespace(file_id="x", file_unique_id="u", file_ext=".ogg",
+                           mime_type="audio/ogg", duration=15, file_size=2048)
+    tracker.track("cache_hit", user=_user(), chat=_chat(),
+                  info=info, detected_language="es")
+    event = tracker._state.queue.get_nowait()
+    assert event.detected_language == "es"
 
 
 def test_queue_full_drops_silently():
