@@ -2,9 +2,10 @@ name: Keep Render alive
 
 on:
   schedule:
-    # Render free tier sleeps after 15 min of inactivity. */10 gives 5-min
-    # buffer against GitHub Actions schedule delays.
-    - cron: '*/10 * * * *'
+    # Render free tier sleeps after 15 min of inactivity. */14 keeps a 1-min
+    # buffer while reducing scheduled-run pressure on free GitHub runners
+    # (more frequent crons get auto-cancelled when the queue is busy).
+    - cron: '*/14 * * * *'
   workflow_dispatch:
 
 jobs:
