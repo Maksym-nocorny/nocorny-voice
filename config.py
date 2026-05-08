@@ -61,7 +61,7 @@ GEMINI_RETRY_BASE_DELAY = _env_float("GEMINI_RETRY_BASE_DELAY", 1.0)
 
 # --- Media limits ---
 MAX_DURATION_SEC = _env_int("MAX_DURATION_SEC", 1800)        # 30 min
-MAX_FILE_SIZE_MB = _env_int("MAX_FILE_SIZE_MB", 50)
+MAX_FILE_SIZE_MB = _env_int("MAX_FILE_SIZE_MB", 20)
 
 # --- Per-user rate limit ---
 RATE_LIMIT_REQUESTS = _env_int("RATE_LIMIT_REQUESTS", 5)

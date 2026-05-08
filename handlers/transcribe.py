@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from telegram import Message, Update
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
 import analytics
@@ -190,10 +190,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     status_message = await update.message.reply_text(get_text(user_lang, "downloading"))
     temp_path: Optional[str] = None
     try:
-        new_file = await context.bot.get_file(info.file_id)
-        with tempfile.NamedTemporaryFile(suffix=info.file_ext, delete=False) as f:
-            temp_path = f.name
-        await new_file.download_to_drive(temp_path)
+        try:
+            new_file = await context.bot.get_file(info.file_id)
+            with tempfile.NamedTemporaryFile(suffix=info.file_ext, delete=False) as f:
+                temp_path = f.name
+            await new_file.download_to_drive(temp_path)
+        except BadRequest as e:
+            # Telegram caps getFile downloads at 20 MB. Some clients report a
+            # smaller `file_size` than the actual upload (or omit it), so this
+            # slips past pre-flight validation.
+            if "too big" in str(e).lower():
+                logger.info("media_rejected reason=too_large_telegram size=%s", info.file_size)
+                analytics.track("media_rejected_too_large", user=user, chat=chat, info=info)
+                await status_message.edit_text(
+                    get_text(user_lang, "media_too_large", MAX_FILE_SIZE_MB)
+                )
+                return
+            raise
 
         # L2: same content, different file_unique_id (e.g. forwarded between users
         # or re-uploaded after restart). SHA-256 here adds ~150-300ms for 50MB but

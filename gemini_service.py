@@ -140,17 +140,22 @@ def _log_usage(operation: str, response) -> Tuple[int, int, int]:
     return p, c, t
 
 
+_LOOP_RATE_MIN_DURATION_SEC = 5
+
+
 def _is_likely_loop(out_tokens: int, duration_sec: Optional[int],
                     max_tokens: int = TRANSCRIBE_MAX_TOKENS) -> bool:
     """Heuristic: did the model run away generating repetitive output?
 
     Two signals (either triggers):
       1. Output is at >=95% of max_tokens (response was capped — almost always bad).
-      2. Output rate > N tokens/sec (real speech tops out ~5-7).
+      2. Output rate > N tokens/sec (real speech tops out ~5-7). Skipped on
+         very short clips (<5s) where token/sec is too noisy — a normal
+         "Привіт, як справи?" on a 2s clip easily exceeds the threshold.
     """
     if max_tokens > 0 and out_tokens >= int(max_tokens * TRANSCRIBE_MAX_OUT_FRACTION):
         return True
-    if duration_sec and duration_sec > 0:
+    if duration_sec and duration_sec >= _LOOP_RATE_MIN_DURATION_SEC:
         if out_tokens / duration_sec > TRANSCRIBE_MAX_OUT_PER_SEC:
             return True
     return False
