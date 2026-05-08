@@ -171,7 +171,9 @@ def _empty(message: str) -> str:
 def render_overview(s: Optional[OverviewSection]) -> str:
     if s is None:
         return _empty("Analytics not available (DATABASE_URL not configured).")
-    pricing_active = s.price_per_1m_input > 0 or s.price_per_1m_output > 0
+    pricing_active = (s.price_per_1m_input > 0
+                      or s.price_per_1m_audio_input > 0
+                      or s.price_per_1m_output > 0)
     cost_lines = (
         f"  • USD 24h: {_fmt_usd(s.cost_usd_24h)}  •  30d: {_fmt_usd(s.cost_usd_30d)}\n"
         if pricing_active else ""
@@ -202,7 +204,9 @@ def render_overview(s: Optional[OverviewSection]) -> str:
 def render_users(s: Optional[UsersSection]) -> str:
     if s is None:
         return _empty("Analytics not available.")
-    show_cost = s.price_per_1m_input > 0 or s.price_per_1m_output > 0
+    show_cost = (s.price_per_1m_input > 0
+                 or s.price_per_1m_audio_input > 0
+                 or s.price_per_1m_output > 0)
     header = "ev · tokens · USD" if show_cost else "ev · tokens"
     groups_header = f"<b>Groups using the bot ({_fmt_int(s.total_groups)} total) — events</b>"
     return (
@@ -291,7 +295,10 @@ def render_cost(s: Optional[CostSection]) -> str:
     if s is None:
         return _empty("Analytics not available.")
     cost_block = ""
-    if s.price_per_1m_input > 0 or s.price_per_1m_output > 0:
+    pricing_active = (s.price_per_1m_input > 0
+                      or s.price_per_1m_audio_input > 0
+                      or s.price_per_1m_output > 0)
+    if pricing_active:
         cost_block = (
             f"<b>Cost (USD)</b>\n"
             f"  • Lifetime: {_fmt_usd(s.cost_usd_lifetime)}\n"
@@ -299,7 +306,8 @@ def render_cost(s: Optional[CostSection]) -> str:
             f"  • 7d:       {_fmt_usd(s.cost_usd_7d)}\n"
             f"  • 24h:      {_fmt_usd(s.cost_usd_24h)}\n"
             f"  • Avg/req (30d): {_fmt_usd(s.avg_cost_usd_per_request_30d)}\n"
-            f"  <i>at ${s.price_per_1m_input:.2f}/1M in · "
+            f"  <i>at ${s.price_per_1m_input:.2f}/1M text · "
+            f"${s.price_per_1m_audio_input:.2f}/1M audio · "
             f"${s.price_per_1m_output:.2f}/1M out</i>\n\n"
         )
     return (

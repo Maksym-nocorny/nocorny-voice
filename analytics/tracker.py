@@ -53,12 +53,12 @@ WITH u AS (
 INSERT INTO nocorny_voice.events
     (ts, user_id, chat_id, chat_type, request_id, event_type,
      media_type, duration_sec, file_size_bytes, mime_type,
-     prompt_tokens, candidates_tokens, total_tokens, latency_ms, error_class,
-     detected_language)
+     prompt_tokens, candidates_tokens, total_tokens, prompt_audio_tokens,
+     latency_ms, error_class, detected_language)
 VALUES (now(), $1, $6, $7, $8, $9,
         $10, $11, $12, $13,
-        $14, $15, $16, $17, $18,
-        $19)
+        $14, $15, $16, $21,
+        $17, $18, $19)
 """
 
 _RETENTION_SQL = (
@@ -93,6 +93,7 @@ class _Event:
     error_class: Optional[str] = None
     detected_language: Optional[str] = None
     chat_title: Optional[str] = None
+    prompt_audio_tokens: Optional[int] = None
 
     def as_args(self) -> tuple:
         return (
@@ -102,6 +103,7 @@ class _Event:
             self.prompt_tokens, self.candidates_tokens, self.total_tokens,
             self.latency_ms, self.error_class, self.detected_language,
             self.chat_title,
+            self.prompt_audio_tokens,
         )
 
 
@@ -205,6 +207,7 @@ def track(event_type: str, *, user: Optional[User], chat: Optional[Chat],
         event.prompt_tokens = getattr(result, "prompt_tokens", None)
         event.candidates_tokens = getattr(result, "candidates_tokens", None)
         event.total_tokens = getattr(result, "total_tokens", None)
+        event.prompt_audio_tokens = getattr(result, "prompt_audio_tokens", None)
         if event.detected_language is None:
             event.detected_language = getattr(result, "detected_language", None)
 

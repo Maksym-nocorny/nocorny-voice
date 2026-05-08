@@ -52,7 +52,11 @@ TRANSCRIBE_MAX_OUT_PER_SEC = _env_float("TRANSCRIBE_MAX_OUT_PER_SEC", 8.0)
 TRANSCRIBE_MAX_OUT_FRACTION = _env_float("TRANSCRIBE_MAX_OUT_FRACTION", 0.95)
 
 # --- Pricing (Google AI paid-tier rates per 1M tokens). Set to 0 to hide cost in /stats. ---
+# Audio input is 3× text input on gemini-2.5-flash-lite (Standard tier). For voice/audio
+# transcription almost all prompt tokens are audio (Gemini tariffs audio at 32 t/s),
+# so a single rate would undercount cost ~3×.
 PRICE_PER_1M_INPUT_TOKENS = _env_float("PRICE_PER_1M_INPUT_TOKENS", 0.10)
+PRICE_PER_1M_AUDIO_INPUT_TOKENS = _env_float("PRICE_PER_1M_AUDIO_INPUT_TOKENS", 0.30)
 PRICE_PER_1M_OUTPUT_TOKENS = _env_float("PRICE_PER_1M_OUTPUT_TOKENS", 0.40)
 
 # --- Retry on transient Gemini errors ---
