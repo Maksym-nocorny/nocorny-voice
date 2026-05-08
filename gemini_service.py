@@ -70,9 +70,20 @@ class ProcessingFailedError(Exception):
 class TranscriptionDegradedError(Exception):
     """Gemini hallucinated/looped or returned a blocked/truncated response.
 
-    Distinct from ProcessingFailedError so the handler can show a more
-    specific message and analytics can track these separately.
+    Carries partial usage info — Gemini still bills for the call even when
+    the response was unusable, so we surface tokens to the handler so cost
+    accounting matches the API bill.
     """
+
+    def __init__(self, msg: str, *, prompt_tokens: int = 0,
+                 prompt_audio_tokens: int = 0,
+                 candidates_tokens: int = 0,
+                 total_tokens: int = 0):
+        super().__init__(msg)
+        self.prompt_tokens = prompt_tokens
+        self.prompt_audio_tokens = prompt_audio_tokens
+        self.candidates_tokens = candidates_tokens
+        self.total_tokens = total_tokens
 
 
 @dataclass
@@ -355,7 +366,10 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
         if isinstance(r, (RateLimitedError, ProcessingFailedError)):
             raise r
 
-    # Surviving chunks (degraded ones contribute a placeholder).
+    # Surviving chunks (degraded ones contribute a placeholder). Token totals
+    # accumulate across BOTH success and degraded chunks — Gemini bills us per
+    # API call, so a degraded chunk that returned a usable response.usage_metadata
+    # but unusable text still costs money.
     parts: List[str] = []
     p_total = pa_total = c_total = t_total = 0
     detected: Optional[str] = None
@@ -364,9 +378,14 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
         if isinstance(r, TranscriptionDegradedError):
             degraded_count += 1
             parts.append(f"[фрагмент {idx + 1}: не вдалося розпізнати]")
+            p_total += getattr(r, "prompt_tokens", 0)
+            pa_total += getattr(r, "prompt_audio_tokens", 0)
+            c_total += getattr(r, "candidates_tokens", 0)
+            t_total += getattr(r, "total_tokens", 0)
             continue
         if isinstance(r, BaseException):
-            # Unexpected — treat as degraded chunk, keep the rest.
+            # Unexpected — treat as degraded chunk, keep the rest. No tokens
+            # to recover (we never got past the API client).
             logger.warning("chunk_unexpected_error idx=%d exc=%s", idx, r)
             degraded_count += 1
             parts.append(f"[фрагмент {idx + 1}: не вдалося розпізнати]")
@@ -382,8 +401,11 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
 
     if degraded_count == len(results):
         # All chunks failed — propagate so the user sees an error, not garbage.
+        # Pass accumulated tokens through so the handler can still record cost.
         raise TranscriptionDegradedError(
-            f"all {len(results)} chunks degraded (duration={duration_sec}s)"
+            f"all {len(results)} chunks degraded (duration={duration_sec}s)",
+            prompt_tokens=p_total, prompt_audio_tokens=pa_total,
+            candidates_tokens=c_total, total_tokens=t_total,
         )
 
     logger.info(
@@ -445,7 +467,9 @@ async def _transcribe_one(
             duration_sec, c, finish,
         )
         raise TranscriptionDegradedError(
-            f"loop detected: out={c} duration={duration_sec} finish={finish}"
+            f"loop detected: out={c} duration={duration_sec} finish={finish}",
+            prompt_tokens=p, prompt_audio_tokens=pa,
+            candidates_tokens=c, total_tokens=t,
         )
 
     try:
@@ -457,7 +481,9 @@ async def _transcribe_one(
             duration_sec, finish, e,
         )
         raise TranscriptionDegradedError(
-            f"response.text raised: finish={finish}"
+            f"response.text raised: finish={finish}",
+            prompt_tokens=p, prompt_audio_tokens=pa,
+            candidates_tokens=c, total_tokens=t,
         ) from None
 
     text, detected_language = _split_language_prefix(raw)
