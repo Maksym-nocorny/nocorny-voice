@@ -34,6 +34,26 @@ CREATE TABLE IF NOT EXISTS nocorny_voice.events (
 );
 
 ALTER TABLE nocorny_voice.events ADD COLUMN IF NOT EXISTS detected_language text;
+ALTER TABLE nocorny_voice.events ADD COLUMN IF NOT EXISTS prompt_audio_tokens integer;
+
+-- Backfill historical transcribe_success rows. Idempotent — guarded by IS NULL,
+-- so reruns are no-ops once filled. Gemini tariffs audio at exactly 32 t/s, and
+-- the system prompt is ~30 text tokens, so duration_sec*32 is the audio share
+-- for normal voice/audio rows. The CASE handles the rare row missing duration_sec
+-- by attributing all-but-system-prompt to audio, so those rows aren't permanently
+-- undercounted.
+UPDATE nocorny_voice.events
+SET prompt_audio_tokens = CASE
+    WHEN duration_sec IS NOT NULL AND duration_sec > 0
+        THEN LEAST(prompt_tokens, duration_sec * 32)
+    WHEN prompt_tokens > 100
+        THEN prompt_tokens - 30
+    ELSE 0
+END
+WHERE event_type = 'transcribe_success'
+  AND prompt_audio_tokens IS NULL
+  AND prompt_tokens IS NOT NULL
+  AND prompt_tokens > 0;
 
 CREATE TABLE IF NOT EXISTS nocorny_voice.chats (
     chat_id        bigint       PRIMARY KEY,

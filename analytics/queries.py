@@ -14,7 +14,11 @@ from typing import Optional
 
 import asyncpg
 
-from config import PRICE_PER_1M_INPUT_TOKENS, PRICE_PER_1M_OUTPUT_TOKENS
+from config import (
+    PRICE_PER_1M_AUDIO_INPUT_TOKENS,
+    PRICE_PER_1M_INPUT_TOKENS,
+    PRICE_PER_1M_OUTPUT_TOKENS,
+)
 
 from . import pool
 
@@ -75,6 +79,7 @@ class OverviewSection:
     cost_usd_24h: float = 0.0
     cost_usd_30d: float = 0.0
     price_per_1m_input: float = 0.0
+    price_per_1m_audio_input: float = 0.0
     price_per_1m_output: float = 0.0
 
 
@@ -91,6 +96,7 @@ class UsersSection:
     top_groups: list[TopGroup] = field(default_factory=list)
     total_groups: int = 0
     price_per_1m_input: float = 0.0
+    price_per_1m_audio_input: float = 0.0
     price_per_1m_output: float = 0.0
 
 
@@ -103,6 +109,7 @@ class AllUsersSection:
     total_pages: int = 1
     page_size: int = 50
     price_per_1m_input: float = 0.0
+    price_per_1m_audio_input: float = 0.0
     price_per_1m_output: float = 0.0
 
 
@@ -146,6 +153,7 @@ class CostSection:
     avg_cost_usd_per_request_30d: float
     price_per_1m_input: float
     price_per_1m_output: float
+    price_per_1m_audio_input: float = 0.0
     total_tokens_7d: int = 0
     cost_usd_7d: float = 0.0
 
@@ -156,7 +164,7 @@ class CostSection:
 _OVERVIEW_WINDOWED_SQL = """
 WITH e AS (
     SELECT ts, user_id, event_type, total_tokens, duration_sec,
-           prompt_tokens, candidates_tokens
+           prompt_tokens, candidates_tokens, prompt_audio_tokens
     FROM nocorny_voice.events
     WHERE ts >= now() - interval '7 days'
 )
@@ -175,11 +183,12 @@ SELECT
                        AND ts >= now() - interval '24 hours'), 0)::bigint AS tokens_24h,
     (COALESCE(SUM(duration_sec) FILTER (WHERE event_type='transcribe_success'
                        AND ts >= now() - interval '24 hours'), 0)::float / 60) AS minutes_24h,
-    (COALESCE(SUM(prompt_tokens) FILTER (WHERE event_type='transcribe_success'
-                       AND ts >= now() - interval '24 hours'), 0) * $1::float / 1e6
-     + COALESCE(SUM(candidates_tokens) FILTER (WHERE event_type='transcribe_success'
-                       AND ts >= now() - interval '24 hours'), 0) * $2::float / 1e6
-    )::float                                                               AS cost_24h,
+    COALESCE(SUM(prompt_tokens) FILTER (WHERE event_type='transcribe_success'
+                       AND ts >= now() - interval '24 hours'), 0)::bigint  AS prompt_24h,
+    COALESCE(SUM(prompt_audio_tokens) FILTER (WHERE event_type='transcribe_success'
+                       AND ts >= now() - interval '24 hours'), 0)::bigint  AS audio_24h,
+    COALESCE(SUM(candidates_tokens) FILTER (WHERE event_type='transcribe_success'
+                       AND ts >= now() - interval '24 hours'), 0)::bigint  AS cand_24h,
     COALESCE(
         count(*) FILTER (WHERE event_type IN
             ('error_unknown','processing_failed','rate_limited_gemini','transcribe_degraded')
@@ -195,9 +204,9 @@ FROM e
 _OVERVIEW_30D_SQL = """
 SELECT
     count(DISTINCT user_id)::bigint AS mau,
-    (COALESCE(SUM(prompt_tokens) FILTER (WHERE event_type='transcribe_success'), 0) * $1::float / 1e6
-     + COALESCE(SUM(candidates_tokens) FILTER (WHERE event_type='transcribe_success'), 0) * $2::float / 1e6
-    )::float AS cost_30d
+    COALESCE(SUM(prompt_tokens) FILTER (WHERE event_type='transcribe_success'), 0)::bigint        AS prompt_30d,
+    COALESCE(SUM(prompt_audio_tokens) FILTER (WHERE event_type='transcribe_success'), 0)::bigint  AS audio_30d,
+    COALESCE(SUM(candidates_tokens) FILTER (WHERE event_type='transcribe_success'), 0)::bigint    AS cand_30d
 FROM nocorny_voice.events
 WHERE ts >= now() - interval '30 days'
 """
@@ -215,11 +224,9 @@ async def get_overview() -> Optional[OverviewSection]:
     p = pool.get()
     if p is None:
         return None
-    p_in = PRICE_PER_1M_INPUT_TOKENS
-    p_out = PRICE_PER_1M_OUTPUT_TOKENS
     win, win30, users_row, top24 = await asyncio.gather(
-        p.fetchrow(_OVERVIEW_WINDOWED_SQL, p_in, p_out),
-        p.fetchrow(_OVERVIEW_30D_SQL, p_in, p_out),
+        p.fetchrow(_OVERVIEW_WINDOWED_SQL),
+        p.fetchrow(_OVERVIEW_30D_SQL),
         p.fetchrow(_USERS_TABLE_OVERVIEW_SQL),
         _top_users_in(p, "1 day", limit=5),
     )
@@ -239,10 +246,13 @@ async def get_overview() -> Optional[OverviewSection]:
         minutes_24h=float(win["minutes_24h"]),
         rpm_now=int(win["rpm_now"]),
         rpd_today=int(win["rpd_today"]),
-        cost_usd_24h=float(win["cost_24h"]),
-        cost_usd_30d=float(win30["cost_30d"]),
-        price_per_1m_input=p_in,
-        price_per_1m_output=p_out,
+        cost_usd_24h=_cost_usd(int(win["prompt_24h"]), int(win["cand_24h"]),
+                               int(win["audio_24h"])),
+        cost_usd_30d=_cost_usd(int(win30["prompt_30d"]), int(win30["cand_30d"]),
+                               int(win30["audio_30d"])),
+        price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
+        price_per_1m_audio_input=PRICE_PER_1M_AUDIO_INPUT_TOKENS,
+        price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
 
 
@@ -298,6 +308,7 @@ async def get_users_section() -> Optional[UsersSection]:
         top_groups=groups,
         total_groups=int(total_groups_row["total"]),
         price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
+        price_per_1m_audio_input=PRICE_PER_1M_AUDIO_INPUT_TOKENS,
         price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
 
@@ -319,6 +330,7 @@ async def get_all_users_section(page: int = 1, page_size: int = 50
         total_pages=total_pages,
         page_size=page_size,
         price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
+        price_per_1m_audio_input=PRICE_PER_1M_AUDIO_INPUT_TOKENS,
         price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
 
@@ -451,10 +463,11 @@ async def get_perf_section() -> Optional[PerfSection]:
 
 _COST_LIFETIME_SQL = """
 SELECT
-    COALESCE(SUM(total_tokens), 0)::bigint        AS tk_lifetime,
-    COALESCE(SUM(prompt_tokens), 0)::bigint       AS prompt_lifetime,
-    COALESCE(SUM(candidates_tokens), 0)::bigint   AS cand_lifetime,
-    (COALESCE(SUM(duration_sec), 0)::float / 60)  AS min_lifetime
+    COALESCE(SUM(total_tokens), 0)::bigint            AS tk_lifetime,
+    COALESCE(SUM(prompt_tokens), 0)::bigint           AS prompt_lifetime,
+    COALESCE(SUM(prompt_audio_tokens), 0)::bigint     AS audio_lifetime,
+    COALESCE(SUM(candidates_tokens), 0)::bigint       AS cand_lifetime,
+    (COALESCE(SUM(duration_sec), 0)::float / 60)      AS min_lifetime
 FROM nocorny_voice.events
 WHERE event_type='transcribe_success'
 """
@@ -462,7 +475,8 @@ WHERE event_type='transcribe_success'
 
 _COST_WINDOWED_SQL = """
 WITH e AS (
-    SELECT ts, total_tokens, prompt_tokens, candidates_tokens, duration_sec
+    SELECT ts, total_tokens, prompt_tokens, candidates_tokens,
+           prompt_audio_tokens, duration_sec
     FROM nocorny_voice.events
     WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'
 )
@@ -472,12 +486,16 @@ SELECT
     COALESCE(SUM(total_tokens) FILTER (WHERE ts >= now() - interval '24 hours'), 0)::bigint AS tk_24h,
     COALESCE(AVG(total_tokens), 0)::float                                      AS avg_tk_30d,
     COALESCE(SUM(prompt_tokens), 0)::bigint                                    AS prompt_30d,
+    COALESCE(SUM(prompt_audio_tokens), 0)::bigint                              AS audio_30d,
     COALESCE(SUM(candidates_tokens), 0)::bigint                                AS cand_30d,
-    COALESCE(SUM(prompt_tokens) FILTER (WHERE ts >= now() - interval '7 days'), 0)::bigint  AS prompt_7d,
-    COALESCE(SUM(candidates_tokens) FILTER (WHERE ts >= now() - interval '7 days'), 0)::bigint AS cand_7d,
-    COALESCE(SUM(prompt_tokens) FILTER (WHERE ts >= now() - interval '24 hours'), 0)::bigint AS prompt_24h,
-    COALESCE(SUM(candidates_tokens) FILTER (WHERE ts >= now() - interval '24 hours'), 0)::bigint AS cand_24h,
+    COALESCE(SUM(prompt_tokens) FILTER (WHERE ts >= now() - interval '7 days'), 0)::bigint        AS prompt_7d,
+    COALESCE(SUM(prompt_audio_tokens) FILTER (WHERE ts >= now() - interval '7 days'), 0)::bigint  AS audio_7d,
+    COALESCE(SUM(candidates_tokens) FILTER (WHERE ts >= now() - interval '7 days'), 0)::bigint    AS cand_7d,
+    COALESCE(SUM(prompt_tokens) FILTER (WHERE ts >= now() - interval '24 hours'), 0)::bigint        AS prompt_24h,
+    COALESCE(SUM(prompt_audio_tokens) FILTER (WHERE ts >= now() - interval '24 hours'), 0)::bigint  AS audio_24h,
+    COALESCE(SUM(candidates_tokens) FILTER (WHERE ts >= now() - interval '24 hours'), 0)::bigint    AS cand_24h,
     COALESCE(AVG(prompt_tokens), 0)::float                                     AS avg_prompt_30d,
+    COALESCE(AVG(prompt_audio_tokens), 0)::float                               AS avg_audio_30d,
     COALESCE(AVG(candidates_tokens), 0)::float                                 AS avg_cand_30d,
     (COALESCE(SUM(duration_sec), 0)::float / 60)                               AS min_30d,
     count(*) FILTER (WHERE ts >= now() - interval '1 minute')::bigint          AS rpm_now,
@@ -486,8 +504,14 @@ FROM e
 """
 
 
-def _cost_usd(prompt_tokens: int, candidates_tokens: int) -> float:
-    return (prompt_tokens * PRICE_PER_1M_INPUT_TOKENS / 1e6
+def _cost_usd(prompt_tokens: float, candidates_tokens: float,
+              prompt_audio_tokens: float = 0.0) -> float:
+    """Cost in USD. Audio prompt-tokens priced at the audio rate, the rest at
+    text-input rate. `prompt_tokens` is the total prompt count (incl. audio)."""
+    audio = max(0.0, prompt_audio_tokens)
+    text = max(0.0, prompt_tokens - audio)
+    return (text * PRICE_PER_1M_INPUT_TOKENS / 1e6
+            + audio * PRICE_PER_1M_AUDIO_INPUT_TOKENS / 1e6
             + candidates_tokens * PRICE_PER_1M_OUTPUT_TOKENS / 1e6)
 
 
@@ -500,12 +524,17 @@ async def get_cost_section() -> Optional[CostSection]:
         p.fetchrow(_COST_WINDOWED_SQL),
     )
     cost_lifetime = _cost_usd(int(lifetime["prompt_lifetime"]),
-                              int(lifetime["cand_lifetime"]))
-    cost_30d = _cost_usd(int(win["prompt_30d"]), int(win["cand_30d"]))
-    cost_7d = _cost_usd(int(win["prompt_7d"]), int(win["cand_7d"]))
-    cost_24h = _cost_usd(int(win["prompt_24h"]), int(win["cand_24h"]))
+                              int(lifetime["cand_lifetime"]),
+                              int(lifetime["audio_lifetime"]))
+    cost_30d = _cost_usd(int(win["prompt_30d"]), int(win["cand_30d"]),
+                         int(win["audio_30d"]))
+    cost_7d = _cost_usd(int(win["prompt_7d"]), int(win["cand_7d"]),
+                        int(win["audio_7d"]))
+    cost_24h = _cost_usd(int(win["prompt_24h"]), int(win["cand_24h"]),
+                         int(win["audio_24h"]))
     avg_cost_30d = _cost_usd(float(win["avg_prompt_30d"]),
-                             float(win["avg_cand_30d"]))
+                             float(win["avg_cand_30d"]),
+                             float(win["avg_audio_30d"]))
     return CostSection(
         total_tokens_lifetime=int(lifetime["tk_lifetime"]),
         total_tokens_30d=int(win["tk_30d"]),
@@ -522,6 +551,7 @@ async def get_cost_section() -> Optional[CostSection]:
         cost_usd_24h=cost_24h,
         avg_cost_usd_per_request_30d=avg_cost_30d,
         price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
+        price_per_1m_audio_input=PRICE_PER_1M_AUDIO_INPUT_TOKENS,
         price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
 
@@ -546,15 +576,13 @@ async def _top_users_in(p: asyncpg.Pool, interval: str, limit: int) -> list[TopU
 async def _top_users_usage_in(p: asyncpg.Pool, interval: str, limit: int
                               ) -> list[TopUserUsage]:
     """Top users in a window with events/tokens/cost computed from transcribe_success."""
-    cost_select = (
-        f"COALESCE(SUM(e.prompt_tokens),0) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
-        f"COALESCE(SUM(e.candidates_tokens),0) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
-    )
     rows = await p.fetch(
         "SELECT e.user_id, u.username, u.first_name, "
         "count(*)::bigint AS ev, "
         "COALESCE(SUM(e.total_tokens),0)::bigint AS tk, "
-        f"({cost_select})::float AS c "
+        "COALESCE(SUM(e.prompt_tokens),0)::bigint AS pt, "
+        "COALESCE(SUM(e.prompt_audio_tokens),0)::bigint AS pa, "
+        "COALESCE(SUM(e.candidates_tokens),0)::bigint AS ct "
         "FROM nocorny_voice.events e "
         "LEFT JOIN nocorny_voice.users u USING (user_id) "
         f"WHERE e.event_type='transcribe_success' AND e.ts >= now() - interval '{interval}' "
@@ -564,17 +592,14 @@ async def _top_users_usage_in(p: asyncpg.Pool, interval: str, limit: int
     )
     return [TopUserUsage(
         r["user_id"], r["username"], r["first_name"],
-        int(r["ev"]), int(r["tk"]), float(r["c"]),
+        int(r["ev"]), int(r["tk"]),
+        _cost_usd(int(r["pt"]), int(r["ct"]), int(r["pa"])),
     ) for r in rows]
 
 
 async def _top_users_all_page_with_usage(p: asyncpg.Pool, page: int, page_size: int
                                          ) -> list[TopUserUsage]:
     """Page through all users sorted by lifetime total_events; left-join lifetime usage."""
-    cost_select = (
-        f"COALESCE(SUM(e.prompt_tokens),0) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
-        f"COALESCE(SUM(e.candidates_tokens),0) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
-    )
     rows = await p.fetch(
         "WITH page_users AS ("
         "  SELECT user_id, username, first_name, total_events "
@@ -583,14 +608,19 @@ async def _top_users_all_page_with_usage(p: asyncpg.Pool, page: int, page_size: 
         "), usage AS ("
         "  SELECT e.user_id, "
         "    COALESCE(SUM(e.total_tokens),0)::bigint AS tk, "
-        f"   ({cost_select})::float AS c "
+        "    COALESCE(SUM(e.prompt_tokens),0)::bigint AS pt, "
+        "    COALESCE(SUM(e.prompt_audio_tokens),0)::bigint AS pa, "
+        "    COALESCE(SUM(e.candidates_tokens),0)::bigint AS ct "
         "  FROM nocorny_voice.events e "
         "  WHERE e.event_type='transcribe_success' "
         "    AND e.user_id IN (SELECT user_id FROM page_users) "
         "  GROUP BY e.user_id"
         ") "
         "SELECT p.user_id, p.username, p.first_name, p.total_events, "
-        "       COALESCE(u.tk, 0) AS tk, COALESCE(u.c, 0) AS c "
+        "       COALESCE(u.tk, 0) AS tk, "
+        "       COALESCE(u.pt, 0) AS pt, "
+        "       COALESCE(u.pa, 0) AS pa, "
+        "       COALESCE(u.ct, 0) AS ct "
         "FROM page_users p LEFT JOIN usage u USING (user_id) "
         "ORDER BY p.total_events DESC",
         page_size,
@@ -598,7 +628,8 @@ async def _top_users_all_page_with_usage(p: asyncpg.Pool, page: int, page_size: 
     )
     return [TopUserUsage(
         r["user_id"], r["username"], r["first_name"],
-        int(r["total_events"]), int(r["tk"]), float(r["c"]),
+        int(r["total_events"]), int(r["tk"]),
+        _cost_usd(int(r["pt"]), int(r["ct"]), int(r["pa"])),
     ) for r in rows]
 
 

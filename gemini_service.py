@@ -81,6 +81,7 @@ class GeminiResult:
     prompt_tokens: int
     candidates_tokens: int
     total_tokens: int
+    prompt_audio_tokens: int = 0
     detected_language: Optional[str] = None
 
 
@@ -115,29 +116,76 @@ def _get_transcribe_model() -> genai.GenerativeModel:
     return _transcribe_model
 
 
-def _extract_usage(response) -> Tuple[int, int, int]:
+# Gemini tariffs audio at exactly 32 tokens/sec — used as fallback when the API
+# response doesn't include modality breakdown.
+_AUDIO_TOKENS_PER_SEC = 32
+
+# Log AUDIO modality detection only on the first occurrence per process,
+# to confirm in prod that the SDK actually surfaces prompt_tokens_details.
+_audio_modality_logged = False
+
+
+def _extract_audio_tokens(usage, prompt_total: int,
+                          duration_sec: Optional[int]) -> int:
+    """Extract audio-modality token count from usage_metadata.prompt_tokens_details.
+
+    Returns 0 for non-audio requests. For audio requests where the API doesn't
+    return AUDIO entry (or returns 0), falls back to `min(duration*32, prompt_total)`
+    — Gemini's deterministic 32 t/s tariff makes this exact, not an estimate.
+    """
+    global _audio_modality_logged
+    details = getattr(usage, "prompt_tokens_details", None) or []
+    audio_from_details = 0
+    for entry in details:
+        modality = getattr(entry, "modality", None)
+        modality_name = getattr(modality, "name", str(modality)).upper()
+        if modality_name == "AUDIO":
+            audio_from_details = int(getattr(entry, "token_count", 0) or 0)
+            break
+
+    if audio_from_details > 0:
+        if not _audio_modality_logged:
+            _audio_modality_logged = True
+            logger.info(
+                "gemini_audio_modality_detected audio_tokens=%d prompt_total=%d",
+                audio_from_details, prompt_total,
+            )
+        return min(audio_from_details, prompt_total)
+
+    if duration_sec and duration_sec > 0 and prompt_total > 0:
+        fallback = min(duration_sec * _AUDIO_TOKENS_PER_SEC, prompt_total)
+        if fallback > 0:
+            logger.warning(
+                "gemini_audio_details_missing using_fallback duration=%ds "
+                "prompt_total=%d audio_fallback=%d",
+                duration_sec, prompt_total, fallback,
+            )
+            return fallback
+    return 0
+
+
+def _extract_usage(response, duration_sec: Optional[int] = None
+                   ) -> Tuple[int, int, int, int]:
+    """Returns (prompt_total, prompt_audio, candidates, total)."""
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
-        return 0, 0, 0
-    return (
-        getattr(usage, "prompt_token_count", 0) or 0,
-        getattr(usage, "candidates_token_count", 0) or 0,
-        getattr(usage, "total_token_count", 0) or 0,
-    )
+        return 0, 0, 0, 0
+    prompt = getattr(usage, "prompt_token_count", 0) or 0
+    cand = getattr(usage, "candidates_token_count", 0) or 0
+    total = getattr(usage, "total_token_count", 0) or 0
+    audio = _extract_audio_tokens(usage, prompt, duration_sec)
+    return prompt, audio, cand, total
 
 
-def _log_usage(operation: str, response) -> Tuple[int, int, int]:
-    p, c, t = _extract_usage(response)
+def _log_usage(operation: str, response, duration_sec: Optional[int] = None
+               ) -> Tuple[int, int, int, int]:
+    p, pa, c, t = _extract_usage(response, duration_sec)
     logger.info(
-        "gemini_usage operation=%s prompt_tokens=%d candidates_tokens=%d "
-        "total_tokens=%d model=%s",
-        operation,
-        p,
-        c,
-        t,
-        MODEL_NAME,
+        "gemini_usage operation=%s prompt_tokens=%d audio_tokens=%d "
+        "candidates_tokens=%d total_tokens=%d model=%s",
+        operation, p, pa, c, t, MODEL_NAME,
     )
-    return p, c, t
+    return p, pa, c, t
 
 
 _LOOP_RATE_MIN_DURATION_SEC = 5
@@ -309,7 +357,7 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
 
     # Surviving chunks (degraded ones contribute a placeholder).
     parts: List[str] = []
-    p_total = c_total = t_total = 0
+    p_total = pa_total = c_total = t_total = 0
     detected: Optional[str] = None
     degraded_count = 0
     for idx, r in enumerate(results):
@@ -326,6 +374,7 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
         # success
         parts.append(r.text)
         p_total += r.prompt_tokens
+        pa_total += r.prompt_audio_tokens
         c_total += r.candidates_tokens
         t_total += r.total_tokens
         if detected is None and r.detected_language:
@@ -346,6 +395,7 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
         prompt_tokens=p_total,
         candidates_tokens=c_total,
         total_tokens=t_total,
+        prompt_audio_tokens=pa_total,
         detected_language=detected,
     )
 
@@ -384,7 +434,7 @@ async def _transcribe_one(
         except Exception as e:  # noqa: BLE001 - cleanup best-effort
             logger.warning("gemini_delete_file_failed name=%s exc=%s", gemini_file.name, e)
 
-    p, c, t = _log_usage("transcribe", response)
+    p, pa, c, t = _log_usage("transcribe", response, duration_sec)
 
     # Loop check BEFORE touching response.text — bad responses often raise
     # there too, but the rate signal is more informative.
@@ -416,6 +466,7 @@ async def _transcribe_one(
         prompt_tokens=p,
         candidates_tokens=c,
         total_tokens=t,
+        prompt_audio_tokens=pa,
         detected_language=detected_language,
     )
 
