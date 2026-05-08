@@ -131,13 +131,42 @@ async def test_too_large_voice_rejected(monkeypatch):
     transcribe_spy = AsyncMock()
     monkeypatch.setattr(gemini_service, "transcribe", transcribe_spy)
 
-    huge = 100 * 1024 * 1024  # 100 MB > 50 MB default
+    huge = 100 * 1024 * 1024  # 100 MB, well over the 20 MB default
     update, context, _, _ = _make_update_context(
         voice=_make_voice(file_size=huge)
     )
     await t.handle_message(update, context)
 
     transcribe_spy.assert_not_called()
+
+
+async def test_telegram_file_too_big_returns_friendly_message(monkeypatch):
+    """Telegram caps getFile at 20 MB; some clients under-report file_size so the
+    download still fails. The handler should surface our 'too large' message
+    instead of the generic error."""
+    from telegram.error import BadRequest
+
+    from handlers import transcribe as t
+
+    transcribe_spy = AsyncMock()
+    monkeypatch.setattr(gemini_service, "transcribe", transcribe_spy)
+    track_spy = MagicMock()
+    monkeypatch.setattr(t.analytics, "track", track_spy)
+
+    # file_size below our limit so pre-flight passes; failure happens in getFile.
+    update, context, status, _ = _make_update_context(
+        voice=_make_voice(file_size=1000)
+    )
+    context.bot.get_file = AsyncMock(side_effect=BadRequest("File is too big"))
+
+    await t.handle_message(update, context)
+
+    transcribe_spy.assert_not_called()
+    sent_text = status.edit_text.call_args.args[0]
+    assert "too large" in sent_text.lower() or "20" in sent_text
+    tracked_events = [c.args[0] for c in track_spy.call_args_list]
+    assert "media_rejected_too_large" in tracked_events
+    assert "error_unknown" not in tracked_events
 
 
 # --------------------------------------------------------------------- Rate limit

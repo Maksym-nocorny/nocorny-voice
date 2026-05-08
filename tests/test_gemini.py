@@ -80,3 +80,14 @@ def test_unknown_duration_only_uses_token_cap():
     # Without duration we can only check the cap signal.
     assert not _is_likely_loop(out_tokens=200, duration_sec=None, max_tokens=8192)
     assert _is_likely_loop(out_tokens=8192, duration_sec=None, max_tokens=8192)
+
+
+def test_short_clip_skips_rate_check():
+    # On a 1-2s voice ("Привіт, як справи?") tokens/sec is too noisy — a
+    # legitimate short reply easily exceeds the 8 tok/s threshold. Only the
+    # max-tokens cap should still apply.
+    assert not _is_likely_loop(out_tokens=12, duration_sec=1, max_tokens=8192)
+    assert not _is_likely_loop(out_tokens=20, duration_sec=2, max_tokens=8192)
+    assert not _is_likely_loop(out_tokens=40, duration_sec=4, max_tokens=8192)
+    # Cap signal still fires regardless of duration.
+    assert _is_likely_loop(out_tokens=8192, duration_sec=1, max_tokens=8192)
