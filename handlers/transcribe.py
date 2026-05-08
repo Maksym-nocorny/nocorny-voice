@@ -189,6 +189,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Fresh request: download → L2 cache check → transcribe → respond
     status_message = await update.message.reply_text(get_text(user_lang, "downloading"))
     temp_path: Optional[str] = None
+    # Holds the GeminiResult once transcribe returns. Read by the catch-all
+    # `except Exception` so cost is still recorded if the failure happens
+    # AFTER Gemini billed us (e.g. cache.store_* or _send_transcription).
+    result: Optional[gemini_service.GeminiResult] = None
     try:
         try:
             new_file = await context.bot.get_file(info.file_id)
@@ -243,8 +247,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             latency_ms=int((time.monotonic() - t0) * 1000))
             await status_message.edit_text(get_text(user_lang, "processing_failed"))
             return
-        except gemini_service.TranscriptionDegradedError:
+        except gemini_service.TranscriptionDegradedError as e:
+            # Gemini still bills for degraded calls — surface the partial usage
+            # carried by the exception so cost accounting matches the API bill.
+            partial = gemini_service.GeminiResult(
+                text="",
+                prompt_tokens=getattr(e, "prompt_tokens", 0),
+                prompt_audio_tokens=getattr(e, "prompt_audio_tokens", 0),
+                candidates_tokens=getattr(e, "candidates_tokens", 0),
+                total_tokens=getattr(e, "total_tokens", 0),
+            )
             analytics.track("transcribe_degraded", user=user, chat=chat, info=info,
+                            result=partial,
                             latency_ms=int((time.monotonic() - t0) * 1000))
             await status_message.edit_text(get_text(user_lang, "transcribe_degraded"))
             return
@@ -260,8 +274,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     except Exception as e:
         logger.exception("transcribe_handler_error")
+        # If we got past the transcribe() call before the failure, `result` is
+        # populated and Gemini already billed us — pass it through so tokens
+        # land in analytics. For pre-Gemini failures `result` is still None.
         analytics.track(
-            "error_unknown", user=user, chat=chat, info=info,
+            "error_unknown", user=user, chat=chat, info=info, result=result,
             error_class=type(e).__name__,
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
