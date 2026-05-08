@@ -1,8 +1,10 @@
-"""Read path: all aggregations executed in SQL, returned as typed dataclasses.
+"""Read path: per-section consolidated SQL.
 
-Each section function fans out queries via asyncio.gather() — every query
-acquires its own connection from the pool (asyncpg connections cannot be
-shared by concurrent operations).
+Each section runs a small number of wide aggregations using
+`count(*) FILTER (WHERE …)` / `SUM(...) FILTER (WHERE …)` so a single Postgres
+round-trip yields all the scalars the formatter needs. Independent queries
+within a section fan out via `asyncio.gather` — every query takes its own
+connection from the pool (asyncpg connections cannot be shared concurrently).
 """
 from __future__ import annotations
 
@@ -148,142 +150,153 @@ class CostSection:
     cost_usd_7d: float = 0.0
 
 
-# --------------------------------------------------------------------------- helpers
-
-
-async def _scalar(p: asyncpg.Pool, sql: str, *args) -> int:
-    val = await p.fetchval(sql, *args)
-    return int(val or 0)
-
-
-async def _scalar_float(p: asyncpg.Pool, sql: str, *args) -> float:
-    val = await p.fetchval(sql, *args)
-    return float(val or 0.0)
-
-
 # --------------------------------------------------------------------------- overview
+
+
+_OVERVIEW_WINDOWED_SQL = """
+WITH e AS (
+    SELECT ts, user_id, event_type, total_tokens, duration_sec,
+           prompt_tokens, candidates_tokens
+    FROM nocorny_voice.events
+    WHERE ts >= now() - interval '7 days'
+)
+SELECT
+    count(*) FILTER (WHERE ts >= date_trunc('day', now()))::bigint        AS today,
+    count(*) FILTER (WHERE ts >= now() - interval '24 hours')::bigint     AS last_24h,
+    count(*)::bigint                                                       AS last_7d,
+    count(*) FILTER (WHERE ts >= date_trunc('hour', now()))::bigint       AS this_hour,
+    count(DISTINCT user_id) FILTER (WHERE ts >= now() - interval '1 day')::bigint  AS dau,
+    count(DISTINCT user_id) FILTER (WHERE ts >= now() - interval '7 days')::bigint AS wau,
+    count(*) FILTER (WHERE event_type='transcribe_success'
+                       AND ts >= now() - interval '1 minute')::bigint     AS rpm_now,
+    count(*) FILTER (WHERE event_type='transcribe_success'
+                       AND ts >= date_trunc('day', now()))::bigint        AS rpd_today,
+    COALESCE(SUM(total_tokens) FILTER (WHERE event_type='transcribe_success'
+                       AND ts >= now() - interval '24 hours'), 0)::bigint AS tokens_24h,
+    (COALESCE(SUM(duration_sec) FILTER (WHERE event_type='transcribe_success'
+                       AND ts >= now() - interval '24 hours'), 0)::float / 60) AS minutes_24h,
+    (COALESCE(SUM(prompt_tokens) FILTER (WHERE event_type='transcribe_success'
+                       AND ts >= now() - interval '24 hours'), 0) * $1::float / 1e6
+     + COALESCE(SUM(candidates_tokens) FILTER (WHERE event_type='transcribe_success'
+                       AND ts >= now() - interval '24 hours'), 0) * $2::float / 1e6
+    )::float                                                               AS cost_24h,
+    COALESCE(
+        count(*) FILTER (WHERE event_type IN
+            ('error_unknown','processing_failed','rate_limited_gemini','transcribe_degraded')
+            AND ts >= now() - interval '24 hours')::float
+        / NULLIF(count(*) FILTER (WHERE event_type='transcribe_request'
+            AND ts >= now() - interval '24 hours'), 0),
+        0
+    )::float                                                               AS error_rate_24h
+FROM e
+"""
+
+
+_OVERVIEW_30D_SQL = """
+SELECT
+    count(DISTINCT user_id)::bigint AS mau,
+    (COALESCE(SUM(prompt_tokens) FILTER (WHERE event_type='transcribe_success'), 0) * $1::float / 1e6
+     + COALESCE(SUM(candidates_tokens) FILTER (WHERE event_type='transcribe_success'), 0) * $2::float / 1e6
+    )::float AS cost_30d
+FROM nocorny_voice.events
+WHERE ts >= now() - interval '30 days'
+"""
+
+
+_USERS_TABLE_OVERVIEW_SQL = """
+SELECT
+    count(*)::bigint AS total,
+    count(*) FILTER (WHERE first_seen_at >= date_trunc('day', now()))::bigint AS new_today
+FROM nocorny_voice.users
+"""
 
 
 async def get_overview() -> Optional[OverviewSection]:
     p = pool.get()
     if p is None:
         return None
-    cost_select = (
-        f"SUM(prompt_tokens) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
-        f"SUM(candidates_tokens) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
-    )
-    results = await asyncio.gather(
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE ts >= date_trunc('day', now())"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE ts >= now() - interval '24 hours'"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE ts >= now() - interval '7 days'"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE ts >= date_trunc('hour', now())"),
-        _scalar(p,
-            "SELECT count(DISTINCT user_id) FROM nocorny_voice.events "
-            "WHERE ts >= now() - interval '1 day'"),
-        _scalar(p,
-            "SELECT count(DISTINCT user_id) FROM nocorny_voice.events "
-            "WHERE ts >= now() - interval '7 days'"),
-        _scalar(p,
-            "SELECT count(DISTINCT user_id) FROM nocorny_voice.events "
-            "WHERE ts >= now() - interval '30 days'"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.users "
-            "WHERE first_seen_at >= date_trunc('day', now())"),
-        _scalar(p, "SELECT count(*) FROM nocorny_voice.users"),
+    p_in = PRICE_PER_1M_INPUT_TOKENS
+    p_out = PRICE_PER_1M_OUTPUT_TOKENS
+    win, win30, users_row, top24 = await asyncio.gather(
+        p.fetchrow(_OVERVIEW_WINDOWED_SQL, p_in, p_out),
+        p.fetchrow(_OVERVIEW_30D_SQL, p_in, p_out),
+        p.fetchrow(_USERS_TABLE_OVERVIEW_SQL),
         _top_users_in(p, "1 day", limit=5),
-        _error_rate(p, "24 hours"),
-        _scalar(p,
-            "SELECT COALESCE(SUM(total_tokens),0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
-        _scalar_float(p,
-            "SELECT COALESCE(SUM(duration_sec),0)::float / 60 FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '1 minute'"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= date_trunc('day', now())"),
-        _scalar_float(p,
-            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
-        _scalar_float(p,
-            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
     )
     return OverviewSection(
-        today=results[0],
-        last_24h=results[1],
-        last_7d=results[2],
-        this_hour=results[3],
-        dau=results[4],
-        wau=results[5],
-        mau=results[6],
-        new_users_today=results[7],
-        total_users=results[8],
-        top_users_24h=results[9],
-        error_rate_24h=results[10],
-        total_tokens_24h=results[11],
-        minutes_24h=results[12],
-        rpm_now=results[13],
-        rpd_today=results[14],
-        cost_usd_24h=results[15],
-        cost_usd_30d=results[16],
-        price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
-        price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
+        today=int(win["today"]),
+        last_24h=int(win["last_24h"]),
+        last_7d=int(win["last_7d"]),
+        this_hour=int(win["this_hour"]),
+        dau=int(win["dau"]),
+        wau=int(win["wau"]),
+        mau=int(win30["mau"]),
+        new_users_today=int(users_row["new_today"]),
+        total_users=int(users_row["total"]),
+        top_users_24h=top24,
+        error_rate_24h=float(win["error_rate_24h"]),
+        total_tokens_24h=int(win["tokens_24h"]),
+        minutes_24h=float(win["minutes_24h"]),
+        rpm_now=int(win["rpm_now"]),
+        rpd_today=int(win["rpd_today"]),
+        cost_usd_24h=float(win["cost_24h"]),
+        cost_usd_30d=float(win30["cost_30d"]),
+        price_per_1m_input=p_in,
+        price_per_1m_output=p_out,
     )
 
 
 # --------------------------------------------------------------------------- users
 
 
+_USERS_COHORTS_SQL = """
+SELECT
+    count(DISTINCT user_id) FILTER (WHERE ts >= now() - interval '1 day')::bigint  AS dau,
+    count(DISTINCT user_id) FILTER (WHERE ts >= now() - interval '7 days')::bigint AS wau,
+    count(DISTINCT user_id)::bigint                                                AS mau
+FROM nocorny_voice.events
+WHERE ts >= now() - interval '30 days'
+"""
+
+
+_USERS_TABLE_SECTION_SQL = """
+SELECT
+    count(*)::bigint AS total,
+    count(*) FILTER (WHERE first_seen_at >= date_trunc('day', now()))::bigint AS new_today,
+    count(*) FILTER (WHERE first_seen_at >= now() - interval '7 days')::bigint AS new_7d
+FROM nocorny_voice.users
+"""
+
+
+_TOTAL_GROUPS_SQL = (
+    "SELECT count(*)::bigint AS total FROM nocorny_voice.chats "
+    "WHERE chat_type IN ('group','supergroup','channel')"
+)
+
+
 async def get_users_section() -> Optional[UsersSection]:
     p = pool.get()
     if p is None:
         return None
-    results = await asyncio.gather(
-        _scalar(p, "SELECT count(*) FROM nocorny_voice.users"),
-        _scalar(p,
-            "SELECT count(DISTINCT user_id) FROM nocorny_voice.events "
-            "WHERE ts >= now() - interval '1 day'"),
-        _scalar(p,
-            "SELECT count(DISTINCT user_id) FROM nocorny_voice.events "
-            "WHERE ts >= now() - interval '7 days'"),
-        _scalar(p,
-            "SELECT count(DISTINCT user_id) FROM nocorny_voice.events "
-            "WHERE ts >= now() - interval '30 days'"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.users "
-            "WHERE first_seen_at >= date_trunc('day', now())"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.users "
-            "WHERE first_seen_at >= now() - interval '7 days'"),
+    cohorts, users_row, top30, langs, groups, total_groups_row = await asyncio.gather(
+        p.fetchrow(_USERS_COHORTS_SQL),
+        p.fetchrow(_USERS_TABLE_SECTION_SQL),
         _top_users_usage_in(p, "30 days", 10),
         _languages(p),
         _top_groups(p, limit=15),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.chats "
-            "WHERE chat_type IN ('group','supergroup','channel')"),
+        p.fetchrow(_TOTAL_GROUPS_SQL),
     )
     return UsersSection(
-        total_users=results[0],
-        dau=results[1],
-        wau=results[2],
-        mau=results[3],
-        new_users_today=results[4],
-        new_users_7d=results[5],
-        top_users_30d=results[6],
-        languages=results[7],
-        top_groups=results[8],
-        total_groups=results[9],
+        total_users=int(users_row["total"]),
+        dau=int(cohorts["dau"]),
+        wau=int(cohorts["wau"]),
+        mau=int(cohorts["mau"]),
+        new_users_today=int(users_row["new_today"]),
+        new_users_7d=int(users_row["new_7d"]),
+        top_users_30d=top30,
+        languages=langs,
+        top_groups=groups,
+        total_groups=int(total_groups_row["total"]),
         price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
         price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
@@ -294,7 +307,8 @@ async def get_all_users_section(page: int = 1, page_size: int = 50
     p = pool.get()
     if p is None:
         return None
-    total_users = await _scalar(p, "SELECT count(*) FROM nocorny_voice.users")
+    total_users_row = await p.fetchrow("SELECT count(*)::bigint AS total FROM nocorny_voice.users")
+    total_users = int(total_users_row["total"])
     total_pages = max(1, (total_users + page_size - 1) // page_size)
     page = max(1, min(page, total_pages))
     rows = await _top_users_all_page_with_usage(p, page, page_size)
@@ -312,164 +326,201 @@ async def get_all_users_section(page: int = 1, page_size: int = 50
 # --------------------------------------------------------------------------- content
 
 
+_CONTENT_DURATIONS_SQL = """
+SELECT
+    (COALESCE(SUM(duration_sec), 0)::float / 60)                                       AS min_lifetime,
+    (COALESCE(SUM(duration_sec) FILTER (WHERE ts >= now() - interval '30 days'), 0)::float / 60) AS min_30d,
+    COALESCE(AVG(duration_sec), 0)::float                                              AS avg_dur,
+    COALESCE(percentile_disc(0.5) WITHIN GROUP (ORDER BY duration_sec)
+             FILTER (WHERE duration_sec IS NOT NULL), 0)::int                          AS median_dur
+FROM nocorny_voice.events
+WHERE event_type='transcribe_success'
+"""
+
+
 async def get_content_section() -> Optional[ContentSection]:
     p = pool.get()
     if p is None:
         return None
-    results = await asyncio.gather(
+    durations, media_types, chat_types, buckets = await asyncio.gather(
+        p.fetchrow(_CONTENT_DURATIONS_SQL),
         _grouped(p,
-            "SELECT COALESCE(media_type,'unknown') AS k, count(*) AS c "
+            "SELECT COALESCE(media_type,'unknown') AS k, count(*)::bigint AS c "
             "FROM nocorny_voice.events "
             "WHERE event_type='transcribe_success' "
             "GROUP BY 1 ORDER BY c DESC"),
         _grouped(p,
-            "SELECT chat_type AS k, count(*) AS c "
+            "SELECT chat_type AS k, count(*)::bigint AS c "
             "FROM nocorny_voice.events "
             "WHERE event_type='transcribe_success' "
             "GROUP BY 1 ORDER BY c DESC"),
-        _scalar_float(p,
-            "SELECT COALESCE(SUM(duration_sec),0)::float / 60 "
-            "FROM nocorny_voice.events WHERE event_type='transcribe_success'"),
-        _scalar_float(p,
-            "SELECT COALESCE(SUM(duration_sec),0)::float / 60 "
-            "FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
         _duration_buckets(p),
-        _scalar_float(p,
-            "SELECT COALESCE(AVG(duration_sec),0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success'"),
-        _scalar(p,
-            "SELECT COALESCE(percentile_disc(0.5) WITHIN GROUP (ORDER BY duration_sec),0) "
-            "FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND duration_sec IS NOT NULL"),
     )
     return ContentSection(
-        media_types=results[0],
-        chat_types=results[1],
-        total_minutes_lifetime=results[2],
-        total_minutes_30d=results[3],
-        duration_buckets=results[4],
-        avg_duration_sec=results[5],
-        median_duration_sec=results[6],
+        media_types=media_types,
+        chat_types=chat_types,
+        total_minutes_lifetime=float(durations["min_lifetime"]),
+        total_minutes_30d=float(durations["min_30d"]),
+        duration_buckets=buckets,
+        avg_duration_sec=float(durations["avg_dur"]),
+        median_duration_sec=int(durations["median_dur"]),
     )
 
 
 # --------------------------------------------------------------------------- perf
 
 
+_PERF_24H_SQL = """
+WITH e AS (
+    SELECT ts, event_type, latency_ms
+    FROM nocorny_voice.events
+    WHERE ts >= now() - interval '24 hours'
+)
+SELECT
+    COALESCE(
+        count(*) FILTER (WHERE event_type IN ('cache_hit','cache_l2_hit'))::float
+        / NULLIF(count(*) FILTER (WHERE event_type IN
+            ('cache_hit','cache_l2_hit','transcribe_success')), 0),
+        0
+    )::float AS cache_24h,
+    COALESCE(percentile_disc(0.5) WITHIN GROUP (ORDER BY latency_ms)
+             FILTER (WHERE event_type='transcribe_success' AND latency_ms IS NOT NULL),
+             0)::int AS p50,
+    COALESCE(percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms)
+             FILTER (WHERE event_type='transcribe_success' AND latency_ms IS NOT NULL),
+             0)::int AS p95,
+    COALESCE(percentile_disc(0.99) WITHIN GROUP (ORDER BY latency_ms)
+             FILTER (WHERE event_type='transcribe_success' AND latency_ms IS NOT NULL),
+             0)::int AS p99,
+    COALESCE(
+        count(*) FILTER (WHERE event_type IN
+            ('error_unknown','processing_failed','rate_limited_gemini','transcribe_degraded'))::float
+        / NULLIF(count(*) FILTER (WHERE event_type='transcribe_request'), 0),
+        0
+    )::float AS error_rate,
+    count(*) FILTER (WHERE event_type='rate_limited_user')::bigint AS rate_limited
+FROM e
+"""
+
+
+_PERF_7D_CACHE_SQL = """
+SELECT COALESCE(
+    count(*) FILTER (WHERE event_type IN ('cache_hit','cache_l2_hit'))::float
+    / NULLIF(count(*) FILTER (WHERE event_type IN
+        ('cache_hit','cache_l2_hit','transcribe_success')), 0),
+    0
+)::float AS cache_7d
+FROM nocorny_voice.events
+WHERE ts >= now() - interval '7 days'
+"""
+
+
 async def get_perf_section() -> Optional[PerfSection]:
     p = pool.get()
     if p is None:
         return None
-    results = await asyncio.gather(
-        _cache_hit_rate(p, "24 hours"),
-        _cache_hit_rate(p, "7 days"),
-        _latency_percentile(p, 0.5, "24 hours"),
-        _latency_percentile(p, 0.95, "24 hours"),
-        _latency_percentile(p, 0.99, "24 hours"),
-        _error_rate(p, "24 hours"),
+    h24, h7d, errors_by_class, rejected_24h = await asyncio.gather(
+        p.fetchrow(_PERF_24H_SQL),
+        p.fetchrow(_PERF_7D_CACHE_SQL),
         _grouped(p,
-            "SELECT COALESCE(error_class,'unknown') AS k, count(*) AS c "
+            "SELECT COALESCE(error_class,'unknown') AS k, count(*)::bigint AS c "
             "FROM nocorny_voice.events "
             "WHERE event_type='error_unknown' AND ts >= now() - interval '7 days' "
             "GROUP BY 1 ORDER BY c DESC LIMIT 10"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE event_type='rate_limited_user' AND ts >= now() - interval '24 hours'"),
         _grouped(p,
-            "SELECT event_type AS k, count(*) AS c "
+            "SELECT event_type AS k, count(*)::bigint AS c "
             "FROM nocorny_voice.events "
             "WHERE event_type LIKE 'media_rejected_%' AND ts >= now() - interval '24 hours' "
             "GROUP BY 1 ORDER BY c DESC"),
     )
     return PerfSection(
-        cache_hit_rate_24h=results[0],
-        cache_hit_rate_7d=results[1],
-        latency_p50_ms=results[2],
-        latency_p95_ms=results[3],
-        latency_p99_ms=results[4],
-        error_rate_24h=results[5],
-        errors_by_class=results[6],
-        rate_limited_24h=results[7],
-        rejected_24h=results[8],
+        cache_hit_rate_24h=float(h24["cache_24h"]),
+        cache_hit_rate_7d=float(h7d["cache_7d"]),
+        latency_p50_ms=int(h24["p50"]),
+        latency_p95_ms=int(h24["p95"]),
+        latency_p99_ms=int(h24["p99"]),
+        error_rate_24h=float(h24["error_rate"]),
+        errors_by_class=errors_by_class,
+        rate_limited_24h=int(h24["rate_limited"]),
+        rejected_24h=rejected_24h,
     )
 
 
 # --------------------------------------------------------------------------- cost
 
 
+_COST_LIFETIME_SQL = """
+SELECT
+    COALESCE(SUM(total_tokens), 0)::bigint        AS tk_lifetime,
+    COALESCE(SUM(prompt_tokens), 0)::bigint       AS prompt_lifetime,
+    COALESCE(SUM(candidates_tokens), 0)::bigint   AS cand_lifetime,
+    (COALESCE(SUM(duration_sec), 0)::float / 60)  AS min_lifetime
+FROM nocorny_voice.events
+WHERE event_type='transcribe_success'
+"""
+
+
+_COST_WINDOWED_SQL = """
+WITH e AS (
+    SELECT ts, total_tokens, prompt_tokens, candidates_tokens, duration_sec
+    FROM nocorny_voice.events
+    WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'
+)
+SELECT
+    COALESCE(SUM(total_tokens), 0)::bigint                                     AS tk_30d,
+    COALESCE(SUM(total_tokens) FILTER (WHERE ts >= now() - interval '7 days'), 0)::bigint   AS tk_7d,
+    COALESCE(SUM(total_tokens) FILTER (WHERE ts >= now() - interval '24 hours'), 0)::bigint AS tk_24h,
+    COALESCE(AVG(total_tokens), 0)::float                                      AS avg_tk_30d,
+    COALESCE(SUM(prompt_tokens), 0)::bigint                                    AS prompt_30d,
+    COALESCE(SUM(candidates_tokens), 0)::bigint                                AS cand_30d,
+    COALESCE(SUM(prompt_tokens) FILTER (WHERE ts >= now() - interval '7 days'), 0)::bigint  AS prompt_7d,
+    COALESCE(SUM(candidates_tokens) FILTER (WHERE ts >= now() - interval '7 days'), 0)::bigint AS cand_7d,
+    COALESCE(SUM(prompt_tokens) FILTER (WHERE ts >= now() - interval '24 hours'), 0)::bigint AS prompt_24h,
+    COALESCE(SUM(candidates_tokens) FILTER (WHERE ts >= now() - interval '24 hours'), 0)::bigint AS cand_24h,
+    COALESCE(AVG(prompt_tokens), 0)::float                                     AS avg_prompt_30d,
+    COALESCE(AVG(candidates_tokens), 0)::float                                 AS avg_cand_30d,
+    (COALESCE(SUM(duration_sec), 0)::float / 60)                               AS min_30d,
+    count(*) FILTER (WHERE ts >= now() - interval '1 minute')::bigint          AS rpm_now,
+    count(*) FILTER (WHERE ts >= date_trunc('day', now()))::bigint             AS rpd_today
+FROM e
+"""
+
+
+def _cost_usd(prompt_tokens: int, candidates_tokens: int) -> float:
+    return (prompt_tokens * PRICE_PER_1M_INPUT_TOKENS / 1e6
+            + candidates_tokens * PRICE_PER_1M_OUTPUT_TOKENS / 1e6)
+
+
 async def get_cost_section() -> Optional[CostSection]:
     p = pool.get()
     if p is None:
         return None
-    cost_select = (
-        f"SUM(prompt_tokens) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
-        f"SUM(candidates_tokens) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
+    lifetime, win = await asyncio.gather(
+        p.fetchrow(_COST_LIFETIME_SQL),
+        p.fetchrow(_COST_WINDOWED_SQL),
     )
-    avg_cost_select = (
-        f"AVG(prompt_tokens) * {PRICE_PER_1M_INPUT_TOKENS} / 1e6 + "
-        f"AVG(candidates_tokens) * {PRICE_PER_1M_OUTPUT_TOKENS} / 1e6"
-    )
-    results = await asyncio.gather(
-        _scalar(p,
-            "SELECT COALESCE(SUM(total_tokens),0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success'"),
-        _scalar(p,
-            "SELECT COALESCE(SUM(total_tokens),0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
-        _scalar(p,
-            "SELECT COALESCE(SUM(total_tokens),0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '7 days'"),
-        _scalar(p,
-            "SELECT COALESCE(SUM(total_tokens),0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
-        _scalar_float(p,
-            "SELECT COALESCE(AVG(total_tokens),0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
-        _scalar_float(p,
-            "SELECT COALESCE(SUM(duration_sec),0)::float / 60 "
-            "FROM nocorny_voice.events WHERE event_type='transcribe_success'"),
-        _scalar_float(p,
-            "SELECT COALESCE(SUM(duration_sec),0)::float / 60 "
-            "FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '1 minute'"),
-        _scalar(p,
-            "SELECT count(*) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= date_trunc('day', now())"),
-        _scalar_float(p,
-            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success'"),
-        _scalar_float(p,
-            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
-        _scalar_float(p,
-            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '7 days'"),
-        _scalar_float(p,
-            f"SELECT COALESCE({cost_select},0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '24 hours'"),
-        _scalar_float(p,
-            f"SELECT COALESCE({avg_cost_select},0) FROM nocorny_voice.events "
-            "WHERE event_type='transcribe_success' AND ts >= now() - interval '30 days'"),
-    )
+    cost_lifetime = _cost_usd(int(lifetime["prompt_lifetime"]),
+                              int(lifetime["cand_lifetime"]))
+    cost_30d = _cost_usd(int(win["prompt_30d"]), int(win["cand_30d"]))
+    cost_7d = _cost_usd(int(win["prompt_7d"]), int(win["cand_7d"]))
+    cost_24h = _cost_usd(int(win["prompt_24h"]), int(win["cand_24h"]))
+    avg_cost_30d = _cost_usd(float(win["avg_prompt_30d"]),
+                             float(win["avg_cand_30d"]))
     return CostSection(
-        total_tokens_lifetime=results[0],
-        total_tokens_30d=results[1],
-        total_tokens_7d=results[2],
-        total_tokens_24h=results[3],
-        avg_tokens_per_request_30d=results[4],
-        minutes_lifetime=results[5],
-        minutes_30d=results[6],
-        rpm_now=results[7],
-        rpd_today=results[8],
-        cost_usd_lifetime=results[9],
-        cost_usd_30d=results[10],
-        cost_usd_7d=results[11],
-        cost_usd_24h=results[12],
-        avg_cost_usd_per_request_30d=results[13],
+        total_tokens_lifetime=int(lifetime["tk_lifetime"]),
+        total_tokens_30d=int(win["tk_30d"]),
+        total_tokens_7d=int(win["tk_7d"]),
+        total_tokens_24h=int(win["tk_24h"]),
+        avg_tokens_per_request_30d=float(win["avg_tk_30d"]),
+        minutes_lifetime=float(lifetime["min_lifetime"]),
+        minutes_30d=float(win["min_30d"]),
+        rpm_now=int(win["rpm_now"]),
+        rpd_today=int(win["rpd_today"]),
+        cost_usd_lifetime=cost_lifetime,
+        cost_usd_30d=cost_30d,
+        cost_usd_7d=cost_7d,
+        cost_usd_24h=cost_24h,
+        avg_cost_usd_per_request_30d=avg_cost_30d,
         price_per_1m_input=PRICE_PER_1M_INPUT_TOKENS,
         price_per_1m_output=PRICE_PER_1M_OUTPUT_TOKENS,
     )
@@ -480,7 +531,7 @@ async def get_cost_section() -> Optional[CostSection]:
 
 async def _top_users_in(p: asyncpg.Pool, interval: str, limit: int) -> list[TopUser]:
     rows = await p.fetch(
-        "SELECT e.user_id, u.username, u.first_name, count(*) AS c "
+        "SELECT e.user_id, u.username, u.first_name, count(*)::bigint AS c "
         "FROM nocorny_voice.events e "
         "LEFT JOIN nocorny_voice.users u USING (user_id) "
         f"WHERE e.ts >= now() - interval '{interval}' "
@@ -501,9 +552,9 @@ async def _top_users_usage_in(p: asyncpg.Pool, interval: str, limit: int
     )
     rows = await p.fetch(
         "SELECT e.user_id, u.username, u.first_name, "
-        "count(*) AS ev, "
-        "COALESCE(SUM(e.total_tokens),0) AS tk, "
-        f"({cost_select}) AS c "
+        "count(*)::bigint AS ev, "
+        "COALESCE(SUM(e.total_tokens),0)::bigint AS tk, "
+        f"({cost_select})::float AS c "
         "FROM nocorny_voice.events e "
         "LEFT JOIN nocorny_voice.users u USING (user_id) "
         f"WHERE e.event_type='transcribe_success' AND e.ts >= now() - interval '{interval}' "
@@ -531,8 +582,8 @@ async def _top_users_all_page_with_usage(p: asyncpg.Pool, page: int, page_size: 
         "  ORDER BY total_events DESC LIMIT $1 OFFSET $2"
         "), usage AS ("
         "  SELECT e.user_id, "
-        "    COALESCE(SUM(e.total_tokens),0) AS tk, "
-        f"   ({cost_select}) AS c "
+        "    COALESCE(SUM(e.total_tokens),0)::bigint AS tk, "
+        f"   ({cost_select})::float AS c "
         "  FROM nocorny_voice.events e "
         "  WHERE e.event_type='transcribe_success' "
         "    AND e.user_id IN (SELECT user_id FROM page_users) "
@@ -565,7 +616,7 @@ async def _top_groups(p: asyncpg.Pool, limit: int) -> list[TopGroup]:
 
 async def _languages(p: asyncpg.Pool) -> list[CountedRow]:
     rows = await p.fetch(
-        "SELECT detected_language AS k, count(DISTINCT user_id) AS c "
+        "SELECT detected_language AS k, count(DISTINCT user_id)::bigint AS c "
         "FROM nocorny_voice.events "
         "WHERE detected_language IS NOT NULL "
         "GROUP BY 1 ORDER BY c DESC"
@@ -594,61 +645,11 @@ async def _duration_buckets(p: asyncpg.Pool) -> list[CountedRow]:
                 WHEN duration_sec < 1800 THEN '10-30m'
                 ELSE '>30m'
             END AS k,
-            count(*) AS c
+            count(*)::bigint AS c
         FROM nocorny_voice.events
         WHERE event_type='transcribe_success'
         GROUP BY 1
     """)
-    # Six rows max — sort in Python.
     counted = [CountedRow(r["k"], int(r["c"])) for r in rows]
     counted.sort(key=lambda c: _DURATION_BUCKET_ORDER.get(c.label, 99))
     return counted
-
-
-async def _cache_hit_rate(p: asyncpg.Pool, interval: str) -> float:
-    val = await p.fetchval(f"""
-        SELECT
-            COALESCE(
-                count(*) FILTER (WHERE event_type IN ('cache_hit','cache_l2_hit'))::float /
-                NULLIF(
-                    count(*) FILTER (
-                        WHERE event_type IN ('cache_hit','cache_l2_hit','transcribe_success')
-                    ),
-                    0
-                ),
-                0
-            )
-        FROM nocorny_voice.events
-        WHERE ts >= now() - interval '{interval}'
-    """)
-    return float(val or 0.0)
-
-
-async def _latency_percentile(p: asyncpg.Pool, q: float, interval: str) -> int:
-    val = await p.fetchval(f"""
-        SELECT COALESCE(
-            percentile_disc($1) WITHIN GROUP (ORDER BY latency_ms),
-            0
-        )::int
-        FROM nocorny_voice.events
-        WHERE event_type='transcribe_success'
-          AND latency_ms IS NOT NULL
-          AND ts >= now() - interval '{interval}'
-    """, q)
-    return int(val or 0)
-
-
-async def _error_rate(p: asyncpg.Pool, interval: str) -> float:
-    val = await p.fetchval(f"""
-        SELECT
-            COALESCE(
-                count(*) FILTER (WHERE event_type IN
-                    ('error_unknown','processing_failed','rate_limited_gemini',
-                     'transcribe_degraded'))::float /
-                NULLIF(count(*) FILTER (WHERE event_type='transcribe_request'),0),
-                0
-            )
-        FROM nocorny_voice.events
-        WHERE ts >= now() - interval '{interval}'
-    """)
-    return float(val or 0.0)

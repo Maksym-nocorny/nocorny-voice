@@ -1,6 +1,7 @@
 """/stats command handler — admin-only analytics overview."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -16,8 +17,26 @@ from utils.markdown import chunk_text
 
 logger = logging.getLogger(__name__)
 
-_overview_cache: tuple[float, str] | None = None
-_OVERVIEW_TTL_SEC = 5.0
+
+# Per-section TTL. Overview stays at 5s for "live" feel; the rest can age out
+# slower because the data is essentially aggregate.
+_TTL_SEC: dict[str, float] = {
+    "overview": 5.0,
+    "users": 30.0,
+    "all_users": 30.0,
+    "content": 60.0,
+    "perf": 30.0,
+    "cost": 60.0,
+}
+
+# (sub, page) -> (monotonic_ts, html_text, keyboard)
+_cache: dict[tuple[str, int], tuple[float, str, InlineKeyboardMarkup]] = {}
+# Cap memory growth from All Users pagination keys.
+_CACHE_MAX = 32
+
+# Single in-flight prefetch task (kicked off after `/stats` slash command).
+_prefetch_task: Optional[asyncio.Task] = None
+
 
 _SECTIONS = [
     ("overview", "Overview"),
@@ -89,6 +108,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         km = keyboard if i == len(chunks) - 1 else None
         await update.message.reply_text(chunk, parse_mode="HTML", reply_markup=km)
 
+    _kick_prefetch(except_=sub)
+
 
 async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -143,31 +164,51 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def _render_with_keyboard(sub: str, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
-    global _overview_cache
-    if sub in ("overview", "o"):
-        now = time.monotonic()
-        if _overview_cache and (now - _overview_cache[0]) < _OVERVIEW_TTL_SEC:
-            text = _overview_cache[1]
-        else:
-            text = analytics.render_overview(await analytics.get_overview())
-            _overview_cache = (now, text)
+    # Normalize aliases that show up in slash-command args.
+    sub = _normalize_sub(sub)
+    key = (sub, page)
+
+    hit = _cache.get(key)
+    if hit is not None and (time.monotonic() - hit[0]) < _TTL_SEC.get(sub, 30.0):
+        return hit[1], hit[2]
+
+    text, keyboard = await _compute(sub, page)
+    _cache_put(key, text, keyboard)
+    return text, keyboard
+
+
+def _normalize_sub(sub: str) -> str:
+    aliases = {
+        "o": "overview",
+        "u": "users",
+        "all": "all_users", "a": "all_users",
+        "c": "content",
+        "p": "perf", "performance": "perf",
+        "$": "cost",
+    }
+    return aliases.get(sub, sub)
+
+
+async def _compute(sub: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    if sub == "overview":
+        text = analytics.render_overview(await analytics.get_overview())
         return text, nav_keyboard("overview")
-    if sub in ("users", "u"):
+    if sub == "users":
         text = analytics.render_users(await analytics.get_users_section())
         return text, nav_keyboard("users")
-    if sub in ("all_users", "all", "a"):
+    if sub == "all_users":
         s = await analytics.get_all_users_section(page=page)
         text = analytics.render_all_users(s)
         _page = getattr(s, "page", page)
         _total_pages = getattr(s, "total_pages", 1)
         return text, nav_keyboard("all_users", page=_page, total_pages=_total_pages)
-    if sub in ("content", "c"):
+    if sub == "content":
         text = analytics.render_content(await analytics.get_content_section())
         return text, nav_keyboard("content")
-    if sub in ("perf", "p", "performance"):
+    if sub == "perf":
         text = analytics.render_perf(await analytics.get_perf_section())
         return text, nav_keyboard("perf")
-    if sub in ("cost", "$"):
+    if sub == "cost":
         text = analytics.render_cost(await analytics.get_cost_section())
         return text, nav_keyboard("cost")
     return (
@@ -181,7 +222,45 @@ async def _render_with_keyboard(sub: str, page: int = 1) -> tuple[str, InlineKey
     ), nav_keyboard("overview")
 
 
+def _cache_put(key: tuple[str, int], text: str,
+               keyboard: InlineKeyboardMarkup) -> None:
+    if len(_cache) >= _CACHE_MAX and key not in _cache:
+        # Evict the oldest entry (by write time). N <= 32, scan is trivial.
+        oldest = min(_cache, key=lambda k: _cache[k][0])
+        _cache.pop(oldest, None)
+    _cache[key] = (time.monotonic(), text, keyboard)
+
+
+def _kick_prefetch(*, except_: str) -> None:
+    """Fire a background task to warm sibling sections' cache.
+
+    Idempotent: if a prefetch is already running, do nothing.
+    """
+    global _prefetch_task
+    if _prefetch_task is not None and not _prefetch_task.done():
+        return
+    _prefetch_task = asyncio.create_task(
+        _prefetch_other_sections(except_), name="stats_prefetch",
+    )
+
+
+async def _prefetch_other_sections(except_: str) -> None:
+    # All Users is paginated and heavy — skip it.
+    sections = ["overview", "users", "content", "perf", "cost"]
+    for name in sections:
+        if name == except_:
+            continue
+        try:
+            await _render_with_keyboard(name, 1)
+        except Exception:
+            logger.debug("stats_prefetch_failed sub=%s", name, exc_info=True)
+
+
 def reset_cache() -> None:
-    """Test helper."""
-    global _overview_cache
-    _overview_cache = None
+    """Test helper: clear the section cache and cancel any in-flight prefetch."""
+    global _prefetch_task
+    _cache.clear()
+    task = _prefetch_task
+    if task is not None and not task.done():
+        task.cancel()
+    _prefetch_task = None
