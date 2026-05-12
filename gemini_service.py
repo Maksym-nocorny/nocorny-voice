@@ -131,9 +131,13 @@ def _get_transcribe_model() -> genai.GenerativeModel:
 # response doesn't include modality breakdown.
 _AUDIO_TOKENS_PER_SEC = 32
 
-# Log AUDIO modality detection only on the first occurrence per process,
-# to confirm in prod that the SDK actually surfaces prompt_tokens_details.
+# Track which audio-token path we've taken at least once. Both branches are
+# normal (the SDK either surfaces prompt_tokens_details or it doesn't, and
+# the shape doesn't change at runtime), so we log each path once at INFO and
+# stay silent afterward. Logging on every request was producing ~200 lines/day
+# of noise for what is steady-state behaviour.
 _audio_modality_logged = False
+_audio_fallback_logged = False
 
 
 def _extract_audio_tokens(usage, prompt_total: int,
@@ -144,7 +148,7 @@ def _extract_audio_tokens(usage, prompt_total: int,
     return AUDIO entry (or returns 0), falls back to `min(duration*32, prompt_total)`
     — Gemini's deterministic 32 t/s tariff makes this exact, not an estimate.
     """
-    global _audio_modality_logged
+    global _audio_modality_logged, _audio_fallback_logged
     details = getattr(usage, "prompt_tokens_details", None) or []
     audio_from_details = 0
     for entry in details:
@@ -166,11 +170,13 @@ def _extract_audio_tokens(usage, prompt_total: int,
     if duration_sec and duration_sec > 0 and prompt_total > 0:
         fallback = min(duration_sec * _AUDIO_TOKENS_PER_SEC, prompt_total)
         if fallback > 0:
-            logger.warning(
-                "gemini_audio_details_missing using_fallback duration=%ds "
-                "prompt_total=%d audio_fallback=%d",
-                duration_sec, prompt_total, fallback,
-            )
+            if not _audio_fallback_logged:
+                _audio_fallback_logged = True
+                logger.info(
+                    "gemini_audio_details_missing using_fallback "
+                    "(SDK doesn't surface prompt_tokens_details; "
+                    "computing audio tokens from duration*32)",
+                )
             return fallback
     return 0
 
@@ -200,22 +206,34 @@ def _log_usage(operation: str, response, duration_sec: Optional[int] = None
 
 
 _LOOP_RATE_MIN_DURATION_SEC = 5
+# Even fast Cyrillic speakers don't sustain this rate — anything above is
+# almost certainly the model babbling.
+_LOOP_RATE_HARD_TOK_PER_SEC = 20.0
 
 
 def _is_likely_loop(out_tokens: int, duration_sec: Optional[int],
+                    finish_reason: Optional[str] = None,
                     max_tokens: int = TRANSCRIBE_MAX_TOKENS) -> bool:
     """Heuristic: did the model run away generating repetitive output?
 
-    Two signals (either triggers):
+    Signals:
       1. Output is at >=95% of max_tokens (response was capped — almost always bad).
-      2. Output rate > N tokens/sec (real speech tops out ~5-7). Skipped on
-         very short clips (<5s) where token/sec is too noisy — a normal
-         "Привіт, як справи?" on a 2s clip easily exceeds the threshold.
+      2. Output rate exceeds plausible-speech ceiling (>20 tok/s). Skipped on
+         clips <5s where tok/sec is too noisy.
+      3. Output rate > soft threshold (8 tok/s) AND the model did NOT finish
+         naturally with STOP. Cyrillic tokenises 2-3x denser than English, so
+         normal Ukrainian/Russian speech routinely runs 8-12 tok/s and finishes
+         with STOP — those are real transcriptions, not loops. A genuine loop
+         that finishes with STOP at moderate rate is rare; loops typically hit
+         MAX_TOKENS or get stuck (caught by signal 1).
     """
     if max_tokens > 0 and out_tokens >= int(max_tokens * TRANSCRIBE_MAX_OUT_FRACTION):
         return True
     if duration_sec and duration_sec >= _LOOP_RATE_MIN_DURATION_SEC:
-        if out_tokens / duration_sec > TRANSCRIBE_MAX_OUT_PER_SEC:
+        rate = out_tokens / duration_sec
+        if rate > _LOOP_RATE_HARD_TOK_PER_SEC:
+            return True
+        if rate > TRANSCRIBE_MAX_OUT_PER_SEC and finish_reason != "STOP":
             return True
     return False
 
@@ -460,8 +478,8 @@ async def _transcribe_one(
 
     # Loop check BEFORE touching response.text — bad responses often raise
     # there too, but the rate signal is more informative.
-    if _is_likely_loop(c, duration_sec):
-        finish = _finish_reason(response)
+    finish = _finish_reason(response)
+    if _is_likely_loop(c, duration_sec, finish_reason=finish):
         logger.warning(
             "transcribe_loop_detected duration=%s out_tokens=%d finish=%s",
             duration_sec, c, finish,

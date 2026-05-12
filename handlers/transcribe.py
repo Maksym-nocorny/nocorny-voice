@@ -10,7 +10,13 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from telegram import Message, Update
-from telegram.error import BadRequest, TelegramError
+from telegram.error import (
+    BadRequest,
+    Forbidden,
+    NetworkError,
+    TelegramError,
+    TimedOut,
+)
 from telegram.ext import ContextTypes
 
 import analytics
@@ -30,6 +36,45 @@ logger = logging.getLogger(__name__)
 
 # Leave headroom for HTML escape expansion (worst-case ~10% overhead in real speech).
 _RAW_CHUNK_SIZE = int(TELEGRAM_MAX_MESSAGE_LEN * 0.85)
+
+
+# Telegram returns BadRequest with one of these messages when the message we're
+# trying to edit/reply-to is gone. The user deleted it, or it expired. Benign —
+# don't log a stack trace for this.
+_MSG_GONE_MARKERS = (
+    "message_id_invalid",
+    "message to edit not found",
+    "message to be replied not found",
+    "message to delete not found",
+    "message can't be edited",
+)
+
+
+def _is_message_gone(exc: BadRequest) -> bool:
+    s = str(exc).lower()
+    return any(m in s for m in _MSG_GONE_MARKERS)
+
+
+async def _safe_edit(message: Optional[Message], text: str, **kwargs) -> bool:
+    """Edit a status message; swallow benign 'message gone' / 'bot blocked' errors.
+
+    Returns True on success, False if the edit was skipped because the user
+    deleted the status message or blocked the bot. Other TelegramErrors
+    propagate so the caller can decide.
+    """
+    if message is None:
+        return False
+    try:
+        await message.edit_text(text, **kwargs)
+        return True
+    except BadRequest as e:
+        if _is_message_gone(e):
+            logger.info("status_message_gone reason=%s", e)
+            return False
+        raise
+    except Forbidden as e:
+        logger.info("status_message_forbidden reason=%s", e)
+        return False
 
 
 @dataclass
@@ -87,14 +132,18 @@ async def _send_transcription(
     full_message = prefix + escaped_full
     if len(full_message) <= TELEGRAM_MAX_MESSAGE_LEN:
         if status_message is not None and not is_group:
-            await status_message.edit_text(full_message, parse_mode="HTML")
+            edited = await _safe_edit(status_message, full_message, parse_mode="HTML")
+            if edited:
+                return
+            # Status message was deleted by the user — fall back to a fresh reply
+            # so the transcription still reaches them.
         else:
             if status_message is not None:
                 try:
                     await status_message.delete()
                 except TelegramError:
                     pass
-            await update.message.reply_text(full_message, parse_mode="HTML")
+        await update.message.reply_text(full_message, parse_mode="HTML")
         return
 
     # Chunked path
@@ -206,8 +255,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if "too big" in str(e).lower():
                 logger.info("media_rejected reason=too_large_telegram size=%s", info.file_size)
                 analytics.track("media_rejected_too_large", user=user, chat=chat, info=info)
-                await status_message.edit_text(
-                    get_text(user_lang, "media_too_large", MAX_FILE_SIZE_MB)
+                await _safe_edit(
+                    status_message,
+                    get_text(user_lang, "media_too_large", MAX_FILE_SIZE_MB),
                 )
                 return
             raise
@@ -230,7 +280,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
-        await status_message.edit_text(get_text(user_lang, "transcribing"))
+        await _safe_edit(status_message, get_text(user_lang, "transcribing"))
 
         analytics.track("transcribe_request", user=user, chat=chat, info=info)
         try:
@@ -240,12 +290,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except gemini_service.RateLimitedError:
             analytics.track("rate_limited_gemini", user=user, chat=chat, info=info,
                             latency_ms=int((time.monotonic() - t0) * 1000))
-            await status_message.edit_text(get_text(user_lang, "rate_limit_error"))
+            await _safe_edit(status_message, get_text(user_lang, "rate_limit_error"))
             return
         except gemini_service.ProcessingFailedError:
             analytics.track("processing_failed", user=user, chat=chat, info=info,
                             latency_ms=int((time.monotonic() - t0) * 1000))
-            await status_message.edit_text(get_text(user_lang, "processing_failed"))
+            await _safe_edit(status_message, get_text(user_lang, "processing_failed"))
             return
         except gemini_service.TranscriptionDegradedError as e:
             # Gemini still bills for degraded calls — surface the partial usage
@@ -260,7 +310,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             analytics.track("transcribe_degraded", user=user, chat=chat, info=info,
                             result=partial,
                             latency_ms=int((time.monotonic() - t0) * 1000))
-            await status_message.edit_text(get_text(user_lang, "transcribe_degraded"))
+            await _safe_edit(status_message, get_text(user_lang, "transcribe_degraded"))
             return
 
         cache.store_transcription(info.file_unique_id, result.text, result.detected_language)
@@ -272,6 +322,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _send_transcription(
             update, user_lang, result.text, is_group, status_message=status_message
         )
+    except (TimedOut, NetworkError) as e:
+        # Transient: Telegram API slow/flaky (e.g. getFile timeout). The user
+        # likely sees nothing happen — show a generic error and move on.
+        # No traceback: the cause is on Telegram's side, not ours.
+        logger.warning(
+            "transcribe_telegram_transient class=%s msg=%s",
+            type(e).__name__, e,
+        )
+        analytics.track(
+            "error_unknown", user=user, chat=chat, info=info, result=result,
+            error_class=type(e).__name__,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+        await _safe_edit(status_message, get_text(user_lang, "error_generic"))
+    except Forbidden as e:
+        # User blocked the bot mid-flight. Can't reply at all; just record it.
+        logger.info("transcribe_forbidden msg=%s", e)
+        analytics.track(
+            "error_unknown", user=user, chat=chat, info=info, result=result,
+            error_class=type(e).__name__,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+    except BadRequest as e:
+        # Benign 'message gone' BadRequests get logged at INFO and analytics-tracked,
+        # but don't deserve a stack trace. Other BadRequests are real bugs.
+        if _is_message_gone(e):
+            logger.info("transcribe_status_message_gone msg=%s", e)
+        else:
+            logger.exception("transcribe_handler_error")
+        analytics.track(
+            "error_unknown", user=user, chat=chat, info=info, result=result,
+            error_class=type(e).__name__,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+        await _safe_edit(status_message, get_text(user_lang, "error_generic"))
     except Exception as e:
         logger.exception("transcribe_handler_error")
         # If we got past the transcribe() call before the failure, `result` is
@@ -282,10 +367,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             error_class=type(e).__name__,
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
-        try:
-            await status_message.edit_text(get_text(user_lang, "error_generic"))
-        except TelegramError:
-            pass
+        await _safe_edit(status_message, get_text(user_lang, "error_generic"))
     finally:
         if temp_path:
             try:

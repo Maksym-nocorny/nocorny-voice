@@ -271,3 +271,99 @@ async def test_rate_limited_error_shows_friendly_message(monkeypatch):
     final_text = status.edit_text.await_args_list[-1].args[0]
     assert "busy" in final_text.lower() or "wait" in final_text.lower()
     assert cache.get_transcription("uniq_a") is None
+
+
+# --------------------------------------------------------------------- Resilience: status message gone
+
+
+async def test_status_message_deleted_falls_back_to_reply(monkeypatch):
+    """If user deletes the status message before we can edit it with the
+    transcription, fall back to update.message.reply_text so they still see
+    the result. No ERROR-level log/traceback."""
+    from telegram.error import BadRequest
+
+    from handlers import transcribe as t
+
+    fake_result = GeminiResult(
+        text="recovered", prompt_tokens=1, candidates_tokens=1, total_tokens=2,
+    )
+    monkeypatch.setattr(gemini_service, "transcribe",
+                        AsyncMock(return_value=fake_result))
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    # Every edit on the status message fails — user deleted it.
+    status.edit_text = AsyncMock(side_effect=BadRequest("Message_id_invalid"))
+
+    await t.handle_message(update, context)
+
+    # Final transcription was sent via a fresh reply_text (status came from the
+    # FIRST reply_text call; the transcription is a subsequent one).
+    reply_calls = [c for c in update.message.reply_text.await_args_list
+                   if "recovered" in c.args[0]]
+    assert reply_calls, "transcription should be delivered via reply_text fallback"
+
+
+async def test_telegram_timeout_logs_warning_no_error(monkeypatch, caplog):
+    """getFile timeouts are transient; should be WARNING + friendly status,
+    not an unhandled exception with stack trace."""
+    import logging
+
+    from telegram.error import TimedOut
+
+    from handlers import transcribe as t
+
+    transcribe_spy = AsyncMock()
+    monkeypatch.setattr(gemini_service, "transcribe", transcribe_spy)
+    track_spy = MagicMock()
+    monkeypatch.setattr(t.analytics, "track", track_spy)
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    context.bot.get_file = AsyncMock(side_effect=TimedOut())
+
+    with caplog.at_level(logging.DEBUG, logger="handlers.transcribe"):
+        await t.handle_message(update, context)
+
+    transcribe_spy.assert_not_called()
+    # No ERROR-level log from this handler — only WARNING for transient.
+    transcribe_errors = [
+        r for r in caplog.records
+        if r.name == "handlers.transcribe" and r.levelno >= logging.ERROR
+    ]
+    assert not transcribe_errors, (
+        f"unexpected ERROR-level log: {[r.getMessage() for r in transcribe_errors]}"
+    )
+    # error_unknown is still tracked so the metric is honest.
+    tracked = [c.args[0] for c in track_spy.call_args_list]
+    assert "error_unknown" in tracked
+
+
+async def test_safe_edit_swallows_message_gone_badrequest():
+    """Unit-level: the helper returns False (not raise) on benign 'message gone'
+    BadRequests, regardless of the exact wording Telegram uses."""
+    from telegram.error import BadRequest
+
+    from handlers.transcribe import _safe_edit
+
+    for msg in (
+        "Message_id_invalid",
+        "Message to edit not found",
+        "Bad Request: message to be replied not found",
+        "Message can't be edited",
+    ):
+        m = MagicMock()
+        m.edit_text = AsyncMock(side_effect=BadRequest(msg))
+        result = await _safe_edit(m, "anything")
+        assert result is False, f"expected False for {msg!r}"
+
+
+async def test_safe_edit_propagates_other_badrequests():
+    """A BadRequest that ISN'T 'message gone' is a real bug and must not be
+    swallowed."""
+    from telegram.error import BadRequest
+
+    from handlers.transcribe import _safe_edit
+
+    m = MagicMock()
+    m.edit_text = AsyncMock(side_effect=BadRequest("Some other validation error"))
+    with pytest.raises(BadRequest):
+        await _safe_edit(m, "anything")

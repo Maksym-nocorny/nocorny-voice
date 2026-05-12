@@ -115,7 +115,13 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     if not query or not query.data:
         return
-    await query.answer()
+    # `query.answer()` can fail with BadRequest "Query is too old…" if the user
+    # tapped the button >15s after the message arrived. Benign — the click was
+    # late, but we can still try to edit the message.
+    try:
+        await query.answer()
+    except BadRequest as e:
+        logger.info("stats_query_answer_failed: %s", e)
 
     user = update.effective_user
     if ADMIN_USER_ID is None or not user or user.id != ADMIN_USER_ID:
