@@ -337,6 +337,76 @@ async def test_telegram_timeout_logs_warning_no_error(monkeypatch, caplog):
     assert "error_unknown" in tracked
 
 
+async def test_initial_status_reply_timeout_does_not_kill_transcription(monkeypatch, caplog):
+    """If the initial 'Downloading…' reply_text times out (Telegram slow on
+    that chat), we still proceed with transcription and deliver via final
+    reply_text. The transient is logged at WARNING, not ERROR."""
+    import logging
+
+    from telegram.error import TimedOut
+
+    from handlers import transcribe as t
+
+    fake_result = GeminiResult(
+        text="hello", prompt_tokens=1, candidates_tokens=1, total_tokens=2,
+    )
+    monkeypatch.setattr(gemini_service, "transcribe",
+                        AsyncMock(return_value=fake_result))
+
+    update, context, _, final_sent = _make_update_context(voice=_make_voice())
+    # First reply_text (status) times out; subsequent reply_text (final
+    # transcription) succeeds. side_effect must yield exception then a value.
+    update.message.reply_text = AsyncMock(side_effect=[TimedOut(), final_sent])
+
+    with caplog.at_level(logging.DEBUG, logger="handlers.transcribe"):
+        await t.handle_message(update, context)
+
+    # Transcription was delivered via the second reply_text call.
+    assert update.message.reply_text.await_count >= 2
+    delivered = update.message.reply_text.await_args_list[-1].args[0]
+    assert "hello" in delivered
+    # No ERROR-level log from the handler.
+    handler_errors = [
+        r for r in caplog.records
+        if r.name == "handlers.transcribe" and r.levelno >= logging.ERROR
+    ]
+    assert not handler_errors
+
+
+async def test_initial_status_reply_message_gone_aborts_with_analytics(monkeypatch, caplog):
+    """If the source voice was deleted before our initial status reply could
+    land, Telegram returns BadRequest 'message to be replied not found'. We
+    can't deliver anything — abort early but still track error_unknown."""
+    import logging
+
+    from telegram.error import BadRequest
+
+    from handlers import transcribe as t
+
+    transcribe_spy = AsyncMock()
+    monkeypatch.setattr(gemini_service, "transcribe", transcribe_spy)
+    track_spy = MagicMock()
+    monkeypatch.setattr(t.analytics, "track", track_spy)
+
+    update, context, _, _ = _make_update_context(voice=_make_voice())
+    update.message.reply_text = AsyncMock(
+        side_effect=BadRequest("Message to be replied not found")
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="handlers.transcribe"):
+        await t.handle_message(update, context)
+
+    transcribe_spy.assert_not_called()
+    # error_unknown was tracked for honest metrics.
+    tracked = [c.args[0] for c in track_spy.call_args_list]
+    assert "error_unknown" in tracked
+    handler_errors = [
+        r for r in caplog.records
+        if r.name == "handlers.transcribe" and r.levelno >= logging.ERROR
+    ]
+    assert not handler_errors
+
+
 async def test_safe_edit_swallows_message_gone_badrequest():
     """Unit-level: the helper returns False (not raise) on benign 'message gone'
     BadRequests, regardless of the exact wording Telegram uses."""

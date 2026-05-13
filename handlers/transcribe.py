@@ -235,8 +235,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Fresh request: download → L2 cache check → transcribe → respond
-    status_message = await update.message.reply_text(get_text(user_lang, "downloading"))
+    # Fresh request: download → L2 cache check → transcribe → respond.
+    # The initial status reply sits *outside* the main try/except: if it raises,
+    # we lose analytics + can't deliver anything. Treat its two benign failure
+    # modes (Telegram slow → TimedOut/NetworkError, source voice already deleted
+    # → BadRequest "message to be replied not found") as recoverable: status
+    # stays None and the rest of the flow proceeds; the final reply_text inside
+    # _send_transcription gets its own chance to land.
+    status_message: Optional[Message] = None
+    try:
+        status_message = await update.message.reply_text(get_text(user_lang, "downloading"))
+    except BadRequest as e:
+        # BadRequest must precede NetworkError (PTB makes BadRequest a
+        # NetworkError subclass).
+        if _is_message_gone(e):
+            logger.info("transcribe_initial_status_message_gone msg=%s", e)
+            analytics.track(
+                "error_unknown", user=user, chat=chat, info=info,
+                error_class=type(e).__name__,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+            return
+        raise
+    except (TimedOut, NetworkError) as e:
+        logger.warning(
+            "transcribe_initial_status_failed class=%s msg=%s",
+            type(e).__name__, e,
+        )
     temp_path: Optional[str] = None
     # Holds the GeminiResult once transcribe returns. Read by the catch-all
     # `except Exception` so cost is still recorded if the failure happens
@@ -322,6 +347,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _send_transcription(
             update, user_lang, result.text, is_group, status_message=status_message
         )
+    except BadRequest as e:
+        # NOTE: BadRequest must precede the (TimedOut, NetworkError) arm —
+        # in python-telegram-bot, BadRequest subclasses NetworkError, so a
+        # broader NetworkError catch would shadow this branch.
+        # Benign 'message gone' BadRequests get logged at INFO and analytics-tracked,
+        # but don't deserve a stack trace. Other BadRequests are real bugs.
+        if _is_message_gone(e):
+            logger.info("transcribe_status_message_gone msg=%s", e)
+        else:
+            logger.exception("transcribe_handler_error")
+        analytics.track(
+            "error_unknown", user=user, chat=chat, info=info, result=result,
+            error_class=type(e).__name__,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+        await _safe_edit(status_message, get_text(user_lang, "error_generic"))
     except (TimedOut, NetworkError) as e:
         # Transient: Telegram API slow/flaky (e.g. getFile timeout). The user
         # likely sees nothing happen — show a generic error and move on.
@@ -344,19 +385,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             error_class=type(e).__name__,
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
-    except BadRequest as e:
-        # Benign 'message gone' BadRequests get logged at INFO and analytics-tracked,
-        # but don't deserve a stack trace. Other BadRequests are real bugs.
-        if _is_message_gone(e):
-            logger.info("transcribe_status_message_gone msg=%s", e)
-        else:
-            logger.exception("transcribe_handler_error")
-        analytics.track(
-            "error_unknown", user=user, chat=chat, info=info, result=result,
-            error_class=type(e).__name__,
-            latency_ms=int((time.monotonic() - t0) * 1000),
-        )
-        await _safe_edit(status_message, get_text(user_lang, "error_generic"))
     except Exception as e:
         logger.exception("transcribe_handler_error")
         # If we got past the transcribe() call before the failure, `result` is
