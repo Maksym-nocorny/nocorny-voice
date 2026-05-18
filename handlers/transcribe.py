@@ -339,7 +339,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         cache.store_transcription(info.file_unique_id, result.text, result.detected_language)
-        await cache.store_by_hash(content_hash, result.text, result.detected_language)
+        cache.fire_and_forget_store_by_hash(
+            content_hash, result.text, result.detected_language
+        )
         analytics.track(
             "transcribe_success", user=user, chat=chat, info=info, result=result,
             latency_ms=int((time.monotonic() - t0) * 1000),

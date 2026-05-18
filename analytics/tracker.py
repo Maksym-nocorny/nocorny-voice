@@ -2,9 +2,14 @@
 
 Design contract:
 - track() never awaits, never raises. Drop on overflow.
-- Drainer batches up to ANALYTICS_BATCH_SIZE rows per round-trip.
-- Drainer also runs the daily retention sweep and a periodic SELECT 1 heartbeat
-  (so Neon's 5-min auto-suspend doesn't make the next /stats pay a cold start).
+- Drainer sleeps full ANALYTICS_FLUSH_INTERVAL_SEC between flushes
+  (buffer-and-flush), so the DB wakes once per interval rather than once per
+  event. Polls queue every minute inside that window to flush early on burst
+  (when queue >= half its capacity).
+- Drainer also runs the daily retention sweep (skips L2 sweep when L2 disabled).
+- Optional SELECT 1 heartbeat when ANALYTICS_HEARTBEAT_INTERVAL_SEC > 0
+  (disabled by default to save Neon compute hours; first /stats after idle pays
+  a ~1-2s cold start).
 """
 from __future__ import annotations
 
@@ -271,13 +276,21 @@ async def _maybe_retention(now_mono: float) -> None:
     try:
         async with p.acquire() as conn:
             deleted = await conn.execute(_RETENTION_SQL, _state.retention_days)
-            l2_deleted = await conn.execute(_L2_CACHE_RETENTION_SQL, _state.cache_l2_ttl_days)
+            if _state.cache_l2_ttl_days > 0:
+                l2_deleted = await conn.execute(
+                    _L2_CACHE_RETENTION_SQL, _state.cache_l2_ttl_days
+                )
+            else:
+                # Guard: ttl_days=0 would delete the entire table (WHERE ts < now()).
+                l2_deleted = "SKIPPED (L2 disabled)"
         logger.info("analytics_retention_cleanup events=%s l2_cache=%s", deleted, l2_deleted)
     except Exception:  # noqa: BLE001
         logger.warning("analytics_retention_failed", exc_info=True)
 
 
 async def _maybe_heartbeat(now_mono: float) -> None:
+    if _state.heartbeat_interval_sec <= 0:
+        return
     p = pool.get()
     if p is None:
         return
@@ -291,22 +304,35 @@ async def _maybe_heartbeat(now_mono: float) -> None:
         logger.warning("analytics_heartbeat_failed", exc_info=True)
 
 
+# Poll interval inside the flush window — lets us flush early on burst traffic
+# without waking the DB on every event.
+_DRAINER_POLL_SEC = 60.0
+
+
 async def _drainer_loop() -> None:
     queue = _state.queue
     assert queue is not None
     # Initialise timestamps so first iteration doesn't spam retention/heartbeat.
     _state.last_retention_ts = time.monotonic()
     _state.last_heartbeat_ts = time.monotonic()
+    half_full = max(1, _state.queue_size // 2)
+
     while True:
         try:
-            try:
-                first = await asyncio.wait_for(queue.get(), timeout=_state.flush_interval_sec)
-            except asyncio.TimeoutError:
-                first = None
+            # Sleep up to flush_interval_sec, polling every minute so we can
+            # flush early if the queue is half-full (protects against bursts
+            # and against losing too many events on a Render Free sleep cycle).
+            elapsed = 0.0
+            while elapsed < _state.flush_interval_sec:
+                step = min(_DRAINER_POLL_SEC, _state.flush_interval_sec - elapsed)
+                await asyncio.sleep(step)
+                elapsed += step
+                if queue.qsize() >= half_full:
+                    break
 
             now_mono = time.monotonic()
-            if first is not None:
-                batch = [first] + _drain_batch()
+            batch = _drain_batch()
+            if batch:
                 try:
                     await _flush(batch)
                 except Exception:  # noqa: BLE001 — silent fail per design
