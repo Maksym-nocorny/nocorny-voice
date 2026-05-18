@@ -67,8 +67,8 @@ def test_track_captures_group_chat_title():
     assert event.chat_id == -100123
     assert event.chat_type == "supergroup"
     assert event.chat_title == "Devs UA"
-    # The title is forwarded as the last positional arg ($20) for the chats upsert.
-    assert event.as_args()[-1] == "Devs UA"
+    # The title is forwarded as the $20 positional arg (index 19) for the chats upsert.
+    assert event.as_args()[19] == "Devs UA"
 
 
 def test_track_with_info_and_result_extracts_fields():

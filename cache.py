@@ -9,6 +9,7 @@ from get_by_hash() and silently swallow store_by_hash() — bot keeps working.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from typing import Optional
 from cachetools import TTLCache
 
 from analytics import pool as analytics_pool
-from config import CACHE_MAX_SIZE, CACHE_TTL_SEC
+from config import CACHE_L2_TTL_DAYS, CACHE_MAX_SIZE, CACHE_TTL_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,9 @@ SET last_hit_at = now(),
 
 
 async def get_by_hash(content_hash: str) -> Optional[CachedTranscription]:
-    """L2 lookup. Returns None on miss OR if Postgres unavailable."""
+    """L2 lookup. Returns None on miss, if Postgres unavailable, OR if L2 disabled."""
+    if CACHE_L2_TTL_DAYS <= 0:
+        return None
     p = analytics_pool.get()
     if p is None:
         return None
@@ -102,7 +105,9 @@ async def get_by_hash(content_hash: str) -> Optional[CachedTranscription]:
 async def store_by_hash(
     content_hash: str, text: str, detected_language: Optional[str] = None
 ) -> None:
-    """L2 store. Silently swallows errors — bot keeps working without L2."""
+    """L2 store. No-op if L2 disabled or Postgres unavailable; swallows errors."""
+    if CACHE_L2_TTL_DAYS <= 0:
+        return
     p = analytics_pool.get()
     if p is None:
         return
@@ -110,3 +115,19 @@ async def store_by_hash(
         await p.execute(_STORE_BY_HASH_SQL, content_hash, text, detected_language)
     except Exception:  # noqa: BLE001 — graceful degradation
         logger.warning("cache_l2_store_failed hash=%s", content_hash[:12], exc_info=True)
+
+
+_pending_l2_writes: set[asyncio.Task] = set()
+
+
+def fire_and_forget_store_by_hash(
+    content_hash: str, text: str, detected_language: Optional[str] = None
+) -> None:
+    """Schedule an L2 store without blocking the caller.
+
+    Holds a strong reference to the task so Python's GC doesn't drop it mid-flight
+    (asyncio.create_task alone is not enough — see Python asyncio docs).
+    """
+    task = asyncio.create_task(store_by_hash(content_hash, text, detected_language))
+    _pending_l2_writes.add(task)
+    task.add_done_callback(_pending_l2_writes.discard)
