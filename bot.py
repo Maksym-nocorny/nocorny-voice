@@ -87,9 +87,17 @@ def main() -> None:
         logger.error("TELEGRAM_BOT_TOKEN not set in environment")
         sys.exit(1)
 
+    # PTB's default read/connect timeouts (5s) are tight for Render Free —
+    # a single Telegram getFile/sendMessage during a network blip surfaces as
+    # TimedOut and the user sees an error reply. Bumping to 15s catches the
+    # transient slowness without changing happy-path latency.
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
+        .read_timeout(15)
+        .write_timeout(15)
+        .connect_timeout(15)
+        .pool_timeout(15)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
