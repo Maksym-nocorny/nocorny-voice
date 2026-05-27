@@ -30,6 +30,7 @@ from config import (
     TRANSCRIBE_MAX_OUT_FRACTION,
     TRANSCRIBE_MAX_OUT_PER_SEC,
     TRANSCRIBE_MAX_TOKENS,
+    TRANSCRIBE_RETRY_TEMPERATURE,
     TRANSCRIBE_TEMPERATURE,
 )
 
@@ -440,40 +441,32 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
     )
 
 
-async def _transcribe_one(
-    file_path: str,
-    mime_type: str,
+async def _attempt_transcribe(
+    model: genai.GenerativeModel,
+    gemini_file,
     duration_sec: Optional[int],
+    *,
+    temperature: Optional[float] = None,
 ) -> GeminiResult:
-    """Single Gemini call with ValueError catch + loop detection.
+    """One Gemini generate_content call + response sanity checks.
 
-    Raises TranscriptionDegradedError on response.text() failure or detected loops.
+    Raises TranscriptionDegradedError on detected loop or response.text failure
+    (the exception carries usage info so the caller can still bill the call).
+    `temperature` overrides the model's default per-call when not None — used
+    for the jittered retry after a RECITATION refusal or loop on the first try.
     """
-    gemini_file = await asyncio.to_thread(
-        genai.upload_file, path=file_path, mime_type=mime_type
-    )
-    try:
-        while gemini_file.state.name == "PROCESSING":
-            await asyncio.sleep(2)
-            gemini_file = await asyncio.to_thread(genai.get_file, gemini_file.name)
-        if gemini_file.state.name == "FAILED":
-            raise ProcessingFailedError("gemini reported FAILED state")
-
-        model = _get_transcribe_model()
-
-        async def _call():
-            return await asyncio.to_thread(
-                model.generate_content,
-                [gemini_file],
+    async def _call():
+        kwargs = {}
+        if temperature is not None:
+            kwargs["generation_config"] = genai.GenerationConfig(
+                temperature=temperature,
+                max_output_tokens=TRANSCRIBE_MAX_TOKENS,
             )
+        return await asyncio.to_thread(
+            model.generate_content, [gemini_file], **kwargs,
+        )
 
-        response = await _retry(_call)
-    finally:
-        try:
-            await asyncio.to_thread(genai.delete_file, gemini_file.name)
-        except Exception as e:  # noqa: BLE001 - cleanup best-effort
-            logger.warning("gemini_delete_file_failed name=%s exc=%s", gemini_file.name, e)
-
+    response = await _retry(_call)
     p, pa, c, t = _log_usage("transcribe", response, duration_sec)
 
     # Loop check BEFORE touching response.text — bad responses often raise
@@ -493,7 +486,6 @@ async def _transcribe_one(
     try:
         raw = (response.text or "").strip()
     except ValueError as e:
-        finish = _finish_reason(response)
         logger.warning(
             "transcribe_response_text_failed duration=%s finish=%s exc=%s",
             duration_sec, finish, e,
@@ -513,6 +505,47 @@ async def _transcribe_one(
         prompt_audio_tokens=pa,
         detected_language=detected_language,
     )
+
+
+async def _transcribe_one(
+    file_path: str,
+    mime_type: str,
+    duration_sec: Optional[int],
+) -> GeminiResult:
+    """Single Gemini call with one jittered-temperature semantic retry.
+
+    flash-lite at temp=0.0 deterministically reproduces RECITATION refusals
+    and runaway-token loops on the same audio. One retry at a small positive
+    temperature usually unblocks the false positives; if the second attempt
+    still fails, the original TranscriptionDegradedError bubbles up.
+    """
+    gemini_file = await asyncio.to_thread(
+        genai.upload_file, path=file_path, mime_type=mime_type
+    )
+    try:
+        while gemini_file.state.name == "PROCESSING":
+            await asyncio.sleep(2)
+            gemini_file = await asyncio.to_thread(genai.get_file, gemini_file.name)
+        if gemini_file.state.name == "FAILED":
+            raise ProcessingFailedError("gemini reported FAILED state")
+
+        model = _get_transcribe_model()
+        try:
+            return await _attempt_transcribe(model, gemini_file, duration_sec)
+        except TranscriptionDegradedError as e:
+            logger.info(
+                "transcribe_retry_jittered duration=%s temperature=%.2f first_attempt=%s",
+                duration_sec, TRANSCRIBE_RETRY_TEMPERATURE, e,
+            )
+            return await _attempt_transcribe(
+                model, gemini_file, duration_sec,
+                temperature=TRANSCRIBE_RETRY_TEMPERATURE,
+            )
+    finally:
+        try:
+            await asyncio.to_thread(genai.delete_file, gemini_file.name)
+        except Exception as e:  # noqa: BLE001 - cleanup best-effort
+            logger.warning("gemini_delete_file_failed name=%s exc=%s", gemini_file.name, e)
 
 
 def _finish_reason(response) -> str:

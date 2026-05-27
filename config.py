@@ -34,6 +34,11 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 TRANSCRIBE_MAX_TOKENS = _env_int("TRANSCRIBE_MAX_TOKENS", 8192)
 TRANSCRIBE_TEMPERATURE = _env_float("TRANSCRIBE_TEMPERATURE", 0.0)
+# Fallback temperature for a single semantic retry when the first attempt
+# tripped RECITATION (false-positive copyright refusal) or hit the loop
+# detector. At temp=0.0 flash-lite is deterministic — the same audio
+# reproduces the same refusal/loop — so a small jitter usually unblocks it.
+TRANSCRIBE_RETRY_TEMPERATURE = _env_float("TRANSCRIBE_RETRY_TEMPERATURE", 0.3)
 
 # --- Long-audio chunking (mitigates flash-lite hallucinations on long files) ---
 # Files longer than this are split into chunks of the same length via ffmpeg.
