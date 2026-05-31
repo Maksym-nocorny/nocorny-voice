@@ -83,17 +83,22 @@ class _MediaInfo:
     file_unique_id: str
     file_ext: str
     mime_type: str
-    duration: int
+    duration: Optional[int]
     file_size: Optional[int]
 
 
 def _extract_media_info(message: Message) -> Optional[_MediaInfo]:
+    # Telegram's `duration` field is formally required on voice/video_note but
+    # in practice forwarded or re-encoded video/video_note often arrives with
+    # duration=0. Preserve None so validation can distinguish "unknown" from
+    # "really zero seconds" — otherwise legit multi-MB files get rejected as
+    # too_short purely because metadata is missing.
     if message.voice:
         m = message.voice
-        return _MediaInfo(m.file_id, m.file_unique_id, ".ogg", "audio/ogg", m.duration or 0, m.file_size)
+        return _MediaInfo(m.file_id, m.file_unique_id, ".ogg", "audio/ogg", m.duration or None, m.file_size)
     if message.video_note:
         m = message.video_note
-        return _MediaInfo(m.file_id, m.file_unique_id, ".mp4", "video/mp4", m.duration or 0, m.file_size)
+        return _MediaInfo(m.file_id, m.file_unique_id, ".mp4", "video/mp4", m.duration or None, m.file_size)
     if message.audio:
         m = message.audio
         return _MediaInfo(
@@ -101,7 +106,7 @@ def _extract_media_info(message: Message) -> Optional[_MediaInfo]:
             m.file_unique_id,
             ".mp3",
             m.mime_type or "audio/mpeg",
-            m.duration or 0,
+            m.duration or None,
             m.file_size,
         )
     if message.video:
@@ -111,7 +116,7 @@ def _extract_media_info(message: Message) -> Optional[_MediaInfo]:
             m.file_unique_id,
             ".mp4",
             m.mime_type or "video/mp4",
-            m.duration or 0,
+            m.duration or None,
             m.file_size,
         )
     return None
@@ -317,7 +322,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             latency_ms=int((time.monotonic() - t0) * 1000))
             await _safe_edit(status_message, get_text(user_lang, "rate_limit_error"))
             return
-        except gemini_service.ProcessingFailedError:
+        except gemini_service.ProcessingFailedError as e:
+            # Gemini rejected the upload itself (FAILED state). The DB row alone
+            # doesn't carry enough to diagnose recurrences — log the file shape
+            # so we can spot patterns (codec, size, duration) next time.
+            logger.warning(
+                "transcribe_gemini_failed mime=%s duration=%s size=%s exc=%s",
+                info.mime_type, info.duration, info.file_size, e,
+            )
             analytics.track("processing_failed", user=user, chat=chat, info=info,
                             latency_ms=int((time.monotonic() - t0) * 1000))
             await _safe_edit(status_message, get_text(user_lang, "processing_failed"))
