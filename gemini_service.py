@@ -440,6 +440,11 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
     )
 
 
+def _read_file_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 async def _transcribe_one(
     file_path: str,
     mime_type: str,
@@ -447,32 +452,27 @@ async def _transcribe_one(
 ) -> GeminiResult:
     """Single Gemini call with ValueError catch + loop detection.
 
+    Sends audio inline (base64 blob in the generate_content payload) rather
+    than via the Files API. Gemini's Files API endpoint started returning
+    "User location is not supported" 400s from Render's EU IPs on
+    2026-05-29 — generateContent itself is unaffected, so the inline path
+    sidesteps the geo-block entirely. Telegram caps downloads at 20 MB and
+    chunks land well under that, comfortably inside the inline limit.
+
     Raises TranscriptionDegradedError on response.text() failure or detected loops.
     """
-    gemini_file = await asyncio.to_thread(
-        genai.upload_file, path=file_path, mime_type=mime_type
-    )
-    try:
-        while gemini_file.state.name == "PROCESSING":
-            await asyncio.sleep(2)
-            gemini_file = await asyncio.to_thread(genai.get_file, gemini_file.name)
-        if gemini_file.state.name == "FAILED":
-            raise ProcessingFailedError("gemini reported FAILED state")
+    audio_bytes = await asyncio.to_thread(_read_file_bytes, file_path)
+    audio_part = {"mime_type": mime_type, "data": audio_bytes}
 
-        model = _get_transcribe_model()
+    model = _get_transcribe_model()
 
-        async def _call():
-            return await asyncio.to_thread(
-                model.generate_content,
-                [gemini_file],
-            )
+    async def _call():
+        return await asyncio.to_thread(
+            model.generate_content,
+            [audio_part],
+        )
 
-        response = await _retry(_call)
-    finally:
-        try:
-            await asyncio.to_thread(genai.delete_file, gemini_file.name)
-        except Exception as e:  # noqa: BLE001 - cleanup best-effort
-            logger.warning("gemini_delete_file_failed name=%s exc=%s", gemini_file.name, e)
+    response = await _retry(_call)
 
     p, pa, c, t = _log_usage("transcribe", response, duration_sec)
 
