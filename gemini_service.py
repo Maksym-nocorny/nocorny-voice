@@ -443,7 +443,7 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
 
 async def _attempt_transcribe(
     model: genai.GenerativeModel,
-    gemini_file,
+    audio_part,
     duration_sec: Optional[int],
     *,
     temperature: Optional[float] = None,
@@ -463,7 +463,7 @@ async def _attempt_transcribe(
                 max_output_tokens=TRANSCRIBE_MAX_TOKENS,
             )
         return await asyncio.to_thread(
-            model.generate_content, [gemini_file], **kwargs,
+            model.generate_content, [audio_part], **kwargs,
         )
 
     response = await _retry(_call)
@@ -507,6 +507,11 @@ async def _attempt_transcribe(
     )
 
 
+def _read_file_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 async def _transcribe_one(
     file_path: str,
     mime_type: str,
@@ -514,38 +519,33 @@ async def _transcribe_one(
 ) -> GeminiResult:
     """Single Gemini call with one jittered-temperature semantic retry.
 
+    Sends audio inline (base64 blob in the generate_content payload) rather
+    than via the Files API. Gemini's Files API endpoint started returning
+    "User location is not supported" 400s from Render's EU IPs on
+    2026-05-29 — generateContent itself is unaffected, so the inline path
+    sidesteps the geo-block entirely. Telegram caps downloads at 20 MB and
+    chunks land well under that, comfortably inside the inline limit.
+
     flash-lite at temp=0.0 deterministically reproduces RECITATION refusals
     and runaway-token loops on the same audio. One retry at a small positive
     temperature usually unblocks the false positives; if the second attempt
     still fails, the original TranscriptionDegradedError bubbles up.
     """
-    gemini_file = await asyncio.to_thread(
-        genai.upload_file, path=file_path, mime_type=mime_type
-    )
-    try:
-        while gemini_file.state.name == "PROCESSING":
-            await asyncio.sleep(2)
-            gemini_file = await asyncio.to_thread(genai.get_file, gemini_file.name)
-        if gemini_file.state.name == "FAILED":
-            raise ProcessingFailedError("gemini reported FAILED state")
+    audio_bytes = await asyncio.to_thread(_read_file_bytes, file_path)
+    audio_part = {"mime_type": mime_type, "data": audio_bytes}
 
-        model = _get_transcribe_model()
-        try:
-            return await _attempt_transcribe(model, gemini_file, duration_sec)
-        except TranscriptionDegradedError as e:
-            logger.info(
-                "transcribe_retry_jittered duration=%s temperature=%.2f first_attempt=%s",
-                duration_sec, TRANSCRIBE_RETRY_TEMPERATURE, e,
-            )
-            return await _attempt_transcribe(
-                model, gemini_file, duration_sec,
-                temperature=TRANSCRIBE_RETRY_TEMPERATURE,
-            )
-    finally:
-        try:
-            await asyncio.to_thread(genai.delete_file, gemini_file.name)
-        except Exception as e:  # noqa: BLE001 - cleanup best-effort
-            logger.warning("gemini_delete_file_failed name=%s exc=%s", gemini_file.name, e)
+    model = _get_transcribe_model()
+    try:
+        return await _attempt_transcribe(model, audio_part, duration_sec)
+    except TranscriptionDegradedError as e:
+        logger.info(
+            "transcribe_retry_jittered duration=%s temperature=%.2f first_attempt=%s",
+            duration_sec, TRANSCRIBE_RETRY_TEMPERATURE, e,
+        )
+        return await _attempt_transcribe(
+            model, audio_part, duration_sec,
+            temperature=TRANSCRIBE_RETRY_TEMPERATURE,
+        )
 
 
 def _finish_reason(response) -> str:
