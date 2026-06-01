@@ -17,4 +17,4 @@ jobs:
         run: |
           curl -sS --max-time 60 -o /dev/null \
             -w "HTTP %{http_code} in %{time_total}s\n" \
-            https://nocorny-voice.onrender.com/ || true
+            https://nocorny-voice-oregon.onrender.com/ || true
