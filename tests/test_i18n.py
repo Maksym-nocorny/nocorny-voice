@@ -25,9 +25,9 @@ def test_format_in_other_language():
     assert "хвилин" in out
 
 
-def test_html_label_format():
+def test_transcription_label_has_no_prefix():
     out = get_text("en", "transcription_label", "hello")
-    assert out == "<b>Transcription:</b>\n\nhello"
+    assert out == "hello"
 
 
 def test_all_languages_have_required_keys():
