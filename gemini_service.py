@@ -30,6 +30,7 @@ from config import (
     TRANSCRIBE_MAX_OUT_FRACTION,
     TRANSCRIBE_MAX_OUT_PER_SEC,
     TRANSCRIBE_MAX_TOKENS,
+    TRANSCRIBE_RETRY_FINAL_TEMPERATURE,
     TRANSCRIBE_RETRY_TEMPERATURE,
     TRANSCRIBE_TEMPERATURE,
 )
@@ -517,7 +518,7 @@ async def _transcribe_one(
     mime_type: str,
     duration_sec: Optional[int],
 ) -> GeminiResult:
-    """Single Gemini call with one jittered-temperature semantic retry.
+    """Single Gemini call with up to two semantic retries at rising temperatures.
 
     Sends audio inline (base64 blob in the generate_content payload) rather
     than via the Files API. Gemini's Files API endpoint started returning
@@ -527,9 +528,11 @@ async def _transcribe_one(
     chunks land well under that, comfortably inside the inline limit.
 
     flash-lite at temp=0.0 deterministically reproduces RECITATION refusals
-    and runaway-token loops on the same audio. One retry at a small positive
-    temperature usually unblocks the false positives; if the second attempt
-    still fails, the original TranscriptionDegradedError bubbles up.
+    and runaway-token loops on the same audio. A small positive temperature
+    usually unblocks the false positives; for stubborn cases where even the
+    jittered retry loops (some noisy/short clips do this reliably), a final
+    attempt at a high temperature widens the next-token distribution enough
+    to break out. Only after all three degrade does the error bubble up.
     """
     audio_bytes = await asyncio.to_thread(_read_file_bytes, file_path)
     audio_part = {"mime_type": mime_type, "data": audio_bytes}
@@ -537,15 +540,25 @@ async def _transcribe_one(
     model = _get_transcribe_model()
     try:
         return await _attempt_transcribe(model, audio_part, duration_sec)
-    except TranscriptionDegradedError as e:
+    except TranscriptionDegradedError as e1:
         logger.info(
             "transcribe_retry_jittered duration=%s temperature=%.2f first_attempt=%s",
-            duration_sec, TRANSCRIBE_RETRY_TEMPERATURE, e,
+            duration_sec, TRANSCRIBE_RETRY_TEMPERATURE, e1,
         )
-        return await _attempt_transcribe(
-            model, audio_part, duration_sec,
-            temperature=TRANSCRIBE_RETRY_TEMPERATURE,
-        )
+        try:
+            return await _attempt_transcribe(
+                model, audio_part, duration_sec,
+                temperature=TRANSCRIBE_RETRY_TEMPERATURE,
+            )
+        except TranscriptionDegradedError as e2:
+            logger.info(
+                "transcribe_retry_final duration=%s temperature=%.2f second_attempt=%s",
+                duration_sec, TRANSCRIBE_RETRY_FINAL_TEMPERATURE, e2,
+            )
+            return await _attempt_transcribe(
+                model, audio_part, duration_sec,
+                temperature=TRANSCRIBE_RETRY_FINAL_TEMPERATURE,
+            )
 
 
 def _finish_reason(response) -> str:

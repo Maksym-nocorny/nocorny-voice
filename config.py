@@ -39,6 +39,11 @@ TRANSCRIBE_TEMPERATURE = _env_float("TRANSCRIBE_TEMPERATURE", 0.0)
 # detector. At temp=0.0 flash-lite is deterministic — the same audio
 # reproduces the same refusal/loop — so a small jitter usually unblocks it.
 TRANSCRIBE_RETRY_TEMPERATURE = _env_float("TRANSCRIBE_RETRY_TEMPERATURE", 0.3)
+# Last-ditch retry temperature when both the deterministic attempt and the
+# small-jitter attempt still degrade. A high T widens the next-token
+# distribution enough to break stubborn pathological loops (seen on some
+# noisy/short voice clips where flash-lite repeats at T=0.0 and T=0.3 alike).
+TRANSCRIBE_RETRY_FINAL_TEMPERATURE = _env_float("TRANSCRIBE_RETRY_FINAL_TEMPERATURE", 1.0)
 
 # --- Long-audio chunking (mitigates flash-lite hallucinations on long files) ---
 # Files longer than this are split into chunks of the same length via ffmpeg.
