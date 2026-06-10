@@ -20,6 +20,7 @@ import analytics
 from config import (
     DATABASE_URL,
     GEMINI_API_KEY,
+    KEEP_ALIVE_INTERVAL_SEC,
     PORT,
     TELEGRAM_BOT_TOKEN,
     WEBHOOK_URL,
@@ -27,6 +28,7 @@ from config import (
 from handlers.start import start
 from handlers.stats import stats_callback, stats_command
 from handlers.transcribe import handle_message
+from utils import keep_alive
 from utils.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -34,9 +36,13 @@ logger = logging.getLogger(__name__)
 
 async def _post_init(app: Application) -> None:
     await analytics.init(DATABASE_URL)
+    # Only meaningful in webhook mode (Render); local polling needs no anti-sleep.
+    if PORT and WEBHOOK_URL:
+        keep_alive.start(WEBHOOK_URL, interval_sec=KEEP_ALIVE_INTERVAL_SEC)
 
 
 async def _post_shutdown(app: Application) -> None:
+    await keep_alive.stop()
     await analytics.close()
 
 

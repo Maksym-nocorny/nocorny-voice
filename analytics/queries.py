@@ -135,6 +135,7 @@ class PerfSection:
     errors_by_class: list[CountedRow]
     rate_limited_24h: int
     rejected_24h: list[CountedRow]
+    degraded_by_reason: list[CountedRow] = field(default_factory=list)
 
 
 @dataclass
@@ -431,7 +432,7 @@ async def get_perf_section() -> Optional[PerfSection]:
     p = pool.get()
     if p is None:
         return None
-    h24, h7d, errors_by_class, rejected_24h = await asyncio.gather(
+    h24, h7d, errors_by_class, rejected_24h, degraded_by_reason = await asyncio.gather(
         p.fetchrow(_PERF_24H_SQL),
         p.fetchrow(_PERF_7D_CACHE_SQL),
         _grouped(p,
@@ -444,6 +445,11 @@ async def get_perf_section() -> Optional[PerfSection]:
             "FROM nocorny_voice.events "
             "WHERE event_type LIKE 'media_rejected_%' AND ts >= now() - interval '24 hours' "
             "GROUP BY 1 ORDER BY c DESC"),
+        _grouped(p,
+            "SELECT COALESCE(error_class,'unknown') AS k, count(*)::bigint AS c "
+            "FROM nocorny_voice.events "
+            "WHERE event_type='transcribe_degraded' AND ts >= now() - interval '7 days' "
+            "GROUP BY 1 ORDER BY c DESC LIMIT 10"),
     )
     return PerfSection(
         cache_hit_rate_24h=float(h24["cache_24h"]),
@@ -455,6 +461,7 @@ async def get_perf_section() -> Optional[PerfSection]:
         errors_by_class=errors_by_class,
         rate_limited_24h=int(h24["rate_limited"]),
         rejected_24h=rejected_24h,
+        degraded_by_reason=degraded_by_reason,
     )
 
 

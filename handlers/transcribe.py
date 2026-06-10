@@ -346,6 +346,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             analytics.track("transcribe_degraded", user=user, chat=chat, info=info,
                             result=partial,
+                            error_class=getattr(e, "finish_reason", None),
                             latency_ms=int((time.monotonic() - t0) * 1000))
             await _safe_edit(status_message, get_text(user_lang, "transcribe_degraded"))
             return

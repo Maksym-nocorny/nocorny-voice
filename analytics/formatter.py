@@ -284,6 +284,7 @@ def render_perf(s: Optional[PerfSection]) -> str:
         f"  • Rate: {_fmt_pct(s.error_rate_24h)}\n"
         f"  • Rate-limited (per-user): {_fmt_int(s.rate_limited_24h)}\n\n"
         f"<b>Errors by class (7d)</b>\n{_fmt_grouped(s.errors_by_class)}\n\n"
+        f"<b>Degraded by reason (7d)</b>\n{_fmt_grouped(s.degraded_by_reason)}\n\n"
         f"<b>Rejected files (24h)</b>\n{_fmt_grouped(s.rejected_24h)}"
     )
 

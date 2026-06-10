@@ -74,18 +74,22 @@ class TranscriptionDegradedError(Exception):
 
     Carries partial usage info — Gemini still bills for the call even when
     the response was unusable, so we surface tokens to the handler so cost
-    accounting matches the API bill.
+    accounting matches the API bill. `finish_reason` (RECITATION /
+    PROHIBITED_CONTENT / MAX_TOKENS / …) is recorded in analytics so /stats
+    can break down WHY transcriptions degraded.
     """
 
     def __init__(self, msg: str, *, prompt_tokens: int = 0,
                  prompt_audio_tokens: int = 0,
                  candidates_tokens: int = 0,
-                 total_tokens: int = 0):
+                 total_tokens: int = 0,
+                 finish_reason: Optional[str] = None):
         super().__init__(msg)
         self.prompt_tokens = prompt_tokens
         self.prompt_audio_tokens = prompt_audio_tokens
         self.candidates_tokens = candidates_tokens
         self.total_tokens = total_tokens
+        self.finish_reason = finish_reason
 
 
 @dataclass
@@ -426,6 +430,7 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
             f"all {len(results)} chunks degraded (duration={duration_sec}s)",
             prompt_tokens=p_total, prompt_audio_tokens=pa_total,
             candidates_tokens=c_total, total_tokens=t_total,
+            finish_reason="all_chunks_degraded",
         )
 
     logger.info(
@@ -482,6 +487,7 @@ async def _attempt_transcribe(
             f"loop detected: out={c} duration={duration_sec} finish={finish}",
             prompt_tokens=p, prompt_audio_tokens=pa,
             candidates_tokens=c, total_tokens=t,
+            finish_reason=finish,
         )
 
     try:
@@ -495,6 +501,7 @@ async def _attempt_transcribe(
             f"response.text raised: finish={finish}",
             prompt_tokens=p, prompt_audio_tokens=pa,
             candidates_tokens=c, total_tokens=t,
+            finish_reason=finish,
         ) from None
 
     text, detected_language = _split_language_prefix(raw)
@@ -533,27 +540,42 @@ async def _transcribe_one(
     jittered retry loops (some noisy/short clips do this reliably), a final
     attempt at a high temperature widens the next-token distribution enough
     to break out. Only after all three degrade does the error bubble up.
+
+    A transient Gemini 5xx (`InternalServerError`, `ServiceUnavailable`,
+    `DeadlineExceeded`) on any single attempt is treated the same as our
+    internal degraded signal — push the next attempt at a different
+    temperature rather than surfacing a generic error to the user. `_retry`
+    already short-cycles `ServiceUnavailable` within one attempt; this outer
+    catch covers the case where it (or an `InternalServerError`) escapes
+    after exhausting that inner budget.
     """
     audio_bytes = await asyncio.to_thread(_read_file_bytes, file_path)
     audio_part = {"mime_type": mime_type, "data": audio_bytes}
 
+    retryable = (
+        TranscriptionDegradedError,
+        exceptions.InternalServerError,
+        exceptions.ServiceUnavailable,
+        exceptions.DeadlineExceeded,
+    )
+
     model = _get_transcribe_model()
     try:
         return await _attempt_transcribe(model, audio_part, duration_sec)
-    except TranscriptionDegradedError as e1:
+    except retryable as e1:
         logger.info(
             "transcribe_retry_jittered duration=%s temperature=%.2f first_attempt=%s",
-            duration_sec, TRANSCRIBE_RETRY_TEMPERATURE, e1,
+            duration_sec, TRANSCRIBE_RETRY_TEMPERATURE, type(e1).__name__,
         )
         try:
             return await _attempt_transcribe(
                 model, audio_part, duration_sec,
                 temperature=TRANSCRIBE_RETRY_TEMPERATURE,
             )
-        except TranscriptionDegradedError as e2:
+        except retryable as e2:
             logger.info(
                 "transcribe_retry_final duration=%s temperature=%.2f second_attempt=%s",
-                duration_sec, TRANSCRIBE_RETRY_FINAL_TEMPERATURE, e2,
+                duration_sec, TRANSCRIBE_RETRY_FINAL_TEMPERATURE, type(e2).__name__,
             )
             return await _attempt_transcribe(
                 model, audio_part, duration_sec,

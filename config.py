@@ -89,6 +89,14 @@ CACHE_L2_TTL_DAYS = _env_int("CACHE_L2_TTL_DAYS", 14)        # L2, Neon Postgres
 # --- Telegram ---
 TELEGRAM_MAX_MESSAGE_LEN = _env_int("TELEGRAM_MAX_MESSAGE_LEN", 4000)
 
+# --- Keep-alive (Render Free anti-sleep) ---
+# Render Free spins the web service down after ~15 min idle; the cold start
+# (~25-40s) outlives Telegram's ~15s callback TTL and makes /stats buttons return
+# "Query is too old". Self-ping the public URL to stay warm. 300s leaves a wide
+# margin under the 15-min timeout even if a ping or two is dropped. This pings the
+# bot's OWN URL only — never the DB, so it costs zero Neon compute hours.
+KEEP_ALIVE_INTERVAL_SEC = _env_float("KEEP_ALIVE_INTERVAL_SEC", 300.0)
+
 # --- Analytics (Neon Postgres) ---
 # Set DATABASE_URL to enable analytics. Bot runs fine without it (track() becomes a no-op).
 DATABASE_URL = os.getenv("DATABASE_URL") or None
