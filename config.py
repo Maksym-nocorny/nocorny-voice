@@ -82,7 +82,10 @@ RATE_LIMIT_REQUESTS = _env_int("RATE_LIMIT_REQUESTS", 5)
 RATE_LIMIT_WINDOW_SEC = _env_int("RATE_LIMIT_WINDOW_SEC", 60)
 
 # --- Cache ---
-CACHE_MAX_SIZE = _env_int("CACHE_MAX_SIZE", 1000)
+# L1 lives in-process; on Render Free (512Mi) a large L1 adds to the RSS that
+# OOM-killed the service on 2026-06-13. Keep it small — L2 (Neon Postgres) backs
+# every miss, so a tight cap costs an extra DB lookup, not a Gemini call.
+CACHE_MAX_SIZE = _env_int("CACHE_MAX_SIZE", 200)
 CACHE_TTL_SEC = _env_int("CACHE_TTL_SEC", 86400)             # 24h (L1, in-memory)
 CACHE_L2_TTL_DAYS = _env_int("CACHE_L2_TTL_DAYS", 14)        # L2, Neon Postgres
 
