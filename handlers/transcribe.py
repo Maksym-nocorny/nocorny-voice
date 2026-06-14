@@ -14,6 +14,7 @@ from telegram.error import (
     BadRequest,
     Forbidden,
     NetworkError,
+    RetryAfter,
     TelegramError,
     TimedOut,
 )
@@ -55,11 +56,19 @@ def _is_message_gone(exc: BadRequest) -> bool:
     return any(m in s for m in _MSG_GONE_MARKERS)
 
 
+# Cap RetryAfter sleeps so a slow status update never holds a request hostage.
+# Telegram's flood-control waits for editMessageText in practice top out at
+# 5-6s; longer waits mean give up on the status message and let the rest of
+# the flow proceed.
+_RETRY_AFTER_MAX_SLEEP_SEC = 6.0
+
+
 async def _safe_edit(message: Optional[Message], text: str, **kwargs) -> bool:
     """Edit a status message; swallow benign 'message gone' / 'bot blocked' errors.
 
     Returns True on success, False if the edit was skipped because the user
-    deleted the status message or blocked the bot. Other TelegramErrors
+    deleted the status message or blocked the bot, or because Telegram is
+    rate-limiting us and the suggested wait is too long. Other TelegramErrors
     propagate so the caller can decide.
     """
     if message is None:
@@ -75,6 +84,29 @@ async def _safe_edit(message: Optional[Message], text: str, **kwargs) -> bool:
     except Forbidden as e:
         logger.info("status_message_forbidden reason=%s", e)
         return False
+    except RetryAfter as e:
+        # Telegram flood-control: bot edited too many messages too fast (e.g.
+        # the previous request just sent a chunked reply). Sleep the suggested
+        # interval (capped) and try once more — if it still 429s, drop the
+        # edit so the rest of the request can proceed.
+        wait = min(float(getattr(e, "retry_after", 0) or 0), _RETRY_AFTER_MAX_SLEEP_SEC)
+        if wait <= 0:
+            logger.info("status_message_retry_after wait=0 dropping")
+            return False
+        logger.info("status_message_retry_after wait=%.1fs", wait)
+        await asyncio.sleep(wait)
+        try:
+            await message.edit_text(text, **kwargs)
+            return True
+        except RetryAfter as e2:
+            logger.info("status_message_retry_after_persistent retry_after=%s", getattr(e2, "retry_after", None))
+            return False
+        except BadRequest as e2:
+            if _is_message_gone(e2):
+                return False
+            raise
+        except Forbidden:
+            return False
 
 
 @dataclass
@@ -262,7 +294,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
         raise
-    except (TimedOut, NetworkError) as e:
+    except (TimedOut, NetworkError, RetryAfter) as e:
         logger.warning(
             "transcribe_initial_status_failed class=%s msg=%s",
             type(e).__name__, e,
@@ -378,10 +410,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
         await _safe_edit(status_message, get_text(user_lang, "error_generic"))
-    except (TimedOut, NetworkError) as e:
-        # Transient: Telegram API slow/flaky (e.g. getFile timeout). The user
-        # likely sees nothing happen — show a generic error and move on.
-        # No traceback: the cause is on Telegram's side, not ours.
+    except (TimedOut, NetworkError, RetryAfter) as e:
+        # Transient: Telegram API slow/flaky (e.g. getFile timeout) or
+        # flood-control 429 on editMessageText when the previous reply just
+        # sent a chunked transcription. The user likely sees nothing happen —
+        # show a generic error and move on. No traceback: the cause is on
+        # Telegram's side. _safe_edit now swallows RetryAfter internally
+        # (sleep+retry, then drop), so the recovery edit can't re-raise.
         logger.warning(
             "transcribe_telegram_transient class=%s msg=%s",
             type(e).__name__, e,

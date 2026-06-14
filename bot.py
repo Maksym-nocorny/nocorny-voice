@@ -5,7 +5,7 @@ import logging
 import sys
 
 from telegram import Update
-from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -73,7 +73,7 @@ async def _global_error_handler(update: object,
             return
         logger.warning("unhandled_badrequest msg=%s", err)
         return
-    if isinstance(err, (TimedOut, NetworkError)):
+    if isinstance(err, (TimedOut, NetworkError, RetryAfter)):
         logger.warning("unhandled_telegram_transient class=%s msg=%s",
                        type(err).__name__, err)
         return

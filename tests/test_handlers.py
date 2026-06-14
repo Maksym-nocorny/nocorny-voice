@@ -407,6 +407,81 @@ async def test_initial_status_reply_message_gone_aborts_with_analytics(monkeypat
     assert not handler_errors
 
 
+async def test_safe_edit_swallows_retry_after_after_one_retry(monkeypatch):
+    """Telegram flood-control on editMessageText must NOT bubble up — sleep
+    the suggested interval (capped) and retry once. If the second try also
+    429s, return False without raising. Production scenario: user sends a
+    second voice message right after a long chunked reply finished."""
+    from telegram.error import RetryAfter
+
+    from handlers.transcribe import _safe_edit
+
+    slept: list[float] = []
+
+    async def _fake_sleep(s):
+        slept.append(s)
+
+    monkeypatch.setattr("handlers.transcribe.asyncio.sleep", _fake_sleep)
+
+    # First call 429s, second succeeds.
+    m = MagicMock()
+    m.edit_text = AsyncMock(side_effect=[RetryAfter(5), None])
+    result = await _safe_edit(m, "transcribing")
+    assert result is True
+    assert slept == [5.0]
+    assert m.edit_text.await_count == 2
+
+    # Persistent 429 — second call also raises — return False, no raise.
+    m2 = MagicMock()
+    m2.edit_text = AsyncMock(side_effect=[RetryAfter(3), RetryAfter(3)])
+    result2 = await _safe_edit(m2, "error_generic")
+    assert result2 is False
+
+
+async def test_handler_swallows_persistent_retry_after_on_status_edits(monkeypatch, caplog):
+    """Production bug repro: every editMessageText hits flood-control 429.
+    Before the fix, the RetryAfter propagated out of the first `_safe_edit`,
+    hit the catch-all `except Exception`, and the recovery `_safe_edit` ALSO
+    raised RetryAfter — surfacing as `unhandled_application_error` in the
+    global handler. After the fix: `_safe_edit` swallows RetryAfter, the
+    flow continues, transcription is delivered via `reply_text` fallback,
+    NO ERROR-level log appears."""
+    import logging
+
+    from telegram.error import RetryAfter
+
+    from handlers import transcribe as t
+
+    fake_result = GeminiResult(
+        text="delivered", prompt_tokens=1, candidates_tokens=1, total_tokens=2,
+    )
+    monkeypatch.setattr(gemini_service, "transcribe",
+                        AsyncMock(return_value=fake_result))
+    # Don't actually sleep through retry-after waits.
+    monkeypatch.setattr("handlers.transcribe.asyncio.sleep", AsyncMock())
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    # Every status edit hits flood-control. _safe_edit's internal retry
+    # exhausts and returns False — the request must not raise.
+    status.edit_text = AsyncMock(side_effect=RetryAfter(5))
+
+    with caplog.at_level(logging.DEBUG, logger="handlers.transcribe"):
+        await t.handle_message(update, context)
+
+    handler_errors = [
+        r for r in caplog.records
+        if r.name == "handlers.transcribe" and r.levelno >= logging.ERROR
+    ]
+    assert not handler_errors, (
+        f"unexpected ERROR-level log: {[r.getMessage() for r in handler_errors]}"
+    )
+    # Transcription still reaches the user via the reply_text fallback
+    # (since status.edit_text never lands).
+    reply_calls = [c for c in update.message.reply_text.await_args_list
+                   if "delivered" in c.args[0]]
+    assert reply_calls, "transcription should be delivered via reply_text fallback"
+
+
 async def test_safe_edit_swallows_message_gone_badrequest():
     """Unit-level: the helper returns False (not raise) on benign 'message gone'
     BadRequests, regardless of the exact wording Telegram uses."""
