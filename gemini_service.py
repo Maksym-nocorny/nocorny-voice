@@ -559,6 +559,18 @@ async def _transcribe_one(
         exceptions.DeadlineExceeded,
     )
 
+    # Transient Gemini server-side errors (NOT TranscriptionDegradedError, which
+    # is a content/model issue). After the final-temperature attempt, one more
+    # call at the same temperature lets the API recover from a flake without
+    # surfacing a generic error to the user. Capped at +1 call, so worst-case
+    # cost per request is 4 billed attempts instead of 3 — only on the narrow
+    # path where 3 prior tries already failed.
+    transient_5xx = (
+        exceptions.InternalServerError,
+        exceptions.ServiceUnavailable,
+        exceptions.DeadlineExceeded,
+    )
+
     model = _get_transcribe_model()
     try:
         return await _attempt_transcribe(model, audio_part, duration_sec)
@@ -577,10 +589,20 @@ async def _transcribe_one(
                 "transcribe_retry_final duration=%s temperature=%.2f second_attempt=%s",
                 duration_sec, TRANSCRIBE_RETRY_FINAL_TEMPERATURE, type(e2).__name__,
             )
-            return await _attempt_transcribe(
-                model, audio_part, duration_sec,
-                temperature=TRANSCRIBE_RETRY_FINAL_TEMPERATURE,
-            )
+            try:
+                return await _attempt_transcribe(
+                    model, audio_part, duration_sec,
+                    temperature=TRANSCRIBE_RETRY_FINAL_TEMPERATURE,
+                )
+            except transient_5xx as e3:
+                logger.info(
+                    "transcribe_retry_after_5xx duration=%s temperature=%.2f exc=%s",
+                    duration_sec, TRANSCRIBE_RETRY_FINAL_TEMPERATURE, type(e3).__name__,
+                )
+                return await _attempt_transcribe(
+                    model, audio_part, duration_sec,
+                    temperature=TRANSCRIBE_RETRY_FINAL_TEMPERATURE,
+                )
 
 
 def _finish_reason(response) -> str:

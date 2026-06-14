@@ -1,7 +1,17 @@
 """Tests for pure helpers in gemini_service (no Gemini API calls)."""
 from __future__ import annotations
 
-from gemini_service import _is_likely_loop, _split_language_prefix
+from unittest.mock import AsyncMock
+
+import pytest
+
+import gemini_service
+from gemini_service import (
+    GeminiResult,
+    _is_likely_loop,
+    _split_language_prefix,
+    _transcribe_one,
+)
 
 
 def test_strips_lang_marker_and_returns_code():
@@ -122,6 +132,61 @@ def test_short_clip_skips_rate_check():
     # Cap signal still fires regardless of duration.
     assert _is_likely_loop(out_tokens=8192, duration_sec=1,
                            finish_reason="MAX_TOKENS", max_tokens=8192)
+
+
+# --- _transcribe_one: extra retry on transient 5xx after final attempt ---
+
+
+@pytest.mark.asyncio
+async def test_extra_retry_on_5xx_after_final_attempt(monkeypatch):
+    """Repro of production failure: first two attempts hit MAX_TOKENS loops
+    (TranscriptionDegradedError), the third (final-temperature) attempt hits
+    a Gemini server flake (InternalServerError 500). Before the fix, the
+    500 propagated to the handler as error_unknown. After: one more attempt
+    at the final temperature, which succeeds — user gets the transcription
+    instead of a generic error."""
+    from google.api_core import exceptions
+
+    success = GeminiResult(
+        text="finally got it", prompt_tokens=10, candidates_tokens=20, total_tokens=30,
+    )
+    side_effects = [
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        exceptions.InternalServerError("500"),
+        success,
+    ]
+    attempt_spy = AsyncMock(side_effect=side_effects)
+    monkeypatch.setattr(gemini_service, "_attempt_transcribe", attempt_spy)
+    # Make _get_transcribe_model a no-op so no Gemini API key is required.
+    monkeypatch.setattr(gemini_service, "_get_transcribe_model", lambda: object())
+    # _transcribe_one reads bytes from disk synchronously — short-circuit it.
+    monkeypatch.setattr(gemini_service, "_read_file_bytes", lambda _p: b"")
+
+    result = await _transcribe_one("/tmp/fake.ogg", "audio/ogg", duration_sec=120)
+    assert result is success
+    assert attempt_spy.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_no_extra_retry_when_final_attempt_degrades(monkeypatch):
+    """The extra-retry path is ONLY for transient server 5xx. If the final
+    attempt itself raises TranscriptionDegradedError (a content-side loop the
+    model can't recover from), we surface it immediately — another attempt
+    won't help and just wastes a billed call."""
+    side_effects = [
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+    ]
+    attempt_spy = AsyncMock(side_effect=side_effects)
+    monkeypatch.setattr(gemini_service, "_attempt_transcribe", attempt_spy)
+    monkeypatch.setattr(gemini_service, "_get_transcribe_model", lambda: object())
+    monkeypatch.setattr(gemini_service, "_read_file_bytes", lambda _p: b"")
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError):
+        await _transcribe_one("/tmp/fake.ogg", "audio/ogg", duration_sec=120)
+    assert attempt_spy.await_count == 3
 
 
 def test_finish_reason_defaults_to_none():
