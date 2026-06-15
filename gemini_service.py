@@ -331,6 +331,15 @@ async def _split_audio(file_path: str, chunk_sec: int) -> Tuple[List[str], str, 
     return chunks, "audio/ogg", temp_dir
 
 
+# When single-shot fully degrades, fall back to chunking IF the file is long
+# enough that smaller chunks would actually be different (below ~40s, a "half"
+# chunk is too short to materially change what the model sees).
+_DEGRADED_FALLBACK_MIN_DURATION_SEC = 40
+# Floor chunk size for the degraded fallback — keeps very short clips from
+# being sliced into useless slivers.
+_DEGRADED_FALLBACK_MIN_CHUNK_SEC = 30
+
+
 async def transcribe(
     file_path: str,
     mime_type: str,
@@ -339,29 +348,67 @@ async def transcribe(
     """Public entry: single-shot for short files, chunked for long ones."""
     _configure_once()
 
-    chunking = (
+    ffmpeg_ready = _ffmpeg_binary() is not None
+    chunking_eligible = (
         TRANSCRIBE_CHUNK_SEC > 0
         and duration_sec is not None
-        and duration_sec > TRANSCRIBE_CHUNK_SEC
-        and _ffmpeg_binary() is not None
+        and ffmpeg_ready
     )
 
-    if not chunking:
-        # Short file or ffmpeg unavailable → original single-shot path.
-        return await _transcribe_one(file_path, mime_type, duration_sec)
+    if chunking_eligible and duration_sec > TRANSCRIBE_CHUNK_SEC:
+        return await _transcribe_chunked(file_path, mime_type, duration_sec)
 
-    return await _transcribe_chunked(file_path, mime_type, duration_sec)
+    try:
+        return await _transcribe_one(file_path, mime_type, duration_sec)
+    except TranscriptionDegradedError as degraded:
+        # Last-resort: if every single-shot retry degraded (MAX_TOKENS loops,
+        # RECITATION refusals), try the chunked path with smaller pieces. A
+        # fresh model context per chunk usually breaks the loop, and a different
+        # audio slice usually bypasses the false-positive content filter.
+        # Only fires when ffmpeg is available and the clip is long enough for
+        # halving to produce non-trivial chunks.
+        if not chunking_eligible or duration_sec < _DEGRADED_FALLBACK_MIN_DURATION_SEC:
+            raise
+        fallback_chunk_sec = max(
+            _DEGRADED_FALLBACK_MIN_CHUNK_SEC,
+            min(TRANSCRIBE_CHUNK_SEC, duration_sec // 2),
+        )
+        logger.info(
+            "transcribe_chunked_fallback_on_degraded duration=%s chunk_sec=%d finish=%s",
+            duration_sec, fallback_chunk_sec, degraded.finish_reason,
+        )
+        try:
+            return await _transcribe_chunked(
+                file_path, mime_type, duration_sec,
+                chunk_sec=fallback_chunk_sec,
+            )
+        except TranscriptionDegradedError as chunked_err:
+            # Both paths degraded. Combine usage so the handler bills for
+            # what we actually consumed in both attempts.
+            raise TranscriptionDegradedError(
+                f"single_shot+chunked_both_degraded single={degraded.finish_reason} "
+                f"chunked={chunked_err.finish_reason}",
+                prompt_tokens=degraded.prompt_tokens + chunked_err.prompt_tokens,
+                prompt_audio_tokens=degraded.prompt_audio_tokens + chunked_err.prompt_audio_tokens,
+                candidates_tokens=degraded.candidates_tokens + chunked_err.candidates_tokens,
+                total_tokens=degraded.total_tokens + chunked_err.total_tokens,
+                finish_reason=degraded.finish_reason or chunked_err.finish_reason,
+            ) from chunked_err
 
 
 async def _transcribe_chunked(file_path: str, mime_type: str,
-                              duration_sec: int) -> GeminiResult:
+                              duration_sec: int,
+                              *, chunk_sec: Optional[int] = None) -> GeminiResult:
     """Split, transcribe each chunk in parallel (bounded), assemble.
 
     `mime_type` is the source file's MIME (used for the single-shot fallback
     if ffmpeg fails). Chunks themselves are always opus/ogg after re-encoding.
+    `chunk_sec` overrides the default split size — used by the degraded
+    fallback to slice more aggressively than the normal long-file path.
     """
+    split_sec = chunk_sec if chunk_sec and chunk_sec > 0 else TRANSCRIBE_CHUNK_SEC
     try:
-        chunk_paths, chunk_mime, temp_dir = await _split_audio(file_path, TRANSCRIBE_CHUNK_SEC)
+        chunk_paths, chunk_mime, temp_dir = await _split_audio(file_path, split_sec)
     except RuntimeError as e:
         logger.warning("ffmpeg_split_failed falling_back_to_single_shot exc=%s", e)
         return await _transcribe_one(file_path, mime_type, duration_sec)
@@ -372,11 +419,11 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
 
         async def _do(idx: int, path: str) -> GeminiResult:
             async with sem:
-                # Per-chunk duration is at most TRANSCRIBE_CHUNK_SEC; the last
-                # one may be shorter but using the cap is fine for loop
-                # detection (it only loosens the per-second threshold).
+                # Per-chunk duration is at most `split_sec`; the last one may
+                # be shorter but using the cap is fine for loop detection
+                # (it only loosens the per-second threshold).
                 logger.info("chunk_transcribe_start idx=%d/%d", idx + 1, n)
-                return await _transcribe_one(path, chunk_mime, TRANSCRIBE_CHUNK_SEC)
+                return await _transcribe_one(path, chunk_mime, split_sec)
 
         results = await asyncio.gather(
             *[_do(i, p) for i, p in enumerate(chunk_paths)],

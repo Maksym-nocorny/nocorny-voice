@@ -189,6 +189,90 @@ async def test_no_extra_retry_when_final_attempt_degrades(monkeypatch):
     assert attempt_spy.await_count == 3
 
 
+@pytest.mark.asyncio
+async def test_chunked_fallback_on_single_shot_degraded(monkeypatch):
+    """Repro of 2026-06-14 production failures: a sub-chunking-threshold clip
+    (97-190s) hit MAX_TOKENS/RECITATION on all 3 single-shot retries. The
+    chunked fallback kicks in, splits the file into smaller pieces, and
+    recovers."""
+    degrade = gemini_service.TranscriptionDegradedError(
+        "loop", finish_reason="MAX_TOKENS",
+        prompt_tokens=100, candidates_tokens=8192, total_tokens=8292,
+    )
+    recovery = GeminiResult(
+        text="recovered via chunks", prompt_tokens=50,
+        candidates_tokens=200, total_tokens=250,
+    )
+    single_shot_spy = AsyncMock(side_effect=degrade)
+    chunked_spy = AsyncMock(return_value=recovery)
+    monkeypatch.setattr(gemini_service, "_transcribe_one", single_shot_spy)
+    monkeypatch.setattr(gemini_service, "_transcribe_chunked", chunked_spy)
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+
+    result = await gemini_service.transcribe(
+        "/tmp/fake.ogg", "audio/ogg", duration_sec=190,
+    )
+    assert result is recovery
+    assert single_shot_spy.await_count == 1
+    assert chunked_spy.await_count == 1
+    # Half-duration chunk size, capped & floored by the fallback constants.
+    _, kwargs = chunked_spy.call_args
+    assert kwargs["chunk_sec"] == 95
+
+
+@pytest.mark.asyncio
+async def test_no_chunked_fallback_for_short_clip(monkeypatch):
+    """Below the min-duration threshold, halving produces useless slivers —
+    we propagate the original degraded error instead of wasting a Gemini call."""
+    degrade = gemini_service.TranscriptionDegradedError(
+        "loop", finish_reason="MAX_TOKENS",
+    )
+    single_shot_spy = AsyncMock(side_effect=degrade)
+    chunked_spy = AsyncMock()
+    monkeypatch.setattr(gemini_service, "_transcribe_one", single_shot_spy)
+    monkeypatch.setattr(gemini_service, "_transcribe_chunked", chunked_spy)
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError):
+        await gemini_service.transcribe(
+            "/tmp/fake.ogg", "audio/ogg", duration_sec=20,
+        )
+    chunked_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chunked_fallback_propagates_aggregated_usage(monkeypatch):
+    """When BOTH paths degrade, the surfaced error must carry combined token
+    usage from single-shot + chunked attempts — Gemini bills both."""
+    single_err = gemini_service.TranscriptionDegradedError(
+        "single", finish_reason="MAX_TOKENS",
+        prompt_tokens=100, prompt_audio_tokens=64,
+        candidates_tokens=8000, total_tokens=8100,
+    )
+    chunked_err = gemini_service.TranscriptionDegradedError(
+        "chunked", finish_reason="RECITATION",
+        prompt_tokens=50, prompt_audio_tokens=32,
+        candidates_tokens=200, total_tokens=250,
+    )
+    monkeypatch.setattr(gemini_service, "_transcribe_one", AsyncMock(side_effect=single_err))
+    monkeypatch.setattr(gemini_service, "_transcribe_chunked", AsyncMock(side_effect=chunked_err))
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
+        await gemini_service.transcribe(
+            "/tmp/fake.ogg", "audio/ogg", duration_sec=190,
+        )
+    final = exc_info.value
+    assert final.prompt_tokens == 150
+    assert final.prompt_audio_tokens == 96
+    assert final.candidates_tokens == 8200
+    assert final.total_tokens == 8350
+    assert final.finish_reason == "MAX_TOKENS"  # original surfaces
+
+
 def test_finish_reason_defaults_to_none():
     # Backwards-compatible default: missing finish_reason behaves like "not STOP",
     # so the soft rate signal still fires (preserves prior behavior on callers
