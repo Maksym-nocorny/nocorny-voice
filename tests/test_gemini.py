@@ -169,6 +169,29 @@ async def test_extra_retry_on_5xx_after_final_attempt(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_no_final_attempt_when_jittered_retry_recitation(monkeypatch):
+    """RECITATION is a content-safety block (copyrighted lyrics/quoted text):
+    raising temperature can't unblock it, the model keeps reproducing the
+    protected sequence. After the jittered retry (temp=0.30) returns
+    RECITATION, skip the final temp=1.0 call — it's a guaranteed wasted
+    Gemini call and ~10s of user wait. Loop-style degradations (MAX_TOKENS)
+    still get the final attempt — they empirically recover."""
+    side_effects = [
+        gemini_service.TranscriptionDegradedError("blocked", finish_reason="RECITATION"),
+        gemini_service.TranscriptionDegradedError("blocked", finish_reason="RECITATION"),
+    ]
+    attempt_spy = AsyncMock(side_effect=side_effects)
+    monkeypatch.setattr(gemini_service, "_attempt_transcribe", attempt_spy)
+    monkeypatch.setattr(gemini_service, "_get_transcribe_model", lambda: object())
+    monkeypatch.setattr(gemini_service, "_read_file_bytes", lambda _p: b"")
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
+        await _transcribe_one("/tmp/fake.ogg", "audio/ogg", duration_sec=240)
+    assert exc_info.value.finish_reason == "RECITATION"
+    assert attempt_spy.await_count == 2  # no temp=1.0 call
+
+
+@pytest.mark.asyncio
 async def test_no_extra_retry_when_final_attempt_degrades(monkeypatch):
     """The extra-retry path is ONLY for transient server 5xx. If the final
     attempt itself raises TranscriptionDegradedError (a content-side loop the
@@ -211,14 +234,14 @@ async def test_chunked_fallback_on_single_shot_degraded(monkeypatch):
     monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
 
     result = await gemini_service.transcribe(
-        "/tmp/fake.ogg", "audio/ogg", duration_sec=190,
+        "/tmp/fake.ogg", "audio/ogg", duration_sec=140,
     )
     assert result is recovery
     assert single_shot_spy.await_count == 1
     assert chunked_spy.await_count == 1
     # Half-duration chunk size, capped & floored by the fallback constants.
     _, kwargs = chunked_spy.call_args
-    assert kwargs["chunk_sec"] == 95
+    assert kwargs["chunk_sec"] == 70
 
 
 @pytest.mark.asyncio
@@ -263,7 +286,7 @@ async def test_chunked_fallback_propagates_aggregated_usage(monkeypatch):
 
     with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
         await gemini_service.transcribe(
-            "/tmp/fake.ogg", "audio/ogg", duration_sec=190,
+            "/tmp/fake.ogg", "audio/ogg", duration_sec=140,
         )
     final = exc_info.value
     assert final.prompt_tokens == 150

@@ -632,6 +632,19 @@ async def _transcribe_one(
                 temperature=TRANSCRIBE_RETRY_TEMPERATURE,
             )
         except retryable as e2:
+            # RECITATION is a content-safety block (copyrighted song lyrics,
+            # quoted text). Raising temperature can't unblock it; the model
+            # keeps reproducing the same protected sequence. Skip the final
+            # high-temp attempt — it just wastes a billed call and ~10s of
+            # user wait time. Loop-style degradations (MAX_TOKENS) still get
+            # the temp=1.0 escape hatch, which empirically recovers them.
+            if (isinstance(e2, TranscriptionDegradedError)
+                    and getattr(e2, "finish_reason", None) == "RECITATION"):
+                logger.info(
+                    "transcribe_skip_final_on_recitation duration=%s",
+                    duration_sec,
+                )
+                raise
             logger.info(
                 "transcribe_retry_final duration=%s temperature=%.2f second_attempt=%s",
                 duration_sec, TRANSCRIBE_RETRY_FINAL_TEMPERATURE, type(e2).__name__,

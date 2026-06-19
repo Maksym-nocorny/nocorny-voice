@@ -47,8 +47,11 @@ TRANSCRIBE_RETRY_FINAL_TEMPERATURE = _env_float("TRANSCRIBE_RETRY_FINAL_TEMPERAT
 
 # --- Long-audio chunking (mitigates flash-lite hallucinations on long files) ---
 # Files longer than this are split into chunks of the same length via ffmpeg.
-# Set to 0 to disable chunking entirely.
-TRANSCRIBE_CHUNK_SEC = _env_int("TRANSCRIBE_CHUNK_SEC", 240)
+# Set to 0 to disable chunking entirely. Threshold sits below the 3-4 min
+# "danger zone" where flash-lite reliably looped into MAX_TOKENS at the prior
+# 240s setting — chunking earlier avoids the loop preemptively instead of
+# relying on the post-degrade fallback.
+TRANSCRIBE_CHUNK_SEC = _env_int("TRANSCRIBE_CHUNK_SEC", 150)
 # Max parallel Gemini transcribe calls when chunking. Keep modest to avoid rate limits.
 TRANSCRIBE_CHUNK_CONCURRENCY = _env_int("TRANSCRIBE_CHUNK_CONCURRENCY", 3)
 # Path to ffmpeg binary; resolved via PATH if just "ffmpeg".
