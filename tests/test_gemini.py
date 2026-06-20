@@ -139,19 +139,22 @@ def test_short_clip_skips_rate_check():
 
 @pytest.mark.asyncio
 async def test_extra_retry_on_5xx_after_final_attempt(monkeypatch):
-    """Repro of production failure: first two attempts hit MAX_TOKENS loops
-    (TranscriptionDegradedError), the third (final-temperature) attempt hits
-    a Gemini server flake (InternalServerError 500). Before the fix, the
-    500 propagated to the handler as error_unknown. After: one more attempt
-    at the final temperature, which succeeds — user gets the transcription
-    instead of a generic error."""
+    """Repro of production failure: a transient 5xx + a loop hits the temp=1.0
+    final attempt, which itself flakes with a Gemini InternalServerError 500.
+    Before the fix, the 500 propagated to the handler as error_unknown.
+    After: one more attempt at the final temperature, which succeeds — user
+    gets the transcription instead of a generic error.
+
+    NOTE: the first attempt is intentionally a transient 5xx, not MAX_TOKENS —
+    a double MAX_TOKENS pair now short-circuits before temp=1.0
+    (see test_no_final_attempt_when_double_max_tokens)."""
     from google.api_core import exceptions
 
     success = GeminiResult(
         text="finally got it", prompt_tokens=10, candidates_tokens=20, total_tokens=30,
     )
     side_effects = [
-        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        exceptions.ServiceUnavailable("503"),
         gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
         exceptions.InternalServerError("500"),
         success,
@@ -196,10 +199,15 @@ async def test_no_extra_retry_when_final_attempt_degrades(monkeypatch):
     """The extra-retry path is ONLY for transient server 5xx. If the final
     attempt itself raises TranscriptionDegradedError (a content-side loop the
     model can't recover from), we surface it immediately — another attempt
-    won't help and just wastes a billed call."""
+    won't help and just wastes a billed call.
+
+    First two attempts here are transient 5xx (not MAX_TOKENS), so the
+    double-MAX_TOKENS short-circuit doesn't fire and we reach temp=1.0."""
+    from google.api_core import exceptions
+
     side_effects = [
-        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
-        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        exceptions.ServiceUnavailable("503"),
+        exceptions.InternalServerError("500"),
         gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
     ]
     attempt_spy = AsyncMock(side_effect=side_effects)
@@ -210,6 +218,53 @@ async def test_no_extra_retry_when_final_attempt_degrades(monkeypatch):
     with pytest.raises(gemini_service.TranscriptionDegradedError):
         await _transcribe_one("/tmp/fake.ogg", "audio/ogg", duration_sec=120)
     assert attempt_spy.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_no_final_attempt_when_double_max_tokens(monkeypatch):
+    """Two MAX_TOKENS-finish degradations in a row mean the model is truly
+    looping on the audio (almost always copyrighted song lyrics). The temp=1.0
+    escape almost never recovers from this — production data over 24h showed
+    every double-MAX chunk also hit MAX_TOKENS at temp=1.0. Skip the third
+    attempt to save a billed Gemini call."""
+    side_effects = [
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+    ]
+    attempt_spy = AsyncMock(side_effect=side_effects)
+    monkeypatch.setattr(gemini_service, "_attempt_transcribe", attempt_spy)
+    monkeypatch.setattr(gemini_service, "_get_transcribe_model", lambda: object())
+    monkeypatch.setattr(gemini_service, "_read_file_bytes", lambda _p: b"")
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
+        await _transcribe_one("/tmp/fake.ogg", "audio/ogg", duration_sec=120)
+    assert exc_info.value.finish_reason == "MAX_TOKENS"
+    assert attempt_spy.await_count == 2  # no temp=1.0 call
+
+
+@pytest.mark.asyncio
+async def test_two_5xx_in_a_row_surface_as_degraded(monkeypatch):
+    """When the temp=1.0 attempt 5xxs AND the +1 retry-after-5xx also 5xxs,
+    we convert the second 5xx to a TranscriptionDegradedError so the chunked
+    aggregator can mark the chunk and the handler can record cost — instead
+    of letting the bare Gemini exception escape as chunk_unexpected_error."""
+    from google.api_core import exceptions
+
+    side_effects = [
+        exceptions.ServiceUnavailable("503"),
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        exceptions.InternalServerError("500"),
+        exceptions.InternalServerError("500"),
+    ]
+    attempt_spy = AsyncMock(side_effect=side_effects)
+    monkeypatch.setattr(gemini_service, "_attempt_transcribe", attempt_spy)
+    monkeypatch.setattr(gemini_service, "_get_transcribe_model", lambda: object())
+    monkeypatch.setattr(gemini_service, "_read_file_bytes", lambda _p: b"")
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
+        await _transcribe_one("/tmp/fake.ogg", "audio/ogg", duration_sec=120)
+    assert exc_info.value.finish_reason == "gemini_5xx"
+    assert attempt_spy.await_count == 4
 
 
 @pytest.mark.asyncio

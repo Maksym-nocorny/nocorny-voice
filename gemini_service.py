@@ -645,6 +645,20 @@ async def _transcribe_one(
                     duration_sec,
                 )
                 raise
+            # Two MAX_TOKENS in a row at near-cap output means the model is
+            # truly looping on the audio (typically song lyrics), not just
+            # wobbling — the temp=1.0 escape almost always hits MAX_TOKENS
+            # too. Skip it to save a billed call. Logged separately from the
+            # RECITATION skip so /stats can split the two patterns.
+            if (isinstance(e1, TranscriptionDegradedError)
+                    and isinstance(e2, TranscriptionDegradedError)
+                    and getattr(e1, "finish_reason", None) == "MAX_TOKENS"
+                    and getattr(e2, "finish_reason", None) == "MAX_TOKENS"):
+                logger.info(
+                    "transcribe_skip_final_on_double_max_tokens duration=%s",
+                    duration_sec,
+                )
+                raise
             logger.info(
                 "transcribe_retry_final duration=%s temperature=%.2f second_attempt=%s",
                 duration_sec, TRANSCRIBE_RETRY_FINAL_TEMPERATURE, type(e2).__name__,
@@ -659,10 +673,25 @@ async def _transcribe_one(
                     "transcribe_retry_after_5xx duration=%s temperature=%.2f exc=%s",
                     duration_sec, TRANSCRIBE_RETRY_FINAL_TEMPERATURE, type(e3).__name__,
                 )
-                return await _attempt_transcribe(
-                    model, audio_part, duration_sec,
-                    temperature=TRANSCRIBE_RETRY_FINAL_TEMPERATURE,
-                )
+                try:
+                    return await _attempt_transcribe(
+                        model, audio_part, duration_sec,
+                        temperature=TRANSCRIBE_RETRY_FINAL_TEMPERATURE,
+                    )
+                except transient_5xx as e4:
+                    # Two 5xx in a row from Gemini — treat as a degraded
+                    # outcome so the chunked aggregator marks the chunk and
+                    # the handler still records cost (currently zero — the
+                    # API never returned usage_metadata for the failed calls,
+                    # but we account for what we know: nothing).
+                    logger.warning(
+                        "transcribe_5xx_exhausted duration=%s exc=%s",
+                        duration_sec, type(e4).__name__,
+                    )
+                    raise TranscriptionDegradedError(
+                        f"two 5xx in a row: {type(e4).__name__}",
+                        finish_reason="gemini_5xx",
+                    ) from e4
 
 
 def _finish_reason(response) -> str:
