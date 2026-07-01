@@ -351,6 +351,72 @@ async def test_chunked_fallback_propagates_aggregated_usage(monkeypatch):
     assert final.finish_reason == "MAX_TOKENS"  # original surfaces
 
 
+@pytest.mark.asyncio
+async def test_chunked_partial_marks_degraded_chunks(monkeypatch):
+    """When some chunks succeed and at least one degrades, the returned
+    GeminiResult must carry `degraded_chunks > 0` so the handler can emit
+    a separate `transcribe_degraded` analytics event without dropping the
+    partial text the user already got."""
+    good = GeminiResult(
+        text="hello", prompt_tokens=100, candidates_tokens=20, total_tokens=120,
+        prompt_audio_tokens=80,
+    )
+    bad = gemini_service.TranscriptionDegradedError(
+        "recitation", finish_reason="RECITATION",
+        prompt_tokens=50, prompt_audio_tokens=40,
+        candidates_tokens=0, total_tokens=50,
+    )
+    # Two chunks: first succeeds, second degrades.
+    calls = iter([good, bad])
+
+    async def _fake_one(path, mime, dur):  # noqa: ARG001
+        n = next(calls)
+        if isinstance(n, BaseException):
+            raise n
+        return n
+
+    async def _fake_split(_path, _chunk_sec):
+        return (["/tmp/c0.ogg", "/tmp/c1.ogg"], "audio/ogg", "/tmp/nv_chunks_x")
+
+    monkeypatch.setattr(gemini_service, "_split_audio", _fake_split)
+    monkeypatch.setattr(gemini_service, "_transcribe_one", _fake_one)
+    monkeypatch.setattr(gemini_service.shutil, "rmtree", lambda *a, **k: None)
+
+    result = await gemini_service._transcribe_chunked(
+        "/tmp/fake.aac", "audio/aac", duration_sec=300,
+    )
+    assert result.degraded_chunks == 1
+    assert "hello" in result.text
+    assert "не вдалося розпізнати" in result.text
+    # Tokens accumulated across both chunks (Gemini billed both).
+    assert result.total_tokens == 170
+    assert result.prompt_audio_tokens == 120
+
+
+@pytest.mark.asyncio
+async def test_chunked_all_success_has_zero_degraded_chunks(monkeypatch):
+    """Sanity: a fully successful chunked transcribe leaves `degraded_chunks` at 0
+    so the handler does not emit a spurious degraded event."""
+    good = GeminiResult(
+        text="part", prompt_tokens=10, candidates_tokens=2, total_tokens=12,
+    )
+
+    async def _fake_one(path, mime, dur):  # noqa: ARG001
+        return good
+
+    async def _fake_split(_path, _chunk_sec):
+        return (["/tmp/c0.ogg", "/tmp/c1.ogg"], "audio/ogg", "/tmp/nv_chunks_y")
+
+    monkeypatch.setattr(gemini_service, "_split_audio", _fake_split)
+    monkeypatch.setattr(gemini_service, "_transcribe_one", _fake_one)
+    monkeypatch.setattr(gemini_service.shutil, "rmtree", lambda *a, **k: None)
+
+    result = await gemini_service._transcribe_chunked(
+        "/tmp/fake.aac", "audio/aac", duration_sec=300,
+    )
+    assert result.degraded_chunks == 0
+
+
 def test_finish_reason_defaults_to_none():
     # Backwards-compatible default: missing finish_reason behaves like "not STOP",
     # so the soft rate signal still fires (preserves prior behavior on callers

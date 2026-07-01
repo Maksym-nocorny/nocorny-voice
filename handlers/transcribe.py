@@ -109,6 +109,32 @@ async def _safe_edit(message: Optional[Message], text: str, **kwargs) -> bool:
             return False
 
 
+# Telegram's getFile + downloadToDrive occasionally trip a single TimedOut
+# (the request returns mid-flight or the CDN responds slowly). The PTB default
+# is no retry — one blip lands the user on an "error" reply. A single short
+# retry recovers the call ~always while only costing ~1s on the rare miss.
+_DOWNLOAD_RETRY_SLEEP_SEC = 1.0
+
+
+async def _get_file_with_retry(context: ContextTypes.DEFAULT_TYPE,
+                               file_id: str, dest_path: str) -> None:
+    """Fetch file metadata and download to `dest_path`, retrying once on
+    transient Telegram errors. BadRequest (e.g. "file is too big") and
+    RetryAfter propagate immediately — those need handler-level handling.
+    """
+    try:
+        new_file = await context.bot.get_file(file_id)
+        await new_file.download_to_drive(dest_path)
+        return
+    except (TimedOut, NetworkError) as e:
+        logger.info(
+            "telegram_download_retry class=%s msg=%s", type(e).__name__, e,
+        )
+    await asyncio.sleep(_DOWNLOAD_RETRY_SLEEP_SEC)
+    new_file = await context.bot.get_file(file_id)
+    await new_file.download_to_drive(dest_path)
+
+
 @dataclass
 class _MediaInfo:
     file_id: str
@@ -306,10 +332,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     result: Optional[gemini_service.GeminiResult] = None
     try:
         try:
-            new_file = await context.bot.get_file(info.file_id)
             with tempfile.NamedTemporaryFile(suffix=info.file_ext, delete=False) as f:
                 temp_path = f.name
-            await new_file.download_to_drive(temp_path)
+            await _get_file_with_retry(context, info.file_id, temp_path)
         except BadRequest as e:
             # Telegram caps getFile downloads at 20 MB. Some clients report a
             # smaller `file_size` than the actual upload (or omit it), so this
@@ -391,6 +416,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "transcribe_success", user=user, chat=chat, info=info, result=result,
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
+        # Partial-degradation tracking: when chunked transcribe loses one or
+        # more chunks (RECITATION/loop) but the rest succeeded, the user got
+        # a result with `[фрагмент N: ...]` placeholders. The tokens are
+        # already counted by transcribe_success above, so we emit a separate
+        # degraded event with a zero-token result to surface it in /stats Perf
+        # without double-billing.
+        if result.degraded_chunks > 0:
+            empty = gemini_service.GeminiResult(
+                text="", prompt_tokens=0, candidates_tokens=0, total_tokens=0,
+            )
+            analytics.track(
+                "transcribe_degraded", user=user, chat=chat, info=info,
+                result=empty, error_class="partial_chunks",
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
         await _send_transcription(
             update, user_lang, result.text, is_group, status_message=status_message
         )

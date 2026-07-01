@@ -237,6 +237,61 @@ async def test_private_voice_transcription_full_flow(monkeypatch):
     assert cached.text == "hello world"
 
 
+async def test_partial_chunked_emits_extra_degraded_event(monkeypatch):
+    """When Gemini returns a partially-degraded chunked result (some chunks
+    blanked by RECITATION but the rest succeeded), the user still gets text
+    but /stats must see it as degraded — otherwise error_rate hides it."""
+    import analytics
+    from handlers import transcribe as t
+
+    partial_result = GeminiResult(
+        text="part 1\n[фрагмент 2: не вдалося розпізнати]",
+        prompt_tokens=100, candidates_tokens=20, total_tokens=120,
+        prompt_audio_tokens=80, degraded_chunks=1,
+    )
+    monkeypatch.setattr(gemini_service, "transcribe",
+                        AsyncMock(return_value=partial_result))
+
+    tracked: list[tuple[str, dict]] = []
+    monkeypatch.setattr(analytics, "track",
+                        lambda et, **kw: tracked.append((et, kw)))
+
+    update, context, _status, _ = _make_update_context(voice=_make_voice(duration=300))
+    await t.handle_message(update, context)
+
+    event_types = [et for et, _ in tracked]
+    assert "transcribe_success" in event_types
+    assert "transcribe_degraded" in event_types
+    # The success carries the full token count; the degraded marker carries
+    # zero tokens so we don't double-bill cost reporting.
+    degraded_kw = next(kw for et, kw in tracked if et == "transcribe_degraded")
+    assert degraded_kw["error_class"] == "partial_chunks"
+    assert degraded_kw["result"].total_tokens == 0
+
+
+async def test_fully_successful_chunked_does_not_emit_degraded(monkeypatch):
+    """Counterpart: a chunked transcribe with `degraded_chunks == 0` must NOT
+    log a spurious transcribe_degraded event."""
+    import analytics
+    from handlers import transcribe as t
+
+    full = GeminiResult(
+        text="all good", prompt_tokens=10, candidates_tokens=5, total_tokens=15,
+        degraded_chunks=0,
+    )
+    monkeypatch.setattr(gemini_service, "transcribe", AsyncMock(return_value=full))
+
+    tracked: list[str] = []
+    monkeypatch.setattr(analytics, "track",
+                        lambda et, **kw: tracked.append(et))
+
+    update, context, _status, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+
+    assert "transcribe_success" in tracked
+    assert "transcribe_degraded" not in tracked
+
+
 async def test_group_voice_replies_without_button(monkeypatch):
     from handlers import transcribe as t
 
@@ -335,6 +390,38 @@ async def test_telegram_timeout_logs_warning_no_error(monkeypatch, caplog):
     # error_unknown is still tracked so the metric is honest.
     tracked = [c.args[0] for c in track_spy.call_args_list]
     assert "error_unknown" in tracked
+
+
+async def test_telegram_download_retries_once_on_timeout(monkeypatch):
+    """A single transient TimedOut on get_file should be retried — the second
+    attempt usually succeeds, so the user gets their transcription instead of
+    a generic error. Without this, ~1 in ~200 requests would land on 'error'
+    purely because of a Telegram flake."""
+    from telegram.error import TimedOut
+
+    from handlers import transcribe as t
+
+    new_file = MagicMock()
+    new_file.download_to_drive = AsyncMock()
+    # First get_file call times out; second succeeds.
+    bot_get_file = AsyncMock(side_effect=[TimedOut(), new_file])
+
+    fake_result = GeminiResult(
+        text="recovered", prompt_tokens=1, candidates_tokens=1, total_tokens=2,
+    )
+    monkeypatch.setattr(gemini_service, "transcribe",
+                        AsyncMock(return_value=fake_result))
+    # Skip the real 1s sleep between attempts.
+    monkeypatch.setattr(t.asyncio, "sleep", AsyncMock())
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    context.bot.get_file = bot_get_file
+
+    await t.handle_message(update, context)
+
+    assert bot_get_file.await_count == 2
+    final_text = status.edit_text.await_args_list[-1].args[0]
+    assert "recovered" in final_text
 
 
 async def test_initial_status_reply_timeout_does_not_kill_transcription(monkeypatch, caplog):

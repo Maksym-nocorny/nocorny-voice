@@ -100,6 +100,10 @@ class GeminiResult:
     total_tokens: int
     prompt_audio_tokens: int = 0
     detected_language: Optional[str] = None
+    # >0 only on chunked transcribes where at least one chunk degraded but
+    # the rest succeeded. The handler still surfaces the partial text but
+    # tracks an extra `transcribe_degraded` event so /stats reflects it.
+    degraded_chunks: int = 0
 
 
 _configured = False
@@ -491,6 +495,7 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
         total_tokens=t_total,
         prompt_audio_tokens=pa_total,
         detected_language=detected,
+        degraded_chunks=degraded_count,
     )
 
 
