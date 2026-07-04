@@ -437,8 +437,12 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Re-raise the first hard error if any chunk failed unrecoverably.
+    # PermissionDenied travels alongside the internal errors: it's a hard
+    # account-level block (billing/dunning), never a per-chunk hiccup, so
+    # bucketing it as "all_chunks_degraded" would hide the real signal.
     for r in results:
-        if isinstance(r, (RateLimitedError, ProcessingFailedError)):
+        if isinstance(r, (RateLimitedError, ProcessingFailedError,
+                          exceptions.PermissionDenied)):
             raise r
 
     # Surviving chunks (degraded ones contribute a placeholder). Token totals

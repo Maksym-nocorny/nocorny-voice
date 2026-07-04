@@ -20,6 +20,8 @@ from telegram.error import (
 )
 from telegram.ext import ContextTypes
 
+from google.api_core import exceptions as google_exceptions
+
 import analytics
 import cache
 import gemini_service
@@ -475,6 +477,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             error_class=type(e).__name__,
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
+    except google_exceptions.PermissionDenied as e:
+        # Gemini API blocked the account (billing dunning, API key revoked, or
+        # geo-block). Not a bug — no traceback. User sees "temporarily
+        # unavailable" instead of the generic "an error occurred", and analytics
+        # keeps the PermissionDenied class so /stats trends this cluster.
+        logger.warning("transcribe_gemini_permission_denied msg=%s", str(e)[:200])
+        analytics.track(
+            "error_unknown", user=user, chat=chat, info=info, result=result,
+            error_class=type(e).__name__,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+        await _safe_edit(status_message, get_text(user_lang, "service_unavailable"))
     except Exception as e:
         logger.exception("transcribe_handler_error")
         # If we got past the transcribe() call before the failure, `result` is

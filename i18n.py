@@ -18,6 +18,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "The file is too large. Please send media smaller than {} MB.",
         "media_too_short": "The clip is too short to transcribe.",
         "transcribe_degraded": "Couldn't transcribe this audio reliably (the model got stuck or returned a blocked response). Try sending a shorter clip or splitting it.",
+        "service_unavailable": "The transcription service is temporarily unavailable. Please try again later.",
     },
     "uk": {
         "welcome": "Привіт! Я бот для транскрипції. Надішліть мені голосове повідомлення, аудіофайл, відео або відеоповідомлення, і я транскрибую його за допомогою Gemini.",
@@ -33,6 +34,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "Файл занадто великий. Надішліть медіа менше за {} МБ.",
         "media_too_short": "Кліп занадто короткий для транскрипції.",
         "transcribe_degraded": "Не вдалося надійно розпізнати це аудіо (модель зациклилася або повернула заблоковану відповідь). Спробуйте надіслати коротший кліп або розділити його.",
+        "service_unavailable": "Сервіс транскрипції тимчасово недоступний. Будь ласка, спробуйте пізніше.",
     },
     "ru": {
         "welcome": "Привет! Я бот для транскрипции. Отправьте мне голосовое сообщение, аудиофайл, видео или видеосообщение, и я транскрибирую его с помощью Gemini.",
@@ -48,6 +50,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "Файл слишком большой. Отправьте медиа меньше {} МБ.",
         "media_too_short": "Клип слишком короткий для транскрипции.",
         "transcribe_degraded": "Не удалось надёжно распознать это аудио (модель зациклилась или вернула заблокированный ответ). Попробуйте отправить более короткий клип или разделить его.",
+        "service_unavailable": "Сервис транскрипции временно недоступен. Пожалуйста, попробуйте позже.",
     },
     "es": {
         "welcome": "¡Hola! Soy un bot de transcripción. Envíame un mensaje de voz, archivo de audio, video o nota de video, y lo transcribiré usando Gemini.",
@@ -63,6 +66,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "El archivo es demasiado grande. Por favor, envía medios de menos de {} MB.",
         "media_too_short": "El clip es demasiado corto para transcribir.",
         "transcribe_degraded": "No se pudo transcribir este audio de forma fiable (el modelo se atascó o devolvió una respuesta bloqueada). Intenta enviar un clip más corto o dividirlo.",
+        "service_unavailable": "El servicio de transcripción no está disponible temporalmente. Por favor, inténtalo más tarde.",
     },
     "de": {
         "welcome": "Hallo! Ich bin ein Transkriptions-Bot. Sende mir eine Sprachnachricht, Audiodatei, Video oder Videonotiz, und ich transkribiere sie mit Gemini.",
@@ -78,6 +82,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "Die Datei ist zu groß. Bitte sende Medien kleiner als {} MB.",
         "media_too_short": "Der Clip ist zu kurz zum Transkribieren.",
         "transcribe_degraded": "Diese Audiodatei konnte nicht zuverlässig transkribiert werden (das Modell blieb hängen oder lieferte eine blockierte Antwort). Versuche, einen kürzeren Clip zu senden oder ihn aufzuteilen.",
+        "service_unavailable": "Der Transkriptionsdienst ist vorübergehend nicht verfügbar. Bitte versuche es später erneut.",
     },
     "fr": {
         "welcome": "Salut! Je suis un bot de transcription. Envoyez-moi un message vocal, fichier audio, vidéo ou note vidéo, et je le transcrirai avec Gemini.",
@@ -93,6 +98,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "Le fichier est trop volumineux. Veuillez envoyer des médias de moins de {} Mo.",
         "media_too_short": "Le clip est trop court à transcrire.",
         "transcribe_degraded": "Impossible de transcrire cet audio de manière fiable (le modèle s'est bloqué ou a renvoyé une réponse bloquée). Essayez d'envoyer un clip plus court ou de le diviser.",
+        "service_unavailable": "Le service de transcription est temporairement indisponible. Veuillez réessayer plus tard.",
     },
     "it": {
         "welcome": "Ciao! Sono un bot di trascrizione. Inviami un messaggio vocale, file audio, video o nota video e lo trascriverò usando Gemini.",
@@ -108,6 +114,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "Il file è troppo grande. Per favore, invia file più piccoli di {} MB.",
         "media_too_short": "Il clip è troppo corto da trascrivere.",
         "transcribe_degraded": "Non è stato possibile trascrivere questo audio in modo affidabile (il modello si è bloccato o ha restituito una risposta bloccata). Prova a inviare un clip più breve o a dividerlo.",
+        "service_unavailable": "Il servizio di trascrizione è temporaneamente non disponibile. Per favore, riprova più tardi.",
     },
     "pl": {
         "welcome": "Cześć! Jestem botem do transkrypcji. Wyślij mi wiadomość głosową, plik audio, wideo lub notatkę wideo, a przepiszę ją za pomocą Gemini.",
@@ -123,6 +130,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "Plik jest za duży. Proszę wysłać media mniejsze niż {} MB.",
         "media_too_short": "Klip jest za krótki, aby go przepisać.",
         "transcribe_degraded": "Nie udało się wiarygodnie przetranskrybować tego audio (model się zaciął lub zwrócił zablokowaną odpowiedź). Spróbuj wysłać krótszy klip lub podzielić go.",
+        "service_unavailable": "Usługa transkrypcji jest tymczasowo niedostępna. Spróbuj ponownie później.",
     },
     "pt": {
         "welcome": "Olá! Sou um bot de transcrição. Envia-me uma mensagem de voz, ficheiro de áudio, vídeo ou nota de vídeo, e transcrevo-o para ti com o Gemini.",
@@ -138,6 +146,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "O ficheiro é demasiado grande. Por favor, envia multimédia com menos de {} MB.",
         "media_too_short": "O clip é demasiado curto para transcrever.",
         "transcribe_degraded": "Não foi possível transcrever este áudio de forma fiável (o modelo bloqueou ou devolveu uma resposta bloqueada). Tenta enviar um clip mais curto ou dividi-lo.",
+        "service_unavailable": "O serviço de transcrição está temporariamente indisponível. Por favor, tenta novamente mais tarde.",
     },
     "pt-br": {
         "welcome": "Oi! Sou um bot de transcrição. Me envie uma mensagem de voz, arquivo de áudio, vídeo ou nota de vídeo, e eu transcrevo para você usando o Gemini.",
@@ -153,6 +162,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "O arquivo é muito grande. Por favor, envie mídia com menos de {} MB.",
         "media_too_short": "O clipe é muito curto para transcrever.",
         "transcribe_degraded": "Não foi possível transcrever este áudio de forma confiável (o modelo travou ou retornou uma resposta bloqueada). Tente enviar um clipe mais curto ou dividi-lo.",
+        "service_unavailable": "O serviço de transcrição está temporariamente indisponível. Por favor, tente novamente mais tarde.",
     },
     "id": {
         "welcome": "Hai! Saya bot transkripsi. Kirimkan saya pesan suara, file audio, video, atau catatan video, dan saya akan mentranskripsikannya untuk Anda menggunakan Gemini.",
@@ -168,6 +178,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "File terlalu besar. Silakan kirim media yang lebih kecil dari {} MB.",
         "media_too_short": "Klip terlalu pendek untuk ditranskripsikan.",
         "transcribe_degraded": "Tidak dapat mentranskripsikan audio ini dengan andal (model macet atau mengembalikan respons yang diblokir). Coba kirim klip yang lebih pendek atau bagi menjadi beberapa bagian.",
+        "service_unavailable": "Layanan transkripsi untuk sementara tidak tersedia. Silakan coba lagi nanti.",
     },
     "ar": {
         "welcome": "مرحبًا! أنا بوت لتفريغ النصوص. أرسل لي رسالة صوتية أو ملف صوتي أو فيديو أو ملاحظة فيديو، وسأفرّغها لك نصيًا باستخدام Gemini.",
@@ -183,6 +194,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "media_too_large": "الملف كبير جدًا. يرجى إرسال وسائط أصغر من {} ميغابايت.",
         "media_too_short": "المقطع قصير جدًا بحيث لا يمكن تفريغه.",
         "transcribe_degraded": "تعذّر تفريغ هذا الصوت بشكل موثوق (توقف النموذج أو أعاد استجابة محظورة). حاول إرسال مقطع أقصر أو تقسيمه.",
+        "service_unavailable": "خدمة التفريغ غير متاحة مؤقتًا. يرجى المحاولة لاحقًا.",
     },
 }
 
