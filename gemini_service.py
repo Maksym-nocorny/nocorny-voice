@@ -342,6 +342,12 @@ _DEGRADED_FALLBACK_MIN_DURATION_SEC = 40
 # Floor chunk size for the degraded fallback — keeps very short clips from
 # being sliced into useless slivers.
 _DEGRADED_FALLBACK_MIN_CHUNK_SEC = 30
+# On clips shorter than this the "skip temp=1.0 after double MAX_TOKENS" gate
+# is bypassed. The gate normally saves ~$0.003 per stubborn loop, but on short
+# clips (a) that savings is negligible and (b) the outer degraded-fallback
+# can't split the audio meaningfully, so the temp=1.0 attempt is the only
+# remaining chance at a real transcription.
+_MAX_TOKENS_SKIP_MIN_DURATION_SEC = 30
 
 
 async def transcribe(
@@ -659,10 +665,17 @@ async def _transcribe_one(
             # wobbling — the temp=1.0 escape almost always hits MAX_TOKENS
             # too. Skip it to save a billed call. Logged separately from the
             # RECITATION skip so /stats can split the two patterns.
+            # Exception: on very short clips (<30s) the outer degraded-fallback
+            # can't slice the audio into meaningfully smaller pieces, so this
+            # third attempt is the user's only remaining shot at a real
+            # transcription. The billed cost there is a rounding error
+            # (~$0.003), so let it run — the savings aren't worth the miss.
             if (isinstance(e1, TranscriptionDegradedError)
                     and isinstance(e2, TranscriptionDegradedError)
                     and getattr(e1, "finish_reason", None) == "MAX_TOKENS"
-                    and getattr(e2, "finish_reason", None) == "MAX_TOKENS"):
+                    and getattr(e2, "finish_reason", None) == "MAX_TOKENS"
+                    and (duration_sec is None
+                         or duration_sec >= _MAX_TOKENS_SKIP_MIN_DURATION_SEC)):
                 logger.info(
                     "transcribe_skip_final_on_double_max_tokens duration=%s",
                     duration_sec,

@@ -243,6 +243,33 @@ async def test_no_final_attempt_when_double_max_tokens(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_temp10_still_runs_on_short_clip_double_max_tokens(monkeypatch):
+    """Repro of 2026-07-05 20:30 UTC (req=ae45ba35): a 6s voice clip hit
+    MAX_TOKENS on both temp=0.0 and temp=0.3, and the outer degraded-fallback
+    can't slice something that short into meaningfully smaller pieces. The
+    third temp=1.0 attempt is the user's only remaining chance at a real
+    transcription, and its billed cost is ~$0.003 — small enough that the
+    "skip on double MAX_TOKENS" gate must NOT fire below 30 seconds."""
+    recovery = GeminiResult(
+        text="recovered at temp=1.0", prompt_tokens=50,
+        candidates_tokens=20, total_tokens=70,
+    )
+    side_effects = [
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        gemini_service.TranscriptionDegradedError("loop", finish_reason="MAX_TOKENS"),
+        recovery,
+    ]
+    attempt_spy = AsyncMock(side_effect=side_effects)
+    monkeypatch.setattr(gemini_service, "_attempt_transcribe", attempt_spy)
+    monkeypatch.setattr(gemini_service, "_get_transcribe_model", lambda: object())
+    monkeypatch.setattr(gemini_service, "_read_file_bytes", lambda _p: b"")
+
+    result = await _transcribe_one("/tmp/fake.ogg", "audio/ogg", duration_sec=6)
+    assert result.text == "recovered at temp=1.0"
+    assert attempt_spy.await_count == 3  # temp=1.0 call did run
+
+
+@pytest.mark.asyncio
 async def test_two_5xx_in_a_row_surface_as_degraded(monkeypatch):
     """When the temp=1.0 attempt 5xxs AND the +1 retry-after-5xx also 5xxs,
     we convert the second 5xx to a TranscriptionDegradedError so the chunked
