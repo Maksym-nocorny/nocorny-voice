@@ -31,7 +31,7 @@ PORT = os.getenv("PORT")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # --- Gemini model ---
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
 TRANSCRIBE_MAX_TOKENS = _env_int("TRANSCRIBE_MAX_TOKENS", 8192)
 TRANSCRIBE_TEMPERATURE = _env_float("TRANSCRIBE_TEMPERATURE", 0.0)
 # Fallback temperature for a single semantic retry when the first attempt
