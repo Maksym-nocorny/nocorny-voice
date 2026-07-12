@@ -555,6 +555,14 @@ async def _attempt_transcribe(
     try:
         raw = (response.text or "").strip()
     except ValueError as e:
+        # Empty response.candidates + prompt_feedback.block_reason means Gemini
+        # refused the audio at the prompt gate (safety/prohibited/blocklist).
+        # Deterministic per file — subsequent retries at higher temperatures
+        # will get the same "no candidates" refusal, so we tag a distinct
+        # finish_reason and let the caller short-circuit those wasted calls.
+        if _has_no_candidates(response):
+            reason = _block_reason(response)
+            finish = f"prompt_blocked:{reason}" if reason else "prompt_blocked"
         logger.warning(
             "transcribe_response_text_failed duration=%s finish=%s exc=%s",
             duration_sec, finish, e,
@@ -637,6 +645,16 @@ async def _transcribe_one(
     try:
         return await _attempt_transcribe(model, audio_part, duration_sec)
     except retryable as e1:
+        # Prompt-level block (empty candidates + prompt_feedback.block_reason)
+        # is deterministic per file — the model refused the audio at the gate,
+        # not on sampling. Retrying at a different temperature gets the same
+        # "no candidates" refusal, so skip both temp=0.30 and temp=1.0 calls.
+        if _is_prompt_blocked(e1):
+            logger.info(
+                "transcribe_skip_retries_on_prompt_block duration=%s reason=%s",
+                duration_sec, getattr(e1, "finish_reason", ""),
+            )
+            raise
         logger.info(
             "transcribe_retry_jittered duration=%s temperature=%.2f first_attempt=%s",
             duration_sec, TRANSCRIBE_RETRY_TEMPERATURE, type(e1).__name__,
@@ -658,6 +676,15 @@ async def _transcribe_one(
                 logger.info(
                     "transcribe_skip_final_on_recitation duration=%s",
                     duration_sec,
+                )
+                raise
+            # Symmetric skip for prompt-level blocks that surface only on the
+            # jittered retry — same reasoning as the first-attempt short-circuit
+            # above: temp=1.0 can't unblock a prompt-gate refusal.
+            if _is_prompt_blocked(e2):
+                logger.info(
+                    "transcribe_skip_final_on_prompt_block duration=%s reason=%s",
+                    duration_sec, getattr(e2, "finish_reason", ""),
                 )
                 raise
             # Two MAX_TOKENS in a row at near-cap output means the model is
@@ -726,6 +753,40 @@ def _finish_reason(response) -> str:
     except Exception:  # noqa: BLE001
         pass
     return "unknown"
+
+
+def _is_prompt_blocked(exc: BaseException) -> bool:
+    """True when a degraded error came from an empty-candidates prompt-gate refusal."""
+    if not isinstance(exc, TranscriptionDegradedError):
+        return False
+    fr = getattr(exc, "finish_reason", None) or ""
+    return fr.startswith("prompt_blocked")
+
+
+def _has_no_candidates(response) -> bool:
+    try:
+        return not (getattr(response, "candidates", None) or [])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _block_reason(response) -> Optional[str]:
+    """Extract prompt-level block reason (only meaningful when candidates is empty)."""
+    try:
+        pf = getattr(response, "prompt_feedback", None)
+        if pf is None:
+            return None
+        br = getattr(pf, "block_reason", None)
+        if br is None:
+            return None
+        name = getattr(br, "name", None) or str(br)
+        # Filter out "unspecified"/"0" sentinels the SDK returns when the
+        # feedback field exists but the reason wasn't set.
+        if not name or name.upper() in {"UNSPECIFIED", "BLOCK_REASON_UNSPECIFIED", "0"}:
+            return None
+        return name
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _split_language_prefix(raw: str) -> Tuple[str, Optional[str]]:

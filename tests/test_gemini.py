@@ -444,6 +444,80 @@ async def test_chunked_all_success_has_zero_degraded_chunks(monkeypatch):
     assert result.degraded_chunks == 0
 
 
+@pytest.mark.asyncio
+async def test_prompt_blocked_short_circuits_first_attempt(monkeypatch):
+    """Repro of 2026-07-11 16:02 UTC (req=5c5c5211): an 18s voice returned an
+    empty response.candidates with a prompt-level block. The current code
+    retried at temp=0.30 and temp=1.0, both returning the same empty response
+    (3 billed calls, 3 identical failures). After the fix, a prompt_blocked
+    finish_reason on the first attempt skips both jittered + final retries."""
+    blocked = gemini_service.TranscriptionDegradedError(
+        "response.text raised: finish=prompt_blocked:SAFETY",
+        prompt_tokens=106, prompt_audio_tokens=106,
+        candidates_tokens=0, total_tokens=106,
+        finish_reason="prompt_blocked:SAFETY",
+    )
+    attempt_spy = AsyncMock(side_effect=[blocked])
+    monkeypatch.setattr(gemini_service, "_attempt_transcribe", attempt_spy)
+    monkeypatch.setattr(gemini_service, "_get_transcribe_model", lambda: object())
+    monkeypatch.setattr(gemini_service, "_read_file_bytes", lambda _p: b"")
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
+        await _transcribe_one("/tmp/fake.ogg", "audio/ogg", duration_sec=18)
+    assert exc_info.value.finish_reason == "prompt_blocked:SAFETY"
+    assert attempt_spy.await_count == 1  # neither temp=0.30 nor temp=1.0 ran
+
+
+@pytest.mark.asyncio
+async def test_prompt_blocked_short_circuits_second_attempt(monkeypatch):
+    """Defensive symmetric skip: if the jittered retry surfaces prompt_blocked
+    (unusual — block reason is deterministic per file — but possible when the
+    first attempt was a transient 5xx that hid the underlying refusal), skip
+    the final temp=1.0 attempt too."""
+    from google.api_core import exceptions
+
+    blocked = gemini_service.TranscriptionDegradedError(
+        "response.text raised: finish=prompt_blocked:PROHIBITED_CONTENT",
+        finish_reason="prompt_blocked:PROHIBITED_CONTENT",
+    )
+    attempt_spy = AsyncMock(side_effect=[exceptions.ServiceUnavailable("503"), blocked])
+    monkeypatch.setattr(gemini_service, "_attempt_transcribe", attempt_spy)
+    monkeypatch.setattr(gemini_service, "_get_transcribe_model", lambda: object())
+    monkeypatch.setattr(gemini_service, "_read_file_bytes", lambda _p: b"")
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
+        await _transcribe_one("/tmp/fake.ogg", "audio/ogg", duration_sec=60)
+    assert exc_info.value.finish_reason == "prompt_blocked:PROHIBITED_CONTENT"
+    assert attempt_spy.await_count == 2  # temp=1.0 skipped
+
+
+def test_block_reason_extracts_named_enum():
+    class FakeReason:
+        name = "SAFETY"
+    class FakeFeedback:
+        block_reason = FakeReason()
+    class FakeResponse:
+        prompt_feedback = FakeFeedback()
+    assert gemini_service._block_reason(FakeResponse()) == "SAFETY"
+
+
+def test_block_reason_filters_unspecified_sentinel():
+    class FakeReason:
+        name = "BLOCK_REASON_UNSPECIFIED"
+    class FakeFeedback:
+        block_reason = FakeReason()
+    class FakeResponse:
+        prompt_feedback = FakeFeedback()
+    assert gemini_service._block_reason(FakeResponse()) is None
+
+
+def test_block_reason_returns_none_when_missing():
+    class FakeResponse:
+        prompt_feedback = None
+    assert gemini_service._block_reason(FakeResponse()) is None
+    assert gemini_service._block_reason(object()) is None
+
+
 def test_finish_reason_defaults_to_none():
     # Backwards-compatible default: missing finish_reason behaves like "not STOP",
     # so the soft rate signal still fires (preserves prior behavior on callers
