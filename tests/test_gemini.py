@@ -528,3 +528,87 @@ def test_finish_reason_defaults_to_none():
     assert _is_likely_loop(out_tokens=800, duration_sec=50, max_tokens=8192)
     # 200/50 = 4 tok/s — well below soft threshold even with no finish_reason.
     assert not _is_likely_loop(out_tokens=200, duration_sec=50, max_tokens=8192)
+
+
+# --- _retry: 429 waits longer than 5xx (incident 30.07-31.07.2026) ---
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_gets_the_long_ladder(monkeypatch):
+    """A throttled free-tier window lasts minutes, so ResourceExhausted must
+    survive far more than the ~3.5 s the old shared ladder allowed. With the
+    defaults (4 attempts, base 2.0) that is 5 calls and ~30 s of waiting."""
+    from google.api_core import exceptions
+
+    slept: list[float] = []
+
+    async def _fake_sleep(delay):
+        slept.append(delay)
+
+    monkeypatch.setattr(gemini_service.asyncio, "sleep", _fake_sleep)
+    call = AsyncMock(side_effect=exceptions.ResourceExhausted("429"))
+
+    with pytest.raises(gemini_service.RateLimitedError):
+        await gemini_service._retry(call)
+
+    assert call.await_count == 5                      # first try + 4 retries
+    assert len(slept) == 4
+    assert 28 <= sum(slept) <= 32                     # 2+4+8+16 + jitter ≤ 0.5 each
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_recovers_mid_ladder(monkeypatch):
+    """The point of the longer ladder: a 429 that clears after a few seconds
+    now returns a transcription instead of "try later"."""
+    from google.api_core import exceptions
+
+    monkeypatch.setattr(gemini_service.asyncio, "sleep", AsyncMock())
+    call = AsyncMock(side_effect=[
+        exceptions.ResourceExhausted("429"),
+        exceptions.ResourceExhausted("429"),
+        "transcribed",
+    ])
+
+    assert await gemini_service._retry(call) == "transcribed"
+    assert call.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_5xx_keeps_the_short_ladder(monkeypatch):
+    """ServiceUnavailable must NOT inherit the long wait: _transcribe_one
+    retries 5xx again at other temperatures, so a long inner wait would
+    multiply across that outer ladder."""
+    from google.api_core import exceptions
+
+    slept: list[float] = []
+
+    async def _fake_sleep(delay):
+        slept.append(delay)
+
+    monkeypatch.setattr(gemini_service.asyncio, "sleep", _fake_sleep)
+    call = AsyncMock(side_effect=exceptions.ServiceUnavailable("503"))
+
+    with pytest.raises(gemini_service.RateLimitedError):
+        await gemini_service._retry(call)
+
+    assert call.await_count == 3                      # first try + 2 retries
+    assert sum(slept) <= 4                            # 1+2 + jitter
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_after_5xx_switches_to_long_budget(monkeypatch):
+    """Budget follows the LAST exception: a 429 arriving after a 5xx still gets
+    the long treatment instead of dying on the short 5xx budget."""
+    from google.api_core import exceptions
+
+    monkeypatch.setattr(gemini_service.asyncio, "sleep", AsyncMock())
+    call = AsyncMock(side_effect=[
+        exceptions.ServiceUnavailable("503"),
+        exceptions.ResourceExhausted("429"),
+        exceptions.ResourceExhausted("429"),
+        exceptions.ResourceExhausted("429"),
+        "transcribed",
+    ])
+
+    assert await gemini_service._retry(call) == "transcribed"
+    assert call.await_count == 5

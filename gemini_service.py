@@ -22,6 +22,8 @@ from google.api_core import exceptions
 from config import (
     FFMPEG_PATH,
     GEMINI_API_KEY,
+    GEMINI_RATE_LIMIT_RETRY_ATTEMPTS,
+    GEMINI_RATE_LIMIT_RETRY_BASE_DELAY,
     GEMINI_RETRY_ATTEMPTS,
     GEMINI_RETRY_BASE_DELAY,
     MODEL_NAME,
@@ -253,24 +255,44 @@ async def _retry(
     *,
     attempts: int = GEMINI_RETRY_ATTEMPTS,
     base_delay: float = GEMINI_RETRY_BASE_DELAY,
+    rate_limit_attempts: int = GEMINI_RATE_LIMIT_RETRY_ATTEMPTS,
+    rate_limit_base_delay: float = GEMINI_RATE_LIMIT_RETRY_BASE_DELAY,
 ):
+    """Retry transient Gemini failures; 429 gets a longer ladder than 5xx.
+
+    ResourceExhausted on the free tier is not only "quota exceeded" — it is
+    also "no spare capacity right now", and that window lasts minutes. The
+    30.07-31.07.2026 wave killed 15 transcriptions with a ~3.5 s ladder while
+    requests a minute apart still succeeded, so 429 now waits ~30 s. 5xx keeps
+    the short budget on purpose: _transcribe_one retries those at other
+    temperatures, and a long inner wait would multiply across that ladder.
+
+    The budget is picked from the LAST exception seen, so a 429 arriving after
+    a couple of 5xx still gets the long treatment (with the delay continuing to
+    grow from the current attempt, not restarting).
+    """
     last_exc: Optional[BaseException] = None
-    for attempt in range(attempts + 1):
+    attempt = 0
+    while True:
         try:
             return await coro_factory()
         except _RETRY_EXCEPTIONS as e:
             last_exc = e
-            if attempt >= attempts:
+            rate_limited = isinstance(e, exceptions.ResourceExhausted)
+            budget = rate_limit_attempts if rate_limited else attempts
+            base = rate_limit_base_delay if rate_limited else base_delay
+            if attempt >= budget:
                 break
-            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+            delay = base * (2 ** attempt) + random.uniform(0, 0.5)
             logger.warning(
                 "gemini_retry attempt=%d/%d delay=%.2f exc=%s",
                 attempt + 1,
-                attempts,
+                budget,
                 delay,
                 type(e).__name__,
             )
             await asyncio.sleep(delay)
+            attempt += 1
     raise RateLimitedError(str(last_exc) if last_exc else "rate limited")
 
 

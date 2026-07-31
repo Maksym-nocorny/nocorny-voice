@@ -76,6 +76,17 @@ PRICE_PER_1M_OUTPUT_TOKENS = _env_float("PRICE_PER_1M_OUTPUT_TOKENS", 0.40)
 GEMINI_RETRY_ATTEMPTS = _env_int("GEMINI_RETRY_ATTEMPTS", 2)
 GEMINI_RETRY_BASE_DELAY = _env_float("GEMINI_RETRY_BASE_DELAY", 1.0)
 
+# Rate limits (429) get their own, longer ladder. On the free tier
+# ResourceExhausted also means "no spare capacity right now", and such a window
+# lasts minutes: on 30.07-31.07.2026 a 4.5-hour wave killed 15 transcriptions
+# while requests a minute apart still went through. 4 attempts at base 2.0 wait
+# 2+4+8+16 ≈ 30 s (plus jitter) before the user is told to try later — the user
+# is already watching a "transcribing" status, so a slow answer beats a refusal.
+# 5xx keeps the short ladder above: _transcribe_one retries those again, so a
+# long inner wait would multiply there.
+GEMINI_RATE_LIMIT_RETRY_ATTEMPTS = _env_int("GEMINI_RATE_LIMIT_RETRY_ATTEMPTS", 4)
+GEMINI_RATE_LIMIT_RETRY_BASE_DELAY = _env_float("GEMINI_RATE_LIMIT_RETRY_BASE_DELAY", 2.0)
+
 # --- Media limits ---
 MAX_DURATION_SEC = _env_int("MAX_DURATION_SEC", 1800)        # 30 min
 MAX_FILE_SIZE_MB = _env_int("MAX_FILE_SIZE_MB", 20)
