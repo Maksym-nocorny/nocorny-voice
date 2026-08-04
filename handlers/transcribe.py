@@ -32,6 +32,7 @@ from config import (
     TELEGRAM_MAX_MESSAGE_LEN,
 )
 from i18n import get_text
+from utils import mem_guard
 from utils.logging_setup import new_request_id, set_chat, set_user
 from utils.markdown import chunk_text, escape_html
 
@@ -244,6 +245,10 @@ def _validation_error(info: _MediaInfo, user_lang: str) -> Optional[Tuple[str, s
     return None
 
 
+# track_inflight: while any media message is being processed the memory guard
+# will not restart the process — a restart mid-flight silently kills the
+# transcription (Telegram never resends an update the webhook already ACKed).
+@mem_guard.track_inflight
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -477,11 +482,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             error_class=type(e).__name__,
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
-    except google_exceptions.PermissionDenied as e:
+    except google_exceptions.Forbidden as e:
         # Gemini API blocked the account (billing dunning, API key revoked, or
         # geo-block). Not a bug — no traceback. User sees "temporarily
         # unavailable" instead of the generic "an error occurred", and analytics
-        # keeps the PermissionDenied class so /stats trends this cluster.
+        # keeps the exception class so /stats trends this cluster. Forbidden is
+        # the HTTP-403 parent of PermissionDenied: grpc transport raises the
+        # child, rest raises the parent — catching the parent covers both.
+        # (This is google_exceptions.Forbidden — unrelated to telegram.error
+        # .Forbidden caught above.)
         logger.warning("transcribe_gemini_permission_denied msg=%s", str(e)[:200])
         analytics.track(
             "error_unknown", user=user, chat=chat, info=info, result=result,

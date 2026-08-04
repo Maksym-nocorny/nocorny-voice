@@ -28,7 +28,7 @@ from config import (
 from handlers.start import start
 from handlers.stats import stats_callback, stats_command
 from handlers.transcribe import handle_message
-from utils import keep_alive
+from utils import keep_alive, mem_guard
 from utils.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -39,9 +39,16 @@ async def _post_init(app: Application) -> None:
     # Only meaningful in webhook mode (Render); local polling needs no anti-sleep.
     if PORT and WEBHOOK_URL:
         keep_alive.start(WEBHOOK_URL, interval_sec=KEEP_ALIVE_INTERVAL_SEC)
+        # Controlled restart before Render's 512Mi OOM kill (incident
+        # 2026-08-04). Webhook mode only: locally there is no supervisor to
+        # bring the process back. busy_fn counts updates Telegram already got
+        # a 200 for but a handler hasn't picked up yet — exiting would lose
+        # those exactly like an OOM kill would.
+        mem_guard.start(busy_fn=lambda: app.update_queue.qsize())
 
 
 async def _post_shutdown(app: Application) -> None:
+    await mem_guard.stop()
     await keep_alive.stop()
     await analytics.close()
 

@@ -22,6 +22,20 @@ def _env_float(key: str, default: float) -> float:
     return float(raw)
 
 
+def _env_int_empty_off(key: str, default: int) -> int:
+    """Like _env_int, but distinguishes "unset" from "explicitly empty":
+    an UNSET variable keeps the default, while an empty value (or "0") means
+    the feature is switched OFF. Used for kill-switch thresholds where flipping
+    the value in Render must disable the mechanism without a deploy.
+    """
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    if raw.strip() == "":
+        return 0
+    return int(raw)
+
+
 # --- Required secrets ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -32,6 +46,14 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # --- Gemini model ---
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+# SDK transport: "rest", "grpc" or "grpc_asyncio" (google-generativeai 0.8.5
+# accepts it as genai.configure(transport=...)). Default is "rest" — the
+# 2026-08-04 OOM incident experiment: the gRPC C-core keeps native buffer
+# pools outside the Python GC and is the prime suspect for the ~0.7 MB-per-
+# transcription RSS leak that has OOM-killed the service nine times since
+# June. REST keeps the whole request in plain Python HTTP. Roll back by
+# setting GEMINI_TRANSPORT=grpc in Render — a value change, not a deploy.
+GEMINI_TRANSPORT = os.getenv("GEMINI_TRANSPORT") or "rest"
 TRANSCRIBE_MAX_TOKENS = _env_int("TRANSCRIBE_MAX_TOKENS", 8192)
 TRANSCRIBE_TEMPERATURE = _env_float("TRANSCRIBE_TEMPERATURE", 0.0)
 # Fallback temperature for a single semantic retry when the first attempt
@@ -113,6 +135,23 @@ TELEGRAM_MAX_MESSAGE_LEN = _env_int("TELEGRAM_MAX_MESSAGE_LEN", 4000)
 # margin under the 15-min timeout even if a ping or two is dropped. This pings the
 # bot's OWN URL only — never the DB, so it costs zero Neon compute hours.
 KEEP_ALIVE_INTERVAL_SEC = _env_float("KEEP_ALIVE_INTERVAL_SEC", 300.0)
+
+# --- Memory guard (controlled restart before Render's 512Mi OOM kill) ---
+# Render Free OOM-kills the process at 512 MiB with no drain: transcriptions
+# in flight die silently (Telegram never resends an update the webhook already
+# ACKed). Nine OOM kills in Jun-Aug 2026 trace to a slow leak of ~0.7 MB per
+# transcription (see dispatcher incident 2026-08-04-oom-restart.md). Until the
+# leak itself is fixed, utils/mem_guard.py watches our RSS and — once it
+# crosses the threshold AND nothing is in flight — exits cleanly so Render
+# restarts us at a provably quiet moment instead of the kernel killing us at a
+# random one. Unset -> 400 (guard on by default); 0 or empty -> guard off.
+# Both knobs work from Render env without a deploy.
+MEM_GUARD_THRESHOLD_MB = _env_int_empty_off("MEM_GUARD_THRESHOLD_MB", 400)
+MEM_GUARD_CHECK_INTERVAL_SEC = _env_float("MEM_GUARD_CHECK_INTERVAL_SEC", 300.0)
+# Restart-loop brake: the guard never fires during the first N seconds of a
+# process's life. Even a threshold misconfigured below the ~120 MB baseline
+# degrades to one clean restart per this interval, never a tight crash loop.
+MEM_GUARD_MIN_UPTIME_SEC = _env_float("MEM_GUARD_MIN_UPTIME_SEC", 1800.0)
 
 # --- Analytics (Neon Postgres) ---
 # Set DATABASE_URL to enable analytics. Bot runs fine without it (track() becomes a no-op).

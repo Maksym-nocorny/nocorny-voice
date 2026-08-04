@@ -26,6 +26,7 @@ from config import (
     GEMINI_RATE_LIMIT_RETRY_BASE_DELAY,
     GEMINI_RETRY_ATTEMPTS,
     GEMINI_RETRY_BASE_DELAY,
+    GEMINI_TRANSPORT,
     MODEL_NAME,
     TRANSCRIBE_CHUNK_CONCURRENCY,
     TRANSCRIBE_CHUNK_SEC,
@@ -53,7 +54,15 @@ _TRANSCRIBE_INSTRUCTION = (
 
 _LANG_PREFIX = "LANG:"
 
-_RETRY_EXCEPTIONS = (exceptions.ResourceExhausted, exceptions.ServiceUnavailable)
+# TRANSPORT NOTE: google.api_core raises DIFFERENT (parent vs child) classes
+# depending on GEMINI_TRANSPORT. Under grpc it maps gRPC status codes to the
+# child classes (429 -> ResourceExhausted, 504 -> DeadlineExceeded,
+# 403 -> PermissionDenied); under rest it maps HTTP status codes to their
+# PARENTS (429 -> TooManyRequests, 504 -> GatewayTimeout, 403 -> Forbidden).
+# Every catch in this codebase therefore uses the HTTP-level parent class:
+# a strict superset, so behaviour under grpc is unchanged, and under rest the
+# retry ladders keep working instead of silently dying.
+_RETRY_EXCEPTIONS = (exceptions.TooManyRequests, exceptions.ServiceUnavailable)
 
 _SAFETY_BLOCK_NONE = {
     "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
@@ -119,7 +128,12 @@ def _configure_once() -> None:
         return
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
-    genai.configure(api_key=GEMINI_API_KEY)
+    # transport="rest" (default) is the 2026-08-04 OOM-incident experiment:
+    # the gRPC C-core keeps native buffer pools outside the Python GC and is
+    # the prime suspect for the ~0.7 MB-per-call RSS leak. Roll back with
+    # GEMINI_TRANSPORT=grpc in Render env — no deploy needed. See the
+    # TRANSPORT NOTE above _RETRY_EXCEPTIONS for the error-class implications.
+    genai.configure(api_key=GEMINI_API_KEY, transport=GEMINI_TRANSPORT)
     _configured = True
 
 
@@ -278,7 +292,9 @@ async def _retry(
             return await coro_factory()
         except _RETRY_EXCEPTIONS as e:
             last_exc = e
-            rate_limited = isinstance(e, exceptions.ResourceExhausted)
+            # TooManyRequests covers both grpc ResourceExhausted (its
+            # subclass) and rest HTTP 429 — see TRANSPORT NOTE above.
+            rate_limited = isinstance(e, exceptions.TooManyRequests)
             budget = rate_limit_attempts if rate_limited else attempts
             base = rate_limit_base_delay if rate_limited else base_delay
             if attempt >= budget:
@@ -465,12 +481,14 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Re-raise the first hard error if any chunk failed unrecoverably.
-    # PermissionDenied travels alongside the internal errors: it's a hard
-    # account-level block (billing/dunning), never a per-chunk hiccup, so
-    # bucketing it as "all_chunks_degraded" would hide the real signal.
+    # Forbidden (grpc raises its subclass PermissionDenied, rest raises
+    # Forbidden itself for HTTP 403 — see TRANSPORT NOTE) travels alongside
+    # the internal errors: it's a hard account-level block (billing/dunning),
+    # never a per-chunk hiccup, so bucketing it as "all_chunks_degraded"
+    # would hide the real signal.
     for r in results:
         if isinstance(r, (RateLimitedError, ProcessingFailedError,
-                          exceptions.PermissionDenied)):
+                          exceptions.Forbidden)):
             raise r
 
     # Surviving chunks (degraded ones contribute a placeholder). Token totals
@@ -644,11 +662,13 @@ async def _transcribe_one(
     audio_bytes = await asyncio.to_thread(_read_file_bytes, file_path)
     audio_part = {"mime_type": mime_type, "data": audio_bytes}
 
+    # GatewayTimeout is DeadlineExceeded's parent — covers grpc DEADLINE_EXCEEDED
+    # and rest HTTP 504 alike (see TRANSPORT NOTE above _RETRY_EXCEPTIONS).
     retryable = (
         TranscriptionDegradedError,
         exceptions.InternalServerError,
         exceptions.ServiceUnavailable,
-        exceptions.DeadlineExceeded,
+        exceptions.GatewayTimeout,
     )
 
     # Transient Gemini server-side errors (NOT TranscriptionDegradedError, which
@@ -660,7 +680,7 @@ async def _transcribe_one(
     transient_5xx = (
         exceptions.InternalServerError,
         exceptions.ServiceUnavailable,
-        exceptions.DeadlineExceeded,
+        exceptions.GatewayTimeout,
     )
 
     model = _get_transcribe_model()
