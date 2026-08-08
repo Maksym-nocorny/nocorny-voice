@@ -415,6 +415,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _safe_edit(status_message, get_text(user_lang, "transcribe_degraded"))
             return
 
+        # Gemini can return success with nothing in it (silence, pure noise, or a
+        # response that got filtered without raising TranscriptionDegradedError).
+        # `transcription_label` is "{}", so an empty transcript builds an empty
+        # message and Telegram answers 400 "Message text is empty" — the user gets
+        # no reply at all. Treat it as a degradation with a real answer instead.
+        # The tokens were still billed, so keep the usage on `result`.
+        if not result.text.strip():
+            logger.warning(
+                "transcribe_empty_text mime=%s duration=%s size=%s",
+                info.mime_type, info.duration, info.file_size,
+            )
+            analytics.track(
+                "transcribe_degraded", user=user, chat=chat, info=info, result=result,
+                error_class="empty_text",
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+            await _safe_edit(status_message, get_text(user_lang, "transcribe_degraded"))
+            return
+
         cache.store_transcription(info.file_unique_id, result.text, result.detected_language)
         cache.fire_and_forget_store_by_hash(
             content_hash, result.text, result.detected_language

@@ -210,6 +210,64 @@ async def test_cache_hit_skips_gemini_and_responds(monkeypatch):
     assert sent_call.kwargs.get("parse_mode") == "HTML"
 
 
+# ------------------------------------------------------------ Empty transcription
+# Regression guard for 08.08.2026: an empty transcript was cached, then replayed
+# on every retry as an empty Telegram message (400 "Message text is empty"),
+# leaving the user with no reply at all and no way out.
+
+
+async def test_empty_transcription_is_not_cached_and_warns_user(monkeypatch):
+    from handlers import transcribe as t
+
+    fake_result = GeminiResult(text="   ", prompt_tokens=10, candidates_tokens=0, total_tokens=10)
+    transcribe_mock = AsyncMock(return_value=fake_result)
+    monkeypatch.setattr(gemini_service, "transcribe", transcribe_mock)
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+
+    # The user gets a real answer, not an empty message.
+    final_call = status.edit_text.await_args_list[-1]
+    assert final_call.args[0].strip()
+    # Nothing blank was ever handed to Telegram (the 400 that started this).
+    for call in update.message.reply_text.call_args_list:
+        assert call.args[0].strip()
+    for call in status.edit_text.await_args_list:
+        assert call.args[0].strip()
+    # Nothing blank made it into the cache, so a retry re-asks Gemini.
+    assert cache.get_transcription("uniq_a") is None
+
+
+async def test_blank_cache_entry_is_treated_as_miss(monkeypatch):
+    """L2 rows poisoned before the guard existed must not replay forever."""
+    from handlers import transcribe as t
+
+    fake_result = GeminiResult(text="second time lucky", prompt_tokens=10,
+                               candidates_tokens=5, total_tokens=15)
+    transcribe_mock = AsyncMock(return_value=fake_result)
+    monkeypatch.setattr(gemini_service, "transcribe", transcribe_mock)
+
+    # Force a blank straight into the L1 store, bypassing the write guard.
+    cache.transcription_cache["uniq_a"] = cache.CachedTranscription("", "en")
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+
+    # Blank hit was ignored: Gemini ran and the real text reached the user.
+    transcribe_mock.assert_awaited_once()
+    assert "second time lucky" in status.edit_text.await_args_list[-1].args[0]
+
+
+def test_cache_refuses_to_store_blank_text():
+    cache.clear_all()
+    cache.store_transcription("uniq_blank", "", "en")
+    assert cache.get_transcription("uniq_blank") is None
+    cache.store_transcription("uniq_ws", "\n\t  ", "en")
+    assert cache.get_transcription("uniq_ws") is None
+    cache.store_transcription("uniq_ok", "real text", "en")
+    assert cache.get_transcription("uniq_ok").text == "real text"
+
+
 # --------------------------------------------------------------------- Successful flow
 
 

@@ -33,16 +33,36 @@ class CachedTranscription:
 transcription_cache: TTLCache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SEC)
 
 
+# A blank transcription is never a usable answer: Telegram rejects an empty
+# message ("Message text is empty"), so caching one poisons every later retry
+# of the same audio — the handler short-circuits on the cache hit and fails
+# again without ever re-asking Gemini. Seen live 08.08.2026: one voice message
+# left a user with no reply at all, permanently. Both cache layers therefore
+# refuse to store blanks AND refuse to return them, so rows already poisoned
+# before this guard existed (L2 survives restarts) degrade to a normal miss.
+def _is_blank(text: Optional[str]) -> bool:
+    return not text or not text.strip()
+
+
 # --- L1 (in-memory, by file_unique_id) ---
 
 def store_transcription(
     file_unique_id: str, text: str, detected_language: Optional[str] = None
 ) -> None:
+    if _is_blank(text):
+        logger.warning("cache_skip_blank_store file_unique_id=%s", file_unique_id)
+        return
     transcription_cache[file_unique_id] = CachedTranscription(text, detected_language)
 
 
 def get_transcription(file_unique_id: str) -> Optional[CachedTranscription]:
-    return transcription_cache.get(file_unique_id)
+    cached = transcription_cache.get(file_unique_id)
+    if cached is not None and _is_blank(cached.text):
+        # Poisoned before the guard landed — drop it and report a miss.
+        logger.warning("cache_evict_blank file_unique_id=%s", file_unique_id)
+        transcription_cache.pop(file_unique_id, None)
+        return None
+    return cached
 
 
 def remove_transcription(file_unique_id: str) -> None:
@@ -73,12 +93,21 @@ RETURNING text, detected_language
 
 # Backfill detected_language on second-and-later inserts where the first insert
 # happened before language detection existed.
+# `text` is normally left alone (the stored transcription is the source of
+# truth), with one exception: a row that is blank was written by the pre-guard
+# bug and can never be served — get_by_hash treats it as a miss forever, so
+# without this heal every retry of that audio pays for Gemini again. Overwrite
+# blank rows with the fresh text; non-blank rows keep theirs.
 _STORE_BY_HASH_SQL = """
 INSERT INTO nocorny_voice.transcription_cache (content_hash, text, detected_language)
 VALUES ($1, $2, $3)
 ON CONFLICT (content_hash) DO UPDATE
 SET last_hit_at = now(),
     hit_count = nocorny_voice.transcription_cache.hit_count + 1,
+    text = CASE
+        WHEN btrim(nocorny_voice.transcription_cache.text) = '' THEN EXCLUDED.text
+        ELSE nocorny_voice.transcription_cache.text
+    END,
     detected_language = COALESCE(
         nocorny_voice.transcription_cache.detected_language, EXCLUDED.detected_language
     )
@@ -99,6 +128,11 @@ async def get_by_hash(content_hash: str) -> Optional[CachedTranscription]:
         return None
     if row is None:
         return None
+    if _is_blank(row["text"]):
+        # Blank row written before the guard existed. Treated as a miss so the
+        # audio gets a fresh Gemini pass instead of replaying the empty answer.
+        logger.warning("cache_l2_blank_ignored hash=%s", content_hash[:12])
+        return None
     return CachedTranscription(row["text"], row["detected_language"])
 
 
@@ -107,6 +141,9 @@ async def store_by_hash(
 ) -> None:
     """L2 store. No-op if L2 disabled or Postgres unavailable; swallows errors."""
     if CACHE_L2_TTL_DAYS <= 0:
+        return
+    if _is_blank(text):
+        logger.warning("cache_l2_skip_blank_store hash=%s", content_hash[:12])
         return
     p = analytics_pool.get()
     if p is None:
