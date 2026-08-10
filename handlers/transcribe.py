@@ -434,10 +434,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _safe_edit(status_message, get_text(user_lang, "transcribe_degraded"))
             return
 
-        cache.store_transcription(info.file_unique_id, result.text, result.detected_language)
-        cache.fire_and_forget_store_by_hash(
-            content_hash, result.text, result.detected_language
-        )
+        # Cache only complete results. A partially-degraded transcript (some
+        # chunks lost to PROHIBITED_CONTENT/RECITATION/loops, "[фрагмент N: ...]"
+        # placeholders spliced in) is still worth sending — but caching it makes
+        # the loss permanent: L2 keeps it 14 days keyed by content hash, so every
+        # re-send of the same audio would replay the crippled text without ever
+        # re-asking Gemini. Seen live 10.08.2026. Skipping the cache keeps a
+        # re-send a fresh attempt — for a deterministic refusal like
+        # PROHIBITED_CONTENT that attempt will lose the same chunk again, which
+        # is fine: the goal is to keep the state reversible, not to farm retries.
+        # Same bug class as the 08.08.2026 empty-transcription incident;
+        # cache.py carries matching read guards so rows poisoned before this
+        # landed degrade to a miss.
+        if result.degraded_chunks == 0:
+            cache.store_transcription(
+                info.file_unique_id, result.text, result.detected_language
+            )
+            cache.fire_and_forget_store_by_hash(
+                content_hash, result.text, result.detected_language
+            )
+        else:
+            logger.warning(
+                "transcribe_skip_cache_partial degraded_chunks=%s mime=%s duration=%s",
+                result.degraded_chunks, info.mime_type, info.duration,
+            )
         analytics.track(
             "transcribe_success", user=user, chat=chat, info=info, result=result,
             latency_ms=int((time.monotonic() - t0) * 1000),

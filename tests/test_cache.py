@@ -141,3 +141,65 @@ async def test_store_by_hash_defaults_language_to_none():
         await cache.store_by_hash("hash_xyz", "the transcript")
     fake_pool.execute.assert_awaited_once()
     assert fake_pool.execute.await_args.args[3] is None
+
+
+# --- Partially degraded transcripts (placeholder fragments) ---
+# Regression guards for 10.08.2026: a transcript that lost chunks carries
+# "[фрагмент N: не вдалося розпізнати]" placeholders and must never be cached
+# or served from cache — otherwise the loss is irreversible for 14 days (L2).
+
+_PARTIAL = "перша половина тексту\n[фрагмент 2: не вдалося розпізнати]"
+# Variant produced by split-chunk salvaging (WIP in gemini_service): extra
+# detail between the fragment number and the colon.
+_PARTIAL_SPLIT = "текст\n[фрагмент 1, частина 2: не вдалося розпізнати]"
+
+
+def test_cache_refuses_to_store_partially_degraded_text():
+    cache.store_transcription("uniq_part", _PARTIAL, "uk")
+    assert cache.get_transcription("uniq_part") is None
+
+
+def test_degraded_marker_variant_with_part_number_is_detected():
+    cache.store_transcription("uniq_split", _PARTIAL_SPLIT, "uk")
+    assert cache.get_transcription("uniq_split") is None
+
+
+def test_degraded_l1_entry_from_before_guard_is_evicted():
+    # Force a pre-guard partial entry straight into L1, bypassing the write guard.
+    cache.transcription_cache["uniq_old"] = CachedTranscription(_PARTIAL, "uk")
+    assert cache.get_transcription("uniq_old") is None
+    assert "uniq_old" not in cache.transcription_cache
+
+
+def test_text_mentioning_fragments_is_not_mistaken_for_marker():
+    # A transcript that merely talks about fragments must still be cached.
+    text = "у другому фрагменті лекції не вдалося розпізнати акцент доповідача"
+    cache.store_transcription("uniq_talk", text, "uk")
+    assert cache.get_transcription("uniq_talk").text == text
+
+
+@pytest.mark.asyncio
+async def test_get_by_hash_ignores_degraded_row():
+    fake_pool = AsyncMock()
+    fake_pool.fetchrow = AsyncMock(
+        return_value={"text": _PARTIAL, "detected_language": "uk"}
+    )
+    with patch("cache.analytics_pool.get", return_value=fake_pool):
+        assert await cache.get_by_hash("abc123") is None
+
+
+@pytest.mark.asyncio
+async def test_store_by_hash_skips_degraded_text():
+    fake_pool = AsyncMock()
+    fake_pool.execute = AsyncMock()
+    with patch("cache.analytics_pool.get", return_value=fake_pool):
+        await cache.store_by_hash("abc123", _PARTIAL, "uk")
+    fake_pool.execute.assert_not_awaited()
+
+
+def test_store_by_hash_sql_heals_blank_and_degraded_rows():
+    # The ON CONFLICT heal must target both poisoned shapes, or old rows are
+    # never replaced by a clean retry (get_by_hash misses them forever and every
+    # re-send pays for Gemini again).
+    assert "btrim(nocorny_voice.transcription_cache.text) = ''" in cache._STORE_BY_HASH_SQL
+    assert "LIKE '%[фрагмент %: не вдалося розпізнати]%'" in cache._STORE_BY_HASH_SQL

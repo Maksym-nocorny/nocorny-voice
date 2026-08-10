@@ -268,6 +268,79 @@ def test_cache_refuses_to_store_blank_text():
     assert cache.get_transcription("uniq_ok").text == "real text"
 
 
+# ------------------------------------------------ Partially degraded transcription
+# Regression guard for 10.08.2026: Gemini refused one chunk (PROHIBITED_CONTENT),
+# and the partial text — with its "[фрагмент N: не вдалося розпізнати]"
+# placeholder — was cached in L1 and L2 (14 days, keyed by content hash). Every
+# re-send of the same audio then replayed the crippled text without re-asking
+# Gemini, so the user could never get the missing half back. The partial text
+# must still reach the user, but must never reach the cache.
+
+
+async def test_partially_degraded_result_is_sent_but_not_cached(monkeypatch):
+    from handlers import transcribe as t
+
+    partial = GeminiResult(
+        text="part 1\n[фрагмент 2: не вдалося розпізнати]",
+        prompt_tokens=100, candidates_tokens=20, total_tokens=120,
+        prompt_audio_tokens=80, degraded_chunks=1,
+    )
+    monkeypatch.setattr(gemini_service, "transcribe", AsyncMock(return_value=partial))
+    l2_spy = MagicMock()
+    monkeypatch.setattr(cache, "fire_and_forget_store_by_hash", l2_spy)
+
+    update, context, status, _ = _make_update_context(voice=_make_voice(duration=300))
+    await t.handle_message(update, context)
+
+    # The user still gets the partial transcript...
+    assert "part 1" in status.edit_text.await_args_list[-1].args[0]
+    # ...but neither cache layer stores it, so a re-send is a fresh attempt.
+    assert cache.get_transcription("uniq_a") is None
+    l2_spy.assert_not_called()
+
+
+async def test_fully_successful_result_is_cached_in_both_layers(monkeypatch):
+    """Counterpart: degraded_chunks == 0 must keep caching in BOTH layers."""
+    from handlers import transcribe as t
+
+    full = GeminiResult(
+        text="all good", prompt_tokens=10, candidates_tokens=5, total_tokens=15,
+        degraded_chunks=0,
+    )
+    monkeypatch.setattr(gemini_service, "transcribe", AsyncMock(return_value=full))
+    l2_spy = MagicMock()
+    monkeypatch.setattr(cache, "fire_and_forget_store_by_hash", l2_spy)
+
+    update, context, _status, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+
+    assert cache.get_transcription("uniq_a").text == "all good"
+    l2_spy.assert_called_once()
+    assert l2_spy.call_args.args[1] == "all good"
+
+
+async def test_degraded_l1_entry_is_treated_as_miss_by_handler(monkeypatch):
+    """L1 entries poisoned before the guard existed must not short-circuit the
+    handler into replaying the crippled text — Gemini must be asked again."""
+    from handlers import transcribe as t
+
+    fresh = GeminiResult(text="full text this time", prompt_tokens=10,
+                         candidates_tokens=5, total_tokens=15)
+    transcribe_mock = AsyncMock(return_value=fresh)
+    monkeypatch.setattr(gemini_service, "transcribe", transcribe_mock)
+
+    # Force a pre-guard partial entry straight into L1, bypassing the write guard.
+    cache.transcription_cache["uniq_a"] = cache.CachedTranscription(
+        "half\n[фрагмент 2: не вдалося розпізнати]", "uk"
+    )
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+
+    transcribe_mock.assert_awaited_once()
+    assert "full text this time" in status.edit_text.await_args_list[-1].args[0]
+
+
 # --------------------------------------------------------------------- Successful flow
 
 

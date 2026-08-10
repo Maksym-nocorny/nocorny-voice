@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -44,6 +45,29 @@ def _is_blank(text: Optional[str]) -> bool:
     return not text or not text.strip()
 
 
+# A partially-degraded transcription is worth SENDING but never worth CACHING.
+# When a chunked transcribe loses fragments (Gemini PROHIBITED_CONTENT,
+# RECITATION, loop detection), gemini_service splices in placeholder lines like
+# "[фрагмент 2: не вдалося розпізнати]" and the handler still delivers the rest.
+# Caching that text makes the loss permanent: L2 keeps it for 14 days keyed by
+# content hash, so every re-send of the same audio short-circuits on the hit and
+# replays the crippled half — the user cannot fix it by re-sending. Seen live
+# 10.08.2026: one chunk refused with PROHIBITED_CONTENT, partial text cached.
+# Same treatment as blanks (08.08.2026): both layers refuse to store placeholder
+# text AND refuse to return it, so rows poisoned before this guard existed
+# degrade to an ordinary miss and the audio gets a fresh Gemini pass.
+#
+# The pattern must stay in sync with the placeholder strings built in
+# gemini_service (search for "не вдалося розпізнати"). `[^\]]*` tolerates
+# extra detail between the fragment number and the colon (e.g. a future
+# "[фрагмент 1, частина 2: ...]" from split-chunk salvaging).
+_DEGRADED_MARKER_RE = re.compile(r"\[фрагмент \d+[^\]]*: не вдалося розпізнати\]")
+
+
+def _is_degraded(text: Optional[str]) -> bool:
+    return bool(text) and _DEGRADED_MARKER_RE.search(text) is not None
+
+
 # --- L1 (in-memory, by file_unique_id) ---
 
 def store_transcription(
@@ -51,6 +75,11 @@ def store_transcription(
 ) -> None:
     if _is_blank(text):
         logger.warning("cache_skip_blank_store file_unique_id=%s", file_unique_id)
+        return
+    if _is_degraded(text):
+        # Backstop: the handler already skips caching on degraded_chunks > 0;
+        # this catches any other caller handing us placeholder text.
+        logger.warning("cache_skip_degraded_store file_unique_id=%s", file_unique_id)
         return
     transcription_cache[file_unique_id] = CachedTranscription(text, detected_language)
 
@@ -60,6 +89,11 @@ def get_transcription(file_unique_id: str) -> Optional[CachedTranscription]:
     if cached is not None and _is_blank(cached.text):
         # Poisoned before the guard landed — drop it and report a miss.
         logger.warning("cache_evict_blank file_unique_id=%s", file_unique_id)
+        transcription_cache.pop(file_unique_id, None)
+        return None
+    if cached is not None and _is_degraded(cached.text):
+        # Partial text stored before the degraded guard landed — same treatment.
+        logger.warning("cache_evict_degraded file_unique_id=%s", file_unique_id)
         transcription_cache.pop(file_unique_id, None)
         return None
     return cached
@@ -94,10 +128,13 @@ RETURNING text, detected_language
 # Backfill detected_language on second-and-later inserts where the first insert
 # happened before language detection existed.
 # `text` is normally left alone (the stored transcription is the source of
-# truth), with one exception: a row that is blank was written by the pre-guard
-# bug and can never be served — get_by_hash treats it as a miss forever, so
-# without this heal every retry of that audio pays for Gemini again. Overwrite
-# blank rows with the fresh text; non-blank rows keep theirs.
+# truth), with two exceptions — rows written by pre-guard bugs that can never be
+# served, because get_by_hash treats them as a miss forever: (a) blank rows and
+# (b) rows carrying "[фрагмент N: не вдалося розпізнати]" placeholders. Without
+# this heal every retry of that audio pays for Gemini again. The write guards
+# above ensure EXCLUDED.text is always clean, so the overwrite only upgrades.
+# The LIKE pattern mirrors _DEGRADED_MARKER_RE ('%' spans the fragment number
+# and any extra detail before the colon).
 _STORE_BY_HASH_SQL = """
 INSERT INTO nocorny_voice.transcription_cache (content_hash, text, detected_language)
 VALUES ($1, $2, $3)
@@ -105,7 +142,10 @@ ON CONFLICT (content_hash) DO UPDATE
 SET last_hit_at = now(),
     hit_count = nocorny_voice.transcription_cache.hit_count + 1,
     text = CASE
-        WHEN btrim(nocorny_voice.transcription_cache.text) = '' THEN EXCLUDED.text
+        WHEN btrim(nocorny_voice.transcription_cache.text) = ''
+          OR nocorny_voice.transcription_cache.text
+             LIKE '%[фрагмент %: не вдалося розпізнати]%'
+        THEN EXCLUDED.text
         ELSE nocorny_voice.transcription_cache.text
     END,
     detected_language = COALESCE(
@@ -133,6 +173,11 @@ async def get_by_hash(content_hash: str) -> Optional[CachedTranscription]:
         # audio gets a fresh Gemini pass instead of replaying the empty answer.
         logger.warning("cache_l2_blank_ignored hash=%s", content_hash[:12])
         return None
+    if _is_degraded(row["text"]):
+        # Partial row written before the degraded guard existed (L2 survives
+        # restarts and lives 14 days). Miss, so a re-send is a fresh attempt.
+        logger.warning("cache_l2_degraded_ignored hash=%s", content_hash[:12])
+        return None
     return CachedTranscription(row["text"], row["detected_language"])
 
 
@@ -144,6 +189,10 @@ async def store_by_hash(
         return
     if _is_blank(text):
         logger.warning("cache_l2_skip_blank_store hash=%s", content_hash[:12])
+        return
+    if _is_degraded(text):
+        # Backstop mirroring store_transcription — see _DEGRADED_MARKER_RE.
+        logger.warning("cache_l2_skip_degraded_store hash=%s", content_hash[:12])
         return
     p = analytics_pool.get()
     if p is None:
