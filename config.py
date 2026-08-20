@@ -45,7 +45,12 @@ PORT = os.getenv("PORT")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # --- Gemini model ---
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+# Pinned to an exact model, never a floating "-latest" alias: on 2026-08-13
+# Google repointed gemini-flash-lite-latest to a 3.x release whose thinking
+# can't be fully disabled, and thinking tokens bill at the output rate —
+# six days of that cost as much as a normal month. 2.5-flash-lite ships with
+# thinking off and stays the cheapest audio-input model.
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 # SDK transport: "rest", "grpc" or "grpc_asyncio" (google-generativeai 0.8.5
 # accepts it as genai.configure(transport=...)). Default is "rest" — the
 # 2026-08-04 OOM incident experiment: the gRPC C-core keeps native buffer
@@ -87,7 +92,7 @@ TRANSCRIBE_MAX_OUT_PER_SEC = _env_float("TRANSCRIBE_MAX_OUT_PER_SEC", 8.0)
 TRANSCRIBE_MAX_OUT_FRACTION = _env_float("TRANSCRIBE_MAX_OUT_FRACTION", 0.95)
 
 # --- Pricing (Google AI paid-tier rates per 1M tokens). Set to 0 to hide cost in /stats. ---
-# Audio input is 3× text input on gemini-flash-lite-latest (Standard tier). For voice/audio
+# Audio input is 3× text input on gemini-2.5-flash-lite (Standard tier). For voice/audio
 # transcription almost all prompt tokens are audio (Gemini tariffs audio at 32 t/s),
 # so a single rate would undercount cost ~3×.
 PRICE_PER_1M_INPUT_TOKENS = _env_float("PRICE_PER_1M_INPUT_TOKENS", 0.10)
