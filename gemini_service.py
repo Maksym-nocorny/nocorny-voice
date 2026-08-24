@@ -373,6 +373,63 @@ async def _split_audio(file_path: str, chunk_sec: int) -> Tuple[List[str], str, 
     return chunks, "audio/ogg", temp_dir
 
 
+async def _reencode_to_opus(file_path: str, mime_type: str) -> Tuple[str, str, Optional[str]]:
+    """Re-encode a single file to opus mono 16kHz — same codec parameters as
+    _split_audio, minus segmentation — so the non-chunked path never ships raw
+    source bytes inline: an mp4/wav upload can be 20 MB per generateContent
+    payload, while TRANSCRIBE_CHUNK_SEC seconds of 32kbit opus stays under
+    ~600 KB.
+
+    Returns (path, mime, temp_dir). temp_dir is non-None only when the encode
+    succeeded, and the caller owns its cleanup. Never raises for operational
+    reasons: missing ffmpeg or a failed encode falls back to
+    (file_path, mime_type, None) — the exact pre-fix behaviour — with a log
+    line instead of an exception.
+    """
+    ffmpeg = _ffmpeg_binary()
+    if not ffmpeg:
+        logger.warning(
+            "reencode_skipped_no_ffmpeg mime=%s — sending original bytes", mime_type,
+        )
+        return file_path, mime_type, None
+
+    temp_dir = tempfile.mkdtemp(prefix="nv_opus_")
+    out_path = os.path.join(temp_dir, "audio.ogg")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-y", "-i", file_path,
+            "-vn",
+            "-ac", "1", "-ar", "16000",
+            "-c:a", "libopus", "-b:a", "32k", "-application", "voip",
+            out_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+    except Exception as e:  # noqa: BLE001 — spawn failure (binary vanished, OS limits)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.warning("reencode_spawn_failed exc=%s — sending original bytes", e)
+        return file_path, mime_type, None
+    if proc.returncode != 0 or not os.path.exists(out_path) \
+            or os.path.getsize(out_path) == 0:
+        tail = (stderr or b"")[-300:].decode("utf-8", errors="replace")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.warning(
+            "reencode_failed rc=%s — sending original bytes: %s",
+            proc.returncode, tail,
+        )
+        return file_path, mime_type, None
+    try:
+        src_bytes = os.path.getsize(file_path)
+    except OSError:
+        src_bytes = -1
+    logger.info(
+        "reencode_to_opus src_bytes=%d out_bytes=%d", src_bytes,
+        os.path.getsize(out_path),
+    )
+    return out_path, "audio/ogg", temp_dir
+
+
 # When single-shot fully degrades, fall back to chunking IF the file is long
 # enough that smaller chunks would actually be different (below ~40s, a "half"
 # chunk is too short to materially change what the model sees).
@@ -406,42 +463,58 @@ async def transcribe(
     if chunking_eligible and duration_sec > TRANSCRIBE_CHUNK_SEC:
         return await _transcribe_chunked(file_path, mime_type, duration_sec)
 
+    # Short (non-chunked) path: ALWAYS re-encode to opus first. Long files get
+    # re-encoded inside _split_audio anyway; without this step a short mp4/wav
+    # went to Gemini as raw bytes — up to 20 MB per inline REST payload, the
+    # standing memory-leak suspect. On any re-encode failure we fall back to
+    # the original file and MIME, i.e. exactly the old behaviour.
+    send_path, send_mime, reencode_dir = await _reencode_to_opus(file_path, mime_type)
     try:
-        return await _transcribe_one(file_path, mime_type, duration_sec)
-    except TranscriptionDegradedError as degraded:
-        # Last-resort: if every single-shot retry degraded (MAX_TOKENS loops,
-        # RECITATION refusals), try the chunked path with smaller pieces. A
-        # fresh model context per chunk usually breaks the loop, and a different
-        # audio slice usually bypasses the false-positive content filter.
-        # Only fires when ffmpeg is available and the clip is long enough for
-        # halving to produce non-trivial chunks.
-        if not chunking_eligible or duration_sec < _DEGRADED_FALLBACK_MIN_DURATION_SEC:
-            raise
-        fallback_chunk_sec = max(
-            _DEGRADED_FALLBACK_MIN_CHUNK_SEC,
-            min(TRANSCRIBE_CHUNK_SEC, duration_sec // 2),
-        )
-        logger.info(
-            "transcribe_chunked_fallback_on_degraded duration=%s chunk_sec=%d finish=%s",
-            duration_sec, fallback_chunk_sec, degraded.finish_reason,
-        )
         try:
-            return await _transcribe_chunked(
-                file_path, mime_type, duration_sec,
-                chunk_sec=fallback_chunk_sec,
+            return await _transcribe_one(send_path, send_mime, duration_sec)
+        except TranscriptionDegradedError as degraded:
+            # Last-resort: if every single-shot retry degraded (MAX_TOKENS loops,
+            # RECITATION refusals), try the chunked path with smaller pieces. A
+            # fresh model context per chunk usually breaks the loop, and a different
+            # audio slice usually bypasses the false-positive content filter.
+            # Only fires when ffmpeg is available and the clip is long enough for
+            # halving to produce non-trivial chunks.
+            if not chunking_eligible or duration_sec < _DEGRADED_FALLBACK_MIN_DURATION_SEC:
+                raise
+            fallback_chunk_sec = max(
+                _DEGRADED_FALLBACK_MIN_CHUNK_SEC,
+                min(TRANSCRIBE_CHUNK_SEC, duration_sec // 2),
             )
-        except TranscriptionDegradedError as chunked_err:
-            # Both paths degraded. Combine usage so the handler bills for
-            # what we actually consumed in both attempts.
-            raise TranscriptionDegradedError(
-                f"single_shot+chunked_both_degraded single={degraded.finish_reason} "
-                f"chunked={chunked_err.finish_reason}",
-                prompt_tokens=degraded.prompt_tokens + chunked_err.prompt_tokens,
-                prompt_audio_tokens=degraded.prompt_audio_tokens + chunked_err.prompt_audio_tokens,
-                candidates_tokens=degraded.candidates_tokens + chunked_err.candidates_tokens,
-                total_tokens=degraded.total_tokens + chunked_err.total_tokens,
-                finish_reason=degraded.finish_reason or chunked_err.finish_reason,
-            ) from chunked_err
+            logger.info(
+                "transcribe_chunked_fallback_on_degraded duration=%s chunk_sec=%d finish=%s",
+                duration_sec, fallback_chunk_sec, degraded.finish_reason,
+            )
+            try:
+                # Split the same (possibly re-encoded) file the single shot
+                # saw — path and MIME stay a matched pair, and if _split_audio
+                # itself fails, its single-shot fallback re-sends the small
+                # opus copy rather than the raw original.
+                return await _transcribe_chunked(
+                    send_path, send_mime, duration_sec,
+                    chunk_sec=fallback_chunk_sec,
+                )
+            except TranscriptionDegradedError as chunked_err:
+                # Both paths degraded. Combine usage so the handler bills for
+                # what we actually consumed in both attempts.
+                raise TranscriptionDegradedError(
+                    f"single_shot+chunked_both_degraded single={degraded.finish_reason} "
+                    f"chunked={chunked_err.finish_reason}",
+                    prompt_tokens=degraded.prompt_tokens + chunked_err.prompt_tokens,
+                    prompt_audio_tokens=degraded.prompt_audio_tokens + chunked_err.prompt_audio_tokens,
+                    candidates_tokens=degraded.candidates_tokens + chunked_err.candidates_tokens,
+                    total_tokens=degraded.total_tokens + chunked_err.total_tokens,
+                    finish_reason=degraded.finish_reason or chunked_err.finish_reason,
+                ) from chunked_err
+    finally:
+        # The re-encoded copy lives in its own temp dir; without this cleanup
+        # the memory-leak fix would quietly become a disk leak.
+        if reencode_dir:
+            shutil.rmtree(reencode_dir, ignore_errors=True)
 
 
 async def _transcribe_chunked(file_path: str, mime_type: str,

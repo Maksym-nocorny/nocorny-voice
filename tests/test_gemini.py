@@ -1,6 +1,8 @@
 """Tests for pure helpers in gemini_service (no Gemini API calls)."""
 from __future__ import annotations
 
+import os
+
 from unittest.mock import AsyncMock
 
 import pytest
@@ -314,6 +316,7 @@ async def test_chunked_fallback_on_single_shot_degraded(monkeypatch):
     monkeypatch.setattr(gemini_service, "_transcribe_chunked", chunked_spy)
     monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/usr/bin/ffmpeg")
     monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+    monkeypatch.setattr(gemini_service, "_reencode_to_opus", _passthrough_reencode)
 
     result = await gemini_service.transcribe(
         "/tmp/fake.ogg", "audio/ogg", duration_sec=140,
@@ -339,6 +342,7 @@ async def test_no_chunked_fallback_for_short_clip(monkeypatch):
     monkeypatch.setattr(gemini_service, "_transcribe_chunked", chunked_spy)
     monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/usr/bin/ffmpeg")
     monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+    monkeypatch.setattr(gemini_service, "_reencode_to_opus", _passthrough_reencode)
 
     with pytest.raises(gemini_service.TranscriptionDegradedError):
         await gemini_service.transcribe(
@@ -365,6 +369,7 @@ async def test_chunked_fallback_propagates_aggregated_usage(monkeypatch):
     monkeypatch.setattr(gemini_service, "_transcribe_chunked", AsyncMock(side_effect=chunked_err))
     monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/usr/bin/ffmpeg")
     monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+    monkeypatch.setattr(gemini_service, "_reencode_to_opus", _passthrough_reencode)
 
     with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
         await gemini_service.transcribe(
@@ -612,3 +617,232 @@ async def test_rate_limit_after_5xx_switches_to_long_budget(monkeypatch):
 
     assert await gemini_service._retry(call) == "transcribed"
     assert call.await_count == 5
+
+
+# ---------------------------------------------------------------------------
+# _reencode_to_opus + the always-opus short path (memory-leak plan, step 2)
+# ---------------------------------------------------------------------------
+
+
+async def _passthrough_reencode(file_path, mime_type):
+    """Stand-in for _reencode_to_opus: behave as if re-encoding was skipped."""
+    return file_path, mime_type, None
+
+
+class _FakeProc:
+    def __init__(self, returncode=0, stderr=b""):
+        self.returncode = returncode
+        self._stderr = stderr
+
+    async def communicate(self):
+        return b"", self._stderr
+
+
+@pytest.mark.asyncio
+async def test_short_path_sends_reencoded_file(monkeypatch, tmp_path):
+    """A short clip must reach Gemini as the opus copy, not raw source bytes,
+    and the re-encode temp dir must be swept afterwards."""
+    enc_dir = tmp_path / "enc"
+    enc_dir.mkdir()
+    enc_path = str(enc_dir / "audio.ogg")
+
+    events: list[str] = []
+    reencode_spy = AsyncMock(return_value=(enc_path, "audio/ogg", str(enc_dir)))
+
+    async def _fake_one(path, mime, duration):
+        events.append(f"one:{path}:{mime}")
+        return GeminiResult(text="ok", prompt_tokens=1,
+                            candidates_tokens=1, total_tokens=2)
+
+    monkeypatch.setattr(gemini_service, "_reencode_to_opus", reencode_spy)
+    monkeypatch.setattr(gemini_service, "_transcribe_one", _fake_one)
+    monkeypatch.setattr(gemini_service.shutil, "rmtree",
+                        lambda p, **k: events.append(f"rmtree:{p}"))
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+
+    result = await gemini_service.transcribe(
+        "/tmp/src.mp4", "video/mp4", duration_sec=90,
+    )
+    assert result.text == "ok"
+    reencode_spy.assert_awaited_once_with("/tmp/src.mp4", "video/mp4")
+    assert events == [
+        f"one:{enc_path}:audio/ogg",
+        f"rmtree:{enc_dir}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_degraded_fallback_reuses_reencoded_file(monkeypatch, tmp_path):
+    """The degraded->chunked fallback must split the SAME opus copy the single
+    shot saw (matched path+MIME pair), and the temp dir must stay alive until
+    the fallback finishes."""
+    enc_dir = tmp_path / "enc"
+    enc_dir.mkdir()
+    enc_path = str(enc_dir / "audio.ogg")
+
+    events: list[str] = []
+    degrade = gemini_service.TranscriptionDegradedError(
+        "loop", finish_reason="MAX_TOKENS",
+    )
+    recovery = GeminiResult(text="recovered", prompt_tokens=1,
+                            candidates_tokens=1, total_tokens=2)
+
+    async def _fake_chunked(path, mime, duration, *, chunk_sec=None):
+        events.append(f"chunked:{path}:{mime}")
+        return recovery
+
+    monkeypatch.setattr(
+        gemini_service, "_reencode_to_opus",
+        AsyncMock(return_value=(enc_path, "audio/ogg", str(enc_dir))),
+    )
+    monkeypatch.setattr(gemini_service, "_transcribe_one",
+                        AsyncMock(side_effect=degrade))
+    monkeypatch.setattr(gemini_service, "_transcribe_chunked", _fake_chunked)
+    monkeypatch.setattr(gemini_service.shutil, "rmtree",
+                        lambda p, **k: events.append(f"rmtree:{p}"))
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+
+    result = await gemini_service.transcribe(
+        "/tmp/src.mp4", "video/mp4", duration_sec=140,
+    )
+    assert result is recovery
+    # cleanup strictly AFTER the chunked fallback consumed the file
+    assert events == [
+        f"chunked:{enc_path}:audio/ogg",
+        f"rmtree:{enc_dir}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_short_path_original_when_no_ffmpeg(monkeypatch):
+    """No ffmpeg -> pre-fix behaviour: original file and MIME go out as-is."""
+    single_shot_spy = AsyncMock(return_value=GeminiResult(
+        text="ok", prompt_tokens=1, candidates_tokens=1, total_tokens=2,
+    ))
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: None)
+    monkeypatch.setattr(gemini_service, "_transcribe_one", single_shot_spy)
+    monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+
+    result = await gemini_service.transcribe(
+        "/tmp/src.mp4", "video/mp4", duration_sec=90,
+    )
+    assert result.text == "ok"
+    args, _ = single_shot_spy.await_args
+    assert args[0] == "/tmp/src.mp4"
+    assert args[1] == "video/mp4"
+
+
+@pytest.mark.asyncio
+async def test_short_path_original_when_reencode_fails(monkeypatch):
+    """ffmpeg present but exits non-zero -> pre-fix behaviour, no exception."""
+    async def _fake_exec(*args, **kwargs):
+        return _FakeProc(returncode=1, stderr=b"boom")
+
+    single_shot_spy = AsyncMock(return_value=GeminiResult(
+        text="ok", prompt_tokens=1, candidates_tokens=1, total_tokens=2,
+    ))
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/fake/ffmpeg")
+    monkeypatch.setattr(gemini_service.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(gemini_service, "_transcribe_one", single_shot_spy)
+    monkeypatch.setattr(gemini_service, "_configure_once", lambda: None)
+
+    result = await gemini_service.transcribe(
+        "/tmp/src.mp4", "video/mp4", duration_sec=90,
+    )
+    assert result.text == "ok"
+    args, _ = single_shot_spy.await_args
+    assert args[0] == "/tmp/src.mp4"
+    assert args[1] == "video/mp4"
+
+
+@pytest.mark.asyncio
+async def test_reencode_no_ffmpeg_returns_original(monkeypatch):
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: None)
+    out = await gemini_service._reencode_to_opus("/tmp/a.wav", "audio/wav")
+    assert out == ("/tmp/a.wav", "audio/wav", None)
+
+
+@pytest.mark.asyncio
+async def test_reencode_failure_cleans_temp_dir(monkeypatch, tmp_path):
+    made: list[str] = []
+
+    def _fake_mkdtemp(prefix=""):
+        d = tmp_path / "nv_opus_fail"
+        d.mkdir()
+        made.append(str(d))
+        return str(d)
+
+    async def _fake_exec(*args, **kwargs):
+        return _FakeProc(returncode=1, stderr=b"boom")
+
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/fake/ffmpeg")
+    monkeypatch.setattr(gemini_service.tempfile, "mkdtemp", _fake_mkdtemp)
+    monkeypatch.setattr(gemini_service.asyncio, "create_subprocess_exec", _fake_exec)
+
+    out = await gemini_service._reencode_to_opus("/tmp/a.wav", "audio/wav")
+    assert out == ("/tmp/a.wav", "audio/wav", None)
+    assert made and not os.path.exists(made[0])
+
+
+@pytest.mark.asyncio
+async def test_reencode_spawn_failure_cleans_temp_dir(monkeypatch, tmp_path):
+    """Binary vanished between _ffmpeg_binary() and exec -> fall back, sweep dir."""
+    made: list[str] = []
+
+    def _fake_mkdtemp(prefix=""):
+        d = tmp_path / "nv_opus_spawn"
+        d.mkdir()
+        made.append(str(d))
+        return str(d)
+
+    async def _fake_exec(*args, **kwargs):
+        raise FileNotFoundError("no such binary")
+
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/fake/ffmpeg")
+    monkeypatch.setattr(gemini_service.tempfile, "mkdtemp", _fake_mkdtemp)
+    monkeypatch.setattr(gemini_service.asyncio, "create_subprocess_exec", _fake_exec)
+
+    out = await gemini_service._reencode_to_opus("/tmp/a.wav", "audio/wav")
+    assert out == ("/tmp/a.wav", "audio/wav", None)
+    assert made and not os.path.exists(made[0])
+
+
+@pytest.mark.asyncio
+async def test_reencode_success_returns_opus_copy(monkeypatch, tmp_path):
+    """Happy path: opus copy + audio/ogg MIME + caller-owned temp dir, with the
+    same codec parameters _split_audio uses."""
+    enc_dir = tmp_path / "nv_opus_ok"
+    seen_args: list = []
+
+    def _fake_mkdtemp(prefix=""):
+        enc_dir.mkdir()
+        return str(enc_dir)
+
+    class _WritingProc(_FakeProc):
+        async def communicate(self):
+            (enc_dir / "audio.ogg").write_bytes(b"OggS-fake-opus")
+            return b"", b""
+
+    async def _fake_exec(*args, **kwargs):
+        seen_args.extend(args)
+        return _WritingProc(returncode=0)
+
+    src = tmp_path / "src.wav"
+    src.write_bytes(b"RIFF" * 1000)
+
+    monkeypatch.setattr(gemini_service, "_ffmpeg_binary", lambda: "/fake/ffmpeg")
+    monkeypatch.setattr(gemini_service.tempfile, "mkdtemp", _fake_mkdtemp)
+    monkeypatch.setattr(gemini_service.asyncio, "create_subprocess_exec", _fake_exec)
+
+    path, mime, temp_dir = await gemini_service._reencode_to_opus(
+        str(src), "audio/wav",
+    )
+    assert path == str(enc_dir / "audio.ogg")
+    assert mime == "audio/ogg"
+    assert temp_dir == str(enc_dir)
+    assert os.path.exists(path)
+    # codec contract shared with _split_audio
+    for token in ("libopus", "32k", "voip", "-vn", "16000"):
+        assert token in seen_args
