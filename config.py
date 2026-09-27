@@ -81,6 +81,10 @@ TRANSCRIBE_RETRY_FINAL_TEMPERATURE = _env_float("TRANSCRIBE_RETRY_FINAL_TEMPERAT
 TRANSCRIBE_CHUNK_SEC = _env_int("TRANSCRIBE_CHUNK_SEC", 150)
 # Max parallel Gemini transcribe calls when chunking. Keep modest to avoid rate limits.
 TRANSCRIBE_CHUNK_CONCURRENCY = _env_int("TRANSCRIBE_CHUNK_CONCURRENCY", 3)
+# Max media messages transcribed at once across ALL users (each user is also
+# serialized to one at a time). Bounded by RSS on the 512 MiB Render plan:
+# ffmpeg children count against the container limit but not mem_guard's RSS.
+MAX_CONCURRENT_TRANSCRIPTIONS = max(1, _env_int("MAX_CONCURRENT_TRANSCRIPTIONS", 2))
 # Path to ffmpeg binary; resolved via PATH if just "ffmpeg".
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import re
 import uuid
 from typing import Optional
 
@@ -25,10 +26,25 @@ class _ContextFilter(logging.Filter):
         return True
 
 
+# Bot token inside Telegram API URLs that httpx logs at INFO level, both raw
+# (".../bot123:AAE.../sendMessage") and percent-encoded (".../bot123%3AAAE...").
+# Render keeps those logs, so the token must never reach stdout.
+_TOKEN_RE = re.compile(r"(\d{5,}(?::|%3[Aa]))[A-Za-z0-9_-]{30,}")
+
+
+def redact_secrets(text: str) -> str:
+    return _TOKEN_RE.sub(r"\1<redacted>", text)
+
+
+class _RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_secrets(super().format(record))
+
+
 def setup_logging(level: int = logging.INFO) -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(
-        logging.Formatter(
+        _RedactingFormatter(
             "%(asctime)s [%(levelname)s] req=%(request_id)s user=%(user_id)s "
             "chat=%(chat_id)s %(name)s: %(message)s"
         )
