@@ -407,7 +407,16 @@ async def test_chunked_partial_marks_degraded_chunks(monkeypatch):
             raise n
         return n
 
+    split_calls = 0
+
     async def _fake_split(_path, _chunk_sec):
+        # First call: the file-level split. Any later call is the salvage
+        # pass trying to halve the degraded chunk — fail it so this test
+        # keeps exercising the no-salvage aggregation path.
+        nonlocal split_calls
+        split_calls += 1
+        if split_calls > 1:
+            raise RuntimeError("no ffmpeg for salvage")
         return (["/tmp/c0.ogg", "/tmp/c1.ogg"], "audio/ogg", "/tmp/nv_chunks_x")
 
     monkeypatch.setattr(gemini_service, "_split_audio", _fake_split)
@@ -447,6 +456,199 @@ async def test_chunked_all_success_has_zero_degraded_chunks(monkeypatch):
         "/tmp/fake.aac", "audio/aac", duration_sec=300,
     )
     assert result.degraded_chunks == 0
+
+
+def _degraded(finish="MAX_TOKENS", **tokens):
+    defaults = dict(prompt_tokens=50, prompt_audio_tokens=40,
+                    candidates_tokens=0, total_tokens=50)
+    defaults.update(tokens)
+    return gemini_service.TranscriptionDegradedError(
+        "degraded", finish_reason=finish, **defaults,
+    )
+
+
+def _salvage_env(monkeypatch, one_by_path, split_by_path):
+    """Wire path-dispatching fakes for _transcribe_one/_split_audio."""
+    async def _fake_one(path, mime, dur):  # noqa: ARG001
+        r = one_by_path[path]
+        if isinstance(r, BaseException):
+            raise r
+        return r
+
+    async def _fake_split(path, _chunk_sec):
+        return split_by_path[path]
+
+    monkeypatch.setattr(gemini_service, "_split_audio", _fake_split)
+    monkeypatch.setattr(gemini_service, "_transcribe_one", _fake_one)
+    monkeypatch.setattr(gemini_service.shutil, "rmtree", lambda *a, **k: None)
+
+
+@pytest.mark.asyncio
+async def test_chunk_salvage_recovers_half(monkeypatch):
+    """A degraded chunk gets one salvage pass over its halves: the surviving
+    half's text replaces a whole-chunk placeholder, the lost half keeps a
+    narrower one, and every billed call (original failure + both halves) is
+    reflected in the token totals."""
+    _salvage_env(
+        monkeypatch,
+        one_by_path={
+            "/tmp/c0.ogg": GeminiResult(
+                text="hello", prompt_tokens=100, candidates_tokens=20,
+                total_tokens=120, prompt_audio_tokens=80,
+            ),
+            "/tmp/c1.ogg": _degraded(),
+            "/tmp/h0.ogg": GeminiResult(
+                text="rescued", prompt_tokens=25, candidates_tokens=5,
+                total_tokens=30, prompt_audio_tokens=20,
+                detected_language="uk",
+            ),
+            "/tmp/h1.ogg": _degraded(
+                prompt_tokens=8, prompt_audio_tokens=6,
+                candidates_tokens=2, total_tokens=10,
+            ),
+        },
+        split_by_path={
+            "/tmp/fake.aac": (["/tmp/c0.ogg", "/tmp/c1.ogg"], "audio/ogg", "/tmp/d"),
+            "/tmp/c1.ogg": (["/tmp/h0.ogg", "/tmp/h1.ogg"], "audio/ogg", "/tmp/d2"),
+        },
+    )
+
+    result = await gemini_service._transcribe_chunked(
+        "/tmp/fake.aac", "audio/aac", duration_sec=300,
+    )
+    assert result.degraded_chunks == 1  # the lost half still surfaces in /stats
+    assert "hello" in result.text
+    assert "rescued" in result.text
+    assert "[фрагмент 2, частина 2: не вдалося розпізнати]" in result.text
+    assert "[фрагмент 2: не вдалося розпізнати]" not in result.text
+    # 120 (c0) + 50 (c1 failed attempts) + 30 (h0) + 10 (h1 failed) = 210
+    assert result.total_tokens == 210
+    assert result.prompt_audio_tokens == 80 + 40 + 20 + 6
+    assert result.detected_language == "uk"
+
+
+@pytest.mark.asyncio
+async def test_chunk_salvage_full_recovery(monkeypatch):
+    """When both halves transcribe, the chunk becomes a clean success —
+    no placeholder, degraded_chunks stays 0 (no spurious analytics event)."""
+    _salvage_env(
+        monkeypatch,
+        one_by_path={
+            "/tmp/c0.ogg": GeminiResult(
+                text="hello", prompt_tokens=100, candidates_tokens=20,
+                total_tokens=120, prompt_audio_tokens=80,
+            ),
+            "/tmp/c1.ogg": _degraded(),
+            "/tmp/h0.ogg": GeminiResult(
+                text="first half", prompt_tokens=25, candidates_tokens=5,
+                total_tokens=30, prompt_audio_tokens=20,
+            ),
+            "/tmp/h1.ogg": GeminiResult(
+                text="second half", prompt_tokens=25, candidates_tokens=5,
+                total_tokens=30, prompt_audio_tokens=20,
+            ),
+        },
+        split_by_path={
+            "/tmp/fake.aac": (["/tmp/c0.ogg", "/tmp/c1.ogg"], "audio/ogg", "/tmp/d"),
+            "/tmp/c1.ogg": (["/tmp/h0.ogg", "/tmp/h1.ogg"], "audio/ogg", "/tmp/d2"),
+        },
+    )
+
+    result = await gemini_service._transcribe_chunked(
+        "/tmp/fake.aac", "audio/aac", duration_sec=300,
+    )
+    assert result.degraded_chunks == 0
+    assert "не вдалося розпізнати" not in result.text
+    assert "first half" in result.text and "second half" in result.text
+    # Original failed attempts still counted: 120 + 50 + 30 + 30
+    assert result.total_tokens == 230
+
+
+@pytest.mark.asyncio
+async def test_chunk_salvage_all_pieces_fail(monkeypatch):
+    """When every half degrades too, the chunk falls back to the whole-chunk
+    placeholder and the re-raised error accumulates usage from the original
+    attempts plus both halves."""
+    _salvage_env(
+        monkeypatch,
+        one_by_path={
+            "/tmp/c0.ogg": GeminiResult(
+                text="hello", prompt_tokens=100, candidates_tokens=20,
+                total_tokens=120, prompt_audio_tokens=80,
+            ),
+            "/tmp/c1.ogg": _degraded(),
+            "/tmp/h0.ogg": _degraded(total_tokens=10, prompt_tokens=10,
+                                      prompt_audio_tokens=8, candidates_tokens=0),
+            "/tmp/h1.ogg": _degraded(total_tokens=10, prompt_tokens=10,
+                                      prompt_audio_tokens=8, candidates_tokens=0),
+        },
+        split_by_path={
+            "/tmp/fake.aac": (["/tmp/c0.ogg", "/tmp/c1.ogg"], "audio/ogg", "/tmp/d"),
+            "/tmp/c1.ogg": (["/tmp/h0.ogg", "/tmp/h1.ogg"], "audio/ogg", "/tmp/d2"),
+        },
+    )
+
+    result = await gemini_service._transcribe_chunked(
+        "/tmp/fake.aac", "audio/aac", duration_sec=300,
+    )
+    assert result.degraded_chunks == 1
+    assert "[фрагмент 2: не вдалося розпізнати]" in result.text
+    # 120 (c0) + 50 (c1) + 10 + 10 (halves) = 190
+    assert result.total_tokens == 190
+
+
+@pytest.mark.asyncio
+async def test_salvage_skipped_when_halves_too_short(monkeypatch):
+    """Halving a chunk below the 30s floor can't change what the model sees —
+    salvage must re-raise without calling ffmpeg or Gemini."""
+    split_spy = AsyncMock()
+    monkeypatch.setattr(gemini_service, "_split_audio", split_spy)
+    original = _degraded()
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
+        await gemini_service._salvage_chunk(
+            0, "/tmp/c0.ogg", "audio/ogg", chunk_sec=50, degraded=original,
+        )
+    assert exc_info.value is original
+    split_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_salvage_skipped_on_gemini_5xx(monkeypatch):
+    """An API outage isn't content-conditioned — salvage would pile more calls
+    onto a struggling backend, so it must re-raise immediately."""
+    split_spy = AsyncMock()
+    monkeypatch.setattr(gemini_service, "_split_audio", split_spy)
+    original = _degraded(finish="gemini_5xx")
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
+        await gemini_service._salvage_chunk(
+            0, "/tmp/c0.ogg", "audio/ogg", chunk_sec=150, degraded=original,
+        )
+    assert exc_info.value is original
+    split_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_salvage_skipped_when_split_yields_single_piece(monkeypatch):
+    """A short trailing chunk may not actually split (segment_time exceeds its
+    length) — the lone piece is the same audio that already failed, so salvage
+    re-raises instead of burning an identical call."""
+    async def _fake_split(_path, _chunk_sec):
+        return (["/tmp/only.ogg"], "audio/ogg", "/tmp/d3")
+
+    one_spy = AsyncMock()
+    monkeypatch.setattr(gemini_service, "_split_audio", _fake_split)
+    monkeypatch.setattr(gemini_service, "_transcribe_one", one_spy)
+    monkeypatch.setattr(gemini_service.shutil, "rmtree", lambda *a, **k: None)
+    original = _degraded()
+
+    with pytest.raises(gemini_service.TranscriptionDegradedError) as exc_info:
+        await gemini_service._salvage_chunk(
+            1, "/tmp/c1.ogg", "audio/ogg", chunk_sec=150, degraded=original,
+        )
+    assert exc_info.value is original
+    one_spy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -846,3 +1048,67 @@ async def test_reencode_success_returns_opus_copy(monkeypatch, tmp_path):
     # codec contract shared with _split_audio
     for token in ("libopus", "32k", "voip", "-vn", "16000"):
         assert token in seen_args
+
+
+@pytest.mark.asyncio
+async def test_chunk_salvage_rate_limit_keeps_partial(monkeypatch):
+    """A 429/503 while salvaging must not turn a partial transcript into a
+    full failure: the other chunks' text and the placeholder survive."""
+    _salvage_env(
+        monkeypatch,
+        one_by_path={
+            "/tmp/c0.ogg": GeminiResult(
+                text="hello", prompt_tokens=100, candidates_tokens=20,
+                total_tokens=120, prompt_audio_tokens=80,
+            ),
+            "/tmp/c1.ogg": _degraded(),
+            "/tmp/h0.ogg": gemini_service.RateLimitedError("overloaded"),
+            "/tmp/h1.ogg": GeminiResult(
+                text="never-called", prompt_tokens=1, candidates_tokens=1,
+                total_tokens=2, prompt_audio_tokens=1,
+            ),
+        },
+        split_by_path={
+            "/tmp/fake.aac": (["/tmp/c0.ogg", "/tmp/c1.ogg"], "audio/ogg", "/tmp/d"),
+            "/tmp/c1.ogg": (["/tmp/h0.ogg", "/tmp/h1.ogg"], "audio/ogg", "/tmp/d2"),
+        },
+    )
+
+    result = await gemini_service._transcribe_chunked(
+        "/tmp/fake.aac", "audio/aac", duration_sec=300,
+    )
+    assert "hello" in result.text
+    assert "never-called" not in result.text
+    assert "[фрагмент 2: не вдалося розпізнати]" in result.text
+    assert result.degraded_chunks == 1
+    assert result.total_tokens == 120 + 50
+
+
+@pytest.mark.asyncio
+async def test_chunk_salvage_rate_limit_after_rescue_keeps_rescued(monkeypatch):
+    _salvage_env(
+        monkeypatch,
+        one_by_path={
+            "/tmp/c0.ogg": GeminiResult(
+                text="hello", prompt_tokens=100, candidates_tokens=20,
+                total_tokens=120, prompt_audio_tokens=80,
+            ),
+            "/tmp/c1.ogg": _degraded(),
+            "/tmp/h0.ogg": GeminiResult(
+                text="rescued", prompt_tokens=25, candidates_tokens=5,
+                total_tokens=30, prompt_audio_tokens=20,
+            ),
+            "/tmp/h1.ogg": gemini_service.RateLimitedError("overloaded"),
+        },
+        split_by_path={
+            "/tmp/fake.aac": (["/tmp/c0.ogg", "/tmp/c1.ogg"], "audio/ogg", "/tmp/d"),
+            "/tmp/c1.ogg": (["/tmp/h0.ogg", "/tmp/h1.ogg"], "audio/ogg", "/tmp/d2"),
+        },
+    )
+    result = await gemini_service._transcribe_chunked(
+        "/tmp/fake.aac", "audio/aac", duration_sec=300,
+    )
+    assert "hello" in result.text and "rescued" in result.text
+    assert "[фрагмент 2, частина 2: не вдалося розпізнати]" in result.text
+    assert result.degraded_chunks == 1
+    assert result.total_tokens == 120 + 50 + 30

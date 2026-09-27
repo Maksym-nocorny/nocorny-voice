@@ -544,7 +544,12 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
                 # be shorter but using the cap is fine for loop detection
                 # (it only loosens the per-second threshold).
                 logger.info("chunk_transcribe_start idx=%d/%d", idx + 1, n)
-                return await _transcribe_one(path, chunk_mime, split_sec)
+                try:
+                    return await _transcribe_one(path, chunk_mime, split_sec)
+                except TranscriptionDegradedError as degraded:
+                    return await _salvage_chunk(
+                        idx, path, chunk_mime, split_sec, degraded,
+                    )
 
         results = await asyncio.gather(
             *[_do(i, p) for i, p in enumerate(chunk_paths)],
@@ -571,7 +576,8 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
     parts: List[str] = []
     p_total = pa_total = c_total = t_total = 0
     detected: Optional[str] = None
-    degraded_count = 0
+    degraded_count = 0   # chunks that produced no text at all
+    salvage_lost = 0     # halves lost inside partially-salvaged chunks
     for idx, r in enumerate(results):
         if isinstance(r, TranscriptionDegradedError):
             degraded_count += 1
@@ -588,12 +594,14 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
             degraded_count += 1
             parts.append(f"[фрагмент {idx + 1}: не вдалося розпізнати]")
             continue
-        # success
+        # success (possibly via salvage, in which case degraded_chunks carries
+        # the halves that still failed — surface them so /stats sees the loss)
         parts.append(r.text)
         p_total += r.prompt_tokens
         pa_total += r.prompt_audio_tokens
         c_total += r.candidates_tokens
         t_total += r.total_tokens
+        salvage_lost += r.degraded_chunks
         if detected is None and r.detected_language:
             detected = r.detected_language
 
@@ -608,8 +616,9 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
         )
 
     logger.info(
-        "transcribe_chunked_done chunks=%d degraded=%d duration=%ds tokens=%d",
-        len(results), degraded_count, duration_sec, t_total,
+        "transcribe_chunked_done chunks=%d degraded=%d salvage_lost=%d "
+        "duration=%ds tokens=%d",
+        len(results), degraded_count, salvage_lost, duration_sec, t_total,
     )
     return GeminiResult(
         text="\n".join(parts).strip(),
@@ -618,7 +627,130 @@ async def _transcribe_chunked(file_path: str, mime_type: str,
         total_tokens=t_total,
         prompt_audio_tokens=pa_total,
         detected_language=detected,
-        degraded_chunks=degraded_count,
+        degraded_chunks=degraded_count + salvage_lost,
+    )
+
+
+async def _salvage_chunk(
+    idx: int,
+    path: str,
+    mime: str,
+    chunk_sec: int,
+    degraded: TranscriptionDegradedError,
+) -> GeminiResult:
+    """Last-ditch recovery for one degraded chunk: halve it and transcribe
+    the pieces independently.
+
+    Same rationale as the single-shot degraded fallback — re-sending the same
+    bytes reproduces the same loop/refusal (observed in prod: identical
+    failures on same-file resends minutes apart), but fresh context over
+    different audio boundaries usually breaks it. Runs inside the caller's
+    semaphore slot, so pieces go sequentially and don't widen API concurrency.
+
+    Returns a GeminiResult whose token totals include the usage carried by
+    `degraded` (its last attempt) plus everything the pieces consumed;
+    `degraded_chunks` counts pieces that still failed. Re-raises with
+    accumulated usage when halving isn't possible or every piece degraded.
+    """
+    half_sec = chunk_sec // 2
+    # A 5xx-exhausted degradation is an API outage, not a content-conditioned
+    # failure — smaller slices would just pile calls onto a struggling backend.
+    if (half_sec < _DEGRADED_FALLBACK_MIN_CHUNK_SEC
+            or degraded.finish_reason == "gemini_5xx"):
+        raise degraded
+
+    try:
+        piece_paths, piece_mime, temp_dir = await _split_audio(path, half_sec)
+    except exceptions.Forbidden:
+        raise
+    except Exception as e:  # noqa: BLE001 — salvage must never be worse than none
+        logger.warning("chunk_salvage_split_failed idx=%d exc=%s", idx + 1, e)
+        raise degraded from None
+
+    try:
+        if len(piece_paths) < 2:
+            # Chunk didn't actually split (e.g. a short trailing chunk) — the
+            # single piece is the same audio that already failed.
+            raise degraded
+        logger.info(
+            "chunk_salvage_start idx=%d pieces=%d half_sec=%d finish=%s",
+            idx + 1, len(piece_paths), half_sec, degraded.finish_reason,
+        )
+        parts: List[str] = []
+        p = degraded.prompt_tokens
+        pa = degraded.prompt_audio_tokens
+        c = degraded.candidates_tokens
+        t = degraded.total_tokens
+        detected: Optional[str] = None
+        lost = 0
+        aborted = False
+        for j, piece in enumerate(piece_paths):
+            if aborted:
+                lost += 1
+                parts.append(
+                    f"[фрагмент {idx + 1}, частина {j + 1}: не вдалося розпізнати]"
+                )
+                continue
+            try:
+                r = await _transcribe_one(piece, piece_mime, half_sec)
+            except TranscriptionDegradedError as piece_err:
+                lost += 1
+                parts.append(
+                    f"[фрагмент {idx + 1}, частина {j + 1}: не вдалося розпізнати]"
+                )
+                p += piece_err.prompt_tokens
+                pa += piece_err.prompt_audio_tokens
+                c += piece_err.candidates_tokens
+                t += piece_err.total_tokens
+                continue
+            except exceptions.Forbidden:
+                raise
+            except Exception as e:  # noqa: BLE001 — 429/503 (RateLimitedError),
+                # 400s, etc.: stop salvaging but keep what the other chunks and
+                # earlier pieces produced — never turn a partial into a failure.
+                logger.warning(
+                    "chunk_salvage_aborted idx=%d piece=%d exc=%s",
+                    idx + 1, j + 1, type(e).__name__,
+                )
+                aborted = True
+                lost += 1
+                parts.append(
+                    f"[фрагмент {idx + 1}, частина {j + 1}: не вдалося розпізнати]"
+                )
+                continue
+            parts.append(r.text)
+            p += r.prompt_tokens
+            pa += r.prompt_audio_tokens
+            c += r.candidates_tokens
+            t += r.total_tokens
+            if detected is None and r.detected_language:
+                detected = r.detected_language
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    if lost == len(piece_paths):
+        logger.info(
+            "chunk_salvage_failed idx=%d pieces=%d", idx + 1, len(piece_paths),
+        )
+        raise TranscriptionDegradedError(
+            f"chunk {idx + 1} salvage failed: all {len(piece_paths)} pieces degraded",
+            prompt_tokens=p, prompt_audio_tokens=pa,
+            candidates_tokens=c, total_tokens=t,
+            finish_reason=degraded.finish_reason,
+        ) from degraded
+
+    logger.info(
+        "chunk_salvage_done idx=%d pieces=%d lost=%d",
+        idx + 1, len(piece_paths), lost,
+    )
+    return GeminiResult(
+        text="\n".join(parts).strip(),
+        prompt_tokens=p,
+        candidates_tokens=c,
+        total_tokens=t,
+        prompt_audio_tokens=pa,
+        detected_language=detected,
+        degraded_chunks=lost,
     )
 
 
