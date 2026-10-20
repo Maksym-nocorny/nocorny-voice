@@ -18,6 +18,11 @@ Wire format (one frame per message so concurrent sends can't interleave):
 `transcribe()` raises WorkerUnavailable the moment there is no worker, on
 timeout, on socket loss or on a worker-side error — the handler then falls
 back to Gemini, which is the exact pre-worker behaviour.
+
+Local mode (STT_LOCAL_URL set): the bot runs on the same box as the worker,
+so instead of waiting for a socket it POSTs the audio to the worker's local
+HTTP side (`/v1/transcribe`, same bearer token) and reads `/healthz` for
+availability. Same statuses, same fallback.
 """
 from __future__ import annotations
 
@@ -25,17 +30,20 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 import struct
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional, Set
 
+import httpx
 import tornado.web
 import tornado.websocket
 
 from config import (
     STT_CLOUD_LANGS,
+    STT_LOCAL_URL,
     STT_SERVER_TOKEN,
     STT_TIMEOUT_BASE_SEC,
     STT_TIMEOUT_MAX_SEC,
@@ -180,7 +188,105 @@ _registry = _Registry()
 
 
 def is_available() -> bool:
-    return bool(STT_SERVER_TOKEN) and bool(_registry.workers) and not _registry.tripped()
+    if not STT_SERVER_TOKEN or _registry.tripped():
+        return False
+    if STT_LOCAL_URL:
+        return _local_healthy()
+    return bool(_registry.workers)
+
+
+# ----------------------------------------------------------------- local HTTP mode
+
+_LOCAL_HEALTH_TTL_SEC = 15.0
+_local_health: dict = {"ok": False, "at": -1e9}
+_local_client: Optional[httpx.AsyncClient] = None
+_probe_tasks: Set[asyncio.Task] = set()
+_ASCII_LANG = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,8})?$")
+
+
+async def prime() -> None:
+    """One synchronous worker probe at start-up (local mode only)."""
+    if STT_LOCAL_URL and STT_SERVER_TOKEN:
+        _local_health["at"] = time.monotonic()
+        await _refresh_local_health()
+
+
+async def close() -> None:
+    global _local_client
+    for t in list(_probe_tasks):
+        t.cancel()
+    if _local_client is not None:
+        await _local_client.aclose()
+        _local_client = None
+
+
+def _ascii_hint(lang_hint: Optional[str]) -> str:
+    """HTTP headers are latin-1; anything outside plain language codes is dropped."""
+    h = (lang_hint or "").strip().lower()
+    return h if _ASCII_LANG.match(h) else ""
+
+
+def _client() -> httpx.AsyncClient:
+    global _local_client
+    if _local_client is None:
+        _local_client = httpx.AsyncClient(base_url=STT_LOCAL_URL, timeout=httpx.Timeout(10.0))
+    return _local_client
+
+
+def _local_healthy() -> bool:
+    """Cached verdict from the last /healthz probe (refreshed in the background)."""
+    now = time.monotonic()
+    if now - _local_health["at"] > _LOCAL_HEALTH_TTL_SEC:
+        _local_health["at"] = now
+        try:
+            t = asyncio.get_running_loop().create_task(_refresh_local_health())
+            _probe_tasks.add(t)
+            t.add_done_callback(_probe_tasks.discard)
+        except RuntimeError:
+            pass
+    return bool(_local_health["ok"])
+
+
+async def _refresh_local_health() -> None:
+    ok = False
+    try:
+        r = await _client().get("/healthz")
+        ok = r.status_code == 200 and bool(r.json().get("ok"))
+        if not ok:
+            logger.info("stt_local_unhealthy status=%s body=%s", r.status_code, r.text[:120])
+    except Exception as e:  # noqa: BLE001
+        logger.info("stt_local_health_failed exc=%s", e)
+    was = _local_health["ok"]
+    _local_health["ok"] = ok
+    if was != ok:
+        logger.warning("stt_local_available=%s url=%s", ok, STT_LOCAL_URL)
+
+
+async def _transcribe_local(audio: bytes, mime_type: str, *,
+                            duration_sec: Optional[int], lang_hint: Optional[str],
+                            rid: str) -> dict:
+    headers = {"Authorization": "Bearer " + STT_SERVER_TOKEN, "Content-Type": mime_type,
+               "X-Request-Id": rid, "X-Duration": str(duration_sec or ""),
+               "X-Lang-Hint": _ascii_hint(lang_hint)}
+    try:
+        r = await _client().post("/v1/transcribe", content=audio, headers=headers,
+                                 timeout=httpx.Timeout(timeout_for(duration_sec), connect=5.0))
+    except httpx.TimeoutException as e:
+        _registry.note_timeout()
+        logger.warning("stt_local_timeout rid=%s duration=%s budget=%.0fs",
+                       rid, duration_sec, timeout_for(duration_sec))
+        raise WorkerUnavailable("local worker timeout") from e
+    except httpx.HTTPError as e:
+        _local_health["ok"] = False
+        raise WorkerUnavailable(f"local worker unreachable: {e}") from e
+    if r.status_code != 200:
+        if r.status_code in (503, 504):
+            _local_health["ok"] = False
+        raise WorkerUnavailable(f"local worker http {r.status_code}: {r.text[:120]}")
+    try:
+        return r.json()
+    except ValueError as e:
+        raise WorkerUnavailable("local worker bad json") from e
 
 
 def worker_count() -> int:
@@ -200,14 +306,18 @@ def _frame(header: dict, audio: bytes) -> bytes:
 async def transcribe(audio: bytes, mime_type: str, *,
                      duration_sec: Optional[int] = None,
                      lang_hint: Optional[str] = None) -> RemoteResult:
-    """Send one audio blob to a connected worker and wait for its verdict."""
+    """Send one audio blob to the worker (local HTTP or connected socket) and wait."""
+    rid = uuid.uuid4().hex
+    t0 = time.monotonic()
+    if STT_LOCAL_URL:
+        msg = await _transcribe_local(audio, mime_type, duration_sec=duration_sec,
+                                      lang_hint=lang_hint, rid=rid)
+        return _result_from(msg, rid, duration_sec, time.monotonic() - t0)
     ws = _registry.pick()
     if ws is None:
         raise WorkerUnavailable("no worker connected")
-    rid = uuid.uuid4().hex
     fut = _registry.register(rid)
     ws.outstanding.add(rid)
-    t0 = time.monotonic()
     try:
         try:
             await ws.write_message(
@@ -237,8 +347,11 @@ async def transcribe(audio: bytes, mime_type: str, *,
             fut.exception()
         elif not fut.done():
             fut.cancel()
+    return _result_from(msg, rid, duration_sec, time.monotonic() - t0)
+
+
+def _result_from(msg: dict, rid: str, duration_sec: Optional[int], elapsed: float) -> RemoteResult:
     status = str(msg.get("status") or "error")
-    elapsed = time.monotonic() - t0
     if status == "error":
         logger.warning("stt_remote_error rid=%s error=%s", rid, msg.get("error"))
         raise WorkerUnavailable(f"worker error: {msg.get('error')}")

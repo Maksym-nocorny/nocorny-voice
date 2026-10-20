@@ -35,6 +35,7 @@ from config import (
     MAX_CONCURRENT_GEMINI,
     MAX_DURATION_SEC,
     MAX_FILE_SIZE_MB,
+    TELEGRAM_GETFILE_READ_TIMEOUT_SEC,
     TELEGRAM_MAX_MESSAGE_LEN,
 )
 from i18n import get_text
@@ -163,16 +164,28 @@ async def _get_file_with_retry(context: ContextTypes.DEFAULT_TYPE,
     RetryAfter propagate immediately — those need handler-level handling.
     """
     try:
-        new_file = await context.bot.get_file(file_id)
-        await new_file.download_to_drive(dest_path)
+        new_file = await context.bot.get_file(file_id, read_timeout=TELEGRAM_GETFILE_READ_TIMEOUT_SEC)
+        await asyncio.to_thread(_download_sync, new_file, dest_path) \
+            if new_file.file_path and not new_file.file_path.startswith("http") \
+            else await new_file.download_to_drive(dest_path)
         return
     except (TimedOut, NetworkError) as e:
         logger.info(
             "telegram_download_retry class=%s msg=%s", type(e).__name__, e,
         )
     await asyncio.sleep(_DOWNLOAD_RETRY_SLEEP_SEC)
-    new_file = await context.bot.get_file(file_id)
-    await new_file.download_to_drive(dest_path)
+    new_file = await context.bot.get_file(file_id, read_timeout=TELEGRAM_GETFILE_READ_TIMEOUT_SEC)
+    if new_file.file_path and not new_file.file_path.startswith("http"):
+        await asyncio.to_thread(_download_sync, new_file, dest_path)
+    else:
+        await new_file.download_to_drive(dest_path)
+
+
+def _download_sync(new_file, dest_path: str) -> None:
+    """Local Bot API server: file_path is a path on this disk; copy it off the
+    event loop (a 50 MB clip would otherwise block every other user)."""
+    import shutil
+    shutil.copyfile(new_file.file_path, dest_path)
 
 
 @dataclass

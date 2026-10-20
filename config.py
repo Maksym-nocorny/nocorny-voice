@@ -100,7 +100,42 @@ MAX_CONCURRENT_GEMINI = max(1, _env_int("MAX_CONCURRENT_GEMINI", 2))
 # every slot (2026-09-27: 11 voices from one user held the whole bot).
 MAX_CONCURRENT_PER_USER = max(1, _env_int("MAX_CONCURRENT_PER_USER", 2))
 
+# --- Which copy of the bot is this, and who talks to Telegram ---
+# "m1": the primary, runs on the self-hosted box in polling mode (outbound
+#       only, nothing to expose). Heartbeats into the database and keeps the
+#       Telegram webhook deleted while it is alive.
+# "render": the standby on Render, webhook mode. Sets the webhook only when
+#       the primary's heartbeat is stale; drops it again once the primary is
+#       back. Unset = the pre-2026-10-20 behaviour: plain webhook, no lease.
+BOT_INSTANCE = (os.getenv("BOT_INSTANCE") or "").strip().lower()
+BOT_HEARTBEAT_SEC = max(5.0, _env_float("BOT_HEARTBEAT_SEC", 30.0))
+# Primary counts as gone after this long without a heartbeat (6 missed beats);
+# never below three beats, or a healthy primary would look dead between beats.
+BOT_STALE_SEC = max(3 * BOT_HEARTBEAT_SEC, _env_float("BOT_STALE_SEC", 180.0))
+# Primary only: when this file exists (the dispatcher's low-battery marker) the
+# primary hands over to the standby at once instead of dying with the battery.
+BOT_STOP_FLAG_FILE = os.getenv("BOT_STOP_FLAG_FILE") or ""
+# Primary: minimum gap between two cloud clean-ups (each logOut restarts the
+# cloud's 10-minute lockout, so a reclaim must not be repeated every beat).
+BOT_RECLAIM_MIN_GAP_SEC = _env_float("BOT_RECLAIM_MIN_GAP_SEC", 300.0)
+# Standby only: it must never call the cloud while the primary is alive, so it
+# cannot ask Telegram "who am I" at start-up; the id comes from the token and
+# the username from here (what python-telegram-bot would have fetched).
+BOT_USERNAME = os.getenv("BOT_USERNAME") or "NoCorny_voice_bot"
+# Self-hosted Telegram Bot API server (tdlib/telegram-bot-api --local), e.g.
+# http://127.0.0.1:8081. Lifts the cloud's 20 MB getFile limit; getFile then
+# returns a path on the local disk. Empty = api.telegram.org. The primary
+# logs the bot out of the cloud when this is set (Telegram: one server only).
+TELEGRAM_API_BASE_URL = (os.getenv("TELEGRAM_API_BASE_URL") or "").rstrip("/")
+# getFile on a local Bot API server first downloads the file from Telegram and
+# only then answers — a 50 MB clip needs well over the default 15 s.
+TELEGRAM_GETFILE_READ_TIMEOUT_SEC = _env_float(
+    "TELEGRAM_GETFILE_READ_TIMEOUT_SEC", 180.0 if TELEGRAM_API_BASE_URL else 15.0)
+
 # --- Local Whisper worker (self-hosted, connects to us over WebSocket) ---
+# When the bot itself runs next to the worker (primary on the same box), it
+# talks to the worker's local HTTP side instead: STT_LOCAL_URL, same token.
+STT_LOCAL_URL = (os.getenv("STT_LOCAL_URL") or "").rstrip("/")
 # The M1 at home runs scripts/stt_server.py from the dispatcher repo and dials
 # wss://<WEBHOOK_URL>/stt/worker with `Authorization: Bearer STT_SERVER_TOKEN`.
 # No worker connected (power cut, laptop asleep) -> every request goes to

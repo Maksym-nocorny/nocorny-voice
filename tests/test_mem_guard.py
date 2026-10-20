@@ -206,3 +206,15 @@ def test_read_rss_returns_plausible_value():
     assert rss is not None
     # A running pytest process holds tens of MB; anything in (1, 16384) is sane.
     assert 1.0 < rss < 16384.0
+
+
+def test_exit_fn_replaces_sys_exit(monkeypatch):
+    from utils import mem_guard
+    called = []
+    monkeypatch.setattr(mem_guard, "_exit_fn", lambda: called.append(1))
+    mem_guard._exit()
+    assert called == [1]
+    monkeypatch.setattr(mem_guard, "_exit_fn", None)
+    import pytest as _pt
+    with _pt.raises(SystemExit):
+        mem_guard._exit()

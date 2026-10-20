@@ -139,6 +139,18 @@ def _check_once(threshold_mb: float, min_uptime_sec: float,
         "Render restarts the service",
         rss_mb, threshold_mb, uptime_sec,
     )
+    _exit()
+
+
+_exit_fn: Optional[Callable[[], None]] = None
+
+
+def _exit() -> None:
+    """sys.exit(0) is what python-telegram-bot's own runner catches; a custom
+    runner (the standby) passes exit_fn instead, e.g. SIGTERM to itself."""
+    if _exit_fn is not None:
+        _exit_fn()
+        return
     sys.exit(0)
 
 
@@ -160,13 +172,16 @@ async def _loop(threshold_mb: float, interval_sec: float,
 def start(*, threshold_mb: float = MEM_GUARD_THRESHOLD_MB,
           interval_sec: float = MEM_GUARD_CHECK_INTERVAL_SEC,
           min_uptime_sec: float = MEM_GUARD_MIN_UPTIME_SEC,
-          busy_fn: Optional[Callable[[], int]] = None) -> None:
+          busy_fn: Optional[Callable[[], int]] = None,
+          exit_fn: Optional[Callable[[], None]] = None) -> None:
     """Start the background guard. Idempotent; threshold <= 0 disables it.
 
     `busy_fn` returns the number of updates accepted but not yet handled
     (e.g. `lambda: app.update_queue.qsize()`); those count as work in flight.
     """
     global _task, _started_at
+    global _exit_fn
+    _exit_fn = exit_fn
     if threshold_mb <= 0:
         logger.info("mem_guard_disabled threshold_mb=%s", threshold_mb)
         return
