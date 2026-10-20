@@ -532,7 +532,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 user.id, user.language_code):
             remote = await _transcribe_remote(
                 temp_path, info,
-                lang_routing.last_language(user.id) or user.language_code,
+                ",".join(lang_routing.recent_languages(user.id, user.language_code)),
                 duration_sec,
             )
             if remote is not None:

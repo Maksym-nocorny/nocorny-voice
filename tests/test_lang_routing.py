@@ -40,3 +40,11 @@ def test_remember_ignores_blanks():
     lang_routing.remember(3, "  ")
     lang_routing.remember(None, "fa")
     assert lang_routing.last_language(3) is None
+
+
+def test_recent_languages_keep_a_short_newest_first_list():
+    assert lang_routing.recent_languages(9, "EN") == ["en"]
+    assert lang_routing.recent_languages(9, None) == []
+    for code in ["ru", "uk", "ru", "en", "pl"]:
+        lang_routing.remember(9, code)
+    assert lang_routing.recent_languages(9, "fa") == ["pl", "en", "ru"]

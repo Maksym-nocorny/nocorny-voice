@@ -20,6 +20,11 @@ from cachetools import TTLCache
 from config import STT_CLOUD_LANGS
 
 _last_lang: TTLCache = TTLCache(maxsize=20_000, ttl=30 * 24 * 3600)
+# The last few distinct languages heard from a user, newest first. Bilingual
+# users switch between messages; the worker builds its decoder hint (the
+# profanity list Whisper otherwise censors) from all of them.
+_recent_langs: TTLCache = TTLCache(maxsize=20_000, ttl=30 * 24 * 3600)
+RECENT_LANGS_MAX = 3
 
 
 def _norm(code: Optional[str]) -> Optional[str]:
@@ -41,6 +46,17 @@ def remember(user_id: Optional[int], detected: Optional[str]) -> None:
     if user_id is None or not code:
         return
     _last_lang[user_id] = code
+    recent = [c for c in _recent_langs.get(user_id, []) if c != code]
+    _recent_langs[user_id] = [code] + recent[:RECENT_LANGS_MAX - 1]
+
+
+def recent_languages(user_id: Optional[int], ui_language: Optional[str] = None) -> list:
+    """Languages to hint the worker with: what we heard from this user lately,
+    newest first, falling back to the Telegram UI language."""
+    if user_id is not None and _recent_langs.get(user_id):
+        return list(_recent_langs[user_id])
+    ui = _norm(ui_language)
+    return [ui] if ui else []
 
 
 def last_language(user_id: Optional[int]) -> Optional[str]:
@@ -59,3 +75,4 @@ def prefers_cloud(user_id: Optional[int], ui_language: Optional[str]) -> bool:
 
 def reset() -> None:  # tests
     _last_lang.clear()
+    _recent_langs.clear()

@@ -98,3 +98,9 @@ async def test_local_mode_ignores_socket_workers(monkeypatch, local):
     _install(monkeypatch, lambda req: httpx.Response(200, json={"status": "empty", "speech_sec": 0}))
     res = await stt_remote.transcribe(b"x", "audio/ogg", duration_sec=3)
     assert res.status == "empty"
+
+
+def test_ascii_hint_keeps_a_comma_list_and_drops_junk(local):
+    assert stt_remote._ascii_hint("ru,uk") == "ru,uk"
+    assert stt_remote._ascii_hint("укр,en, pt-br") == "en,pt-br"
+    assert stt_remote._ascii_hint(None) == ""

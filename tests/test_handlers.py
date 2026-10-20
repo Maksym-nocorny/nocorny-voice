@@ -994,3 +994,16 @@ async def test_gemini_calls_are_capped_separately(monkeypatch, _worker_env):
     gate.set()
     await asyncio.gather(*tasks)
     assert peak[0] == 2
+
+
+async def test_bilingual_user_hint_lists_recent_languages(monkeypatch, _worker_env):
+    import lang_routing
+    import stt_remote
+    from handlers import transcribe as t
+    remote = AsyncMock(return_value=stt_remote.RemoteResult(status="ok", language="uk", text="т"))
+    monkeypatch.setattr(stt_remote, "transcribe", remote)
+    lang_routing.remember(7, "ru")
+    lang_routing.remember(7, "uk")
+    update, context, _, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+    assert remote.await_args.kwargs["lang_hint"] == "uk,ru"

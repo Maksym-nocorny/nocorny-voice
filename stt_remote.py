@@ -202,6 +202,7 @@ _local_health: dict = {"ok": False, "at": -1e9}
 _local_client: Optional[httpx.AsyncClient] = None
 _probe_tasks: Set[asyncio.Task] = set()
 _ASCII_LANG = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,8})?$")
+_MAX_HINTS = 3
 
 
 async def prime() -> None:
@@ -221,9 +222,10 @@ async def close() -> None:
 
 
 def _ascii_hint(lang_hint: Optional[str]) -> str:
-    """HTTP headers are latin-1; anything outside plain language codes is dropped."""
-    h = (lang_hint or "").strip().lower()
-    return h if _ASCII_LANG.match(h) else ""
+    """Comma-separated language codes, newest first; anything that is not a
+    plain code is dropped (HTTP headers are latin-1)."""
+    parts = [p.strip().lower() for p in (lang_hint or "").split(",")]
+    return ",".join([p for p in parts if _ASCII_LANG.match(p)][:_MAX_HINTS])
 
 
 def _client() -> httpx.AsyncClient:
@@ -321,7 +323,7 @@ async def transcribe(audio: bytes, mime_type: str, *,
     try:
         try:
             await ws.write_message(
-                _frame({"id": rid, "duration": duration_sec, "lang_hint": lang_hint,
+                _frame({"id": rid, "duration": duration_sec, "lang_hint": _ascii_hint(lang_hint),
                         "mime": mime_type}, audio),
                 binary=True,
             )
