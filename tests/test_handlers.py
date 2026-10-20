@@ -964,3 +964,33 @@ async def test_long_file_skips_probe(monkeypatch, _worker_env):
     update, context, _, _ = _make_update_context(voice=_make_voice(duration=600))
     await t.handle_message(update, context)
     probe.assert_not_awaited()
+
+
+async def test_gemini_calls_are_capped_separately(monkeypatch, _worker_env):
+    """Five global slots, but only MAX_CONCURRENT_GEMINI Gemini calls at once."""
+    import asyncio
+    import stt_remote
+    from handlers import transcribe as t
+    monkeypatch.setattr(stt_remote, "is_available", lambda: False)
+    monkeypatch.setattr(t, "MAX_CONCURRENT_GEMINI", 2)
+    monkeypatch.setattr(t, "_gemini_gate", None)
+    running, peak, gate = [0], [0], asyncio.Event()
+
+    async def slow_gemini(*a, **kw):
+        running[0] += 1
+        peak[0] = max(peak[0], running[0])
+        await gate.wait()
+        running[0] -= 1
+        return GeminiResult(text="x", prompt_tokens=1, candidates_tokens=1, total_tokens=2)
+    monkeypatch.setattr(gemini_service, "transcribe", slow_gemini)
+    tasks = []
+    for i in range(5):
+        update, context, _, _ = _make_update_context(
+            voice=_make_voice(file_id=f"f{i}", file_unique_id=f"u{i}"))
+        tasks.append(asyncio.create_task(t.handle_message(update, context)))
+    for _ in range(30):
+        await asyncio.sleep(0)
+    assert running[0] == 2
+    gate.set()
+    await asyncio.gather(*tasks)
+    assert peak[0] == 2

@@ -32,6 +32,7 @@ import rate_limit
 import stt_remote
 from config import (
     EMPTY_AUDIO_PROBE_MAX_SEC,
+    MAX_CONCURRENT_GEMINI,
     MAX_DURATION_SEC,
     MAX_FILE_SIZE_MB,
     TELEGRAM_MAX_MESSAGE_LEN,
@@ -69,6 +70,18 @@ def _is_message_gone(exc: BadRequest) -> bool:
 # 5-6s; longer waits mean give up on the status message and let the rest of
 # the flow proceed.
 _RETRY_AFTER_MAX_SLEEP_SEC = 6.0
+
+# Gemini calls get their own, lower cap than the global transcription slots:
+# the global number is sized for the Whisper worker, the Gemini path is sized
+# for this container's memory. Created lazily inside the running loop.
+_gemini_gate: Optional[asyncio.Semaphore] = None
+
+
+def _gemini_slot() -> asyncio.Semaphore:
+    global _gemini_gate
+    if _gemini_gate is None:
+        _gemini_gate = asyncio.Semaphore(MAX_CONCURRENT_GEMINI)
+    return _gemini_gate
 
 # A transcript made only of timestamps, punctuation and arrows is not speech:
 # on an empty video note Gemini once answered with a list of timestamps
@@ -530,9 +543,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 remote.language)
         try:
             if result is None:
-                result = await gemini_service.transcribe(
-                    temp_path, info.mime_type, duration_sec=duration_sec
-                )
+                async with _gemini_slot():
+                    result = await gemini_service.transcribe(
+                        temp_path, info.mime_type, duration_sec=duration_sec
+                    )
                 lang_routing.remember(user.id, result.detected_language)
                 if looks_like_timestamps_only(result.text):
                     analytics.track(

@@ -81,12 +81,20 @@ TRANSCRIBE_RETRY_FINAL_TEMPERATURE = _env_float("TRANSCRIBE_RETRY_FINAL_TEMPERAT
 TRANSCRIBE_CHUNK_SEC = _env_int("TRANSCRIBE_CHUNK_SEC", 150)
 # Max parallel Gemini transcribe calls when chunking. Keep modest to avoid rate limits.
 TRANSCRIBE_CHUNK_CONCURRENCY = _env_int("TRANSCRIBE_CHUNK_CONCURRENCY", 3)
-# Max media messages transcribed at once across ALL users. Raised 2 -> 3 on
+# Max media messages transcribed at once across ALL users. Raised 2 -> 5 on
 # 2026-10-20 together with the local Whisper worker: with the heavy lifting on
-# the M1 the Render process mostly waits on the socket. Still bounded by RSS on
-# the 512 MiB plan: ffmpeg children count against the container limit but not
-# mem_guard's RSS.
-MAX_CONCURRENT_TRANSCRIPTIONS = max(1, _env_int("MAX_CONCURRENT_TRANSCRIPTIONS", 3))
+# the worker this process mostly waits on the socket (the worker itself runs
+# five decodes side by side; measured on its 8 GB host: shared model weights
+# plus ~135 MB per decode). The Gemini path keeps its own, lower cap below.
+# Still: download + ffmpeg probe/re-encode run before either path, and ffmpeg
+# children count against the 512 MiB container limit but not mem_guard's RSS.
+MAX_CONCURRENT_TRANSCRIPTIONS = max(1, _env_int("MAX_CONCURRENT_TRANSCRIPTIONS", 5))
+# How many of those may be inside a Gemini call at once (worker down, Persian,
+# fallback). This is the old global cap: each Gemini transcription spawns
+# ffmpeg and holds the audio in memory, and the 512 MiB plan OOM-killed us at
+# higher counts. Bounded separately so a worker outage never turns five slots
+# into five Gemini jobs.
+MAX_CONCURRENT_GEMINI = max(1, _env_int("MAX_CONCURRENT_GEMINI", 2))
 # How many of those slots ONE user (one chat in groups) may hold at a time.
 # Kept below the global cap so a user forwarding a backlog can never take
 # every slot (2026-09-27: 11 voices from one user held the whole bot).
