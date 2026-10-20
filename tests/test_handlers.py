@@ -730,3 +730,237 @@ async def test_safe_edit_propagates_other_badrequests():
     m.edit_text = AsyncMock(side_effect=BadRequest("Some other validation error"))
     with pytest.raises(BadRequest):
         await _safe_edit(m, "anything")
+
+
+# --------------------------------------------------------------------- Local worker / empty audio
+
+
+def _probe(max_db: float):
+    import audio_probe
+    return AsyncMock(return_value=audio_probe.Loudness(max_db=max_db, mean_db=max_db - 10))
+
+
+@pytest.fixture
+def _worker_env(monkeypatch):
+    """Worker 'connected', probe says 'loud enough', Gemini must not be called."""
+    import audio_probe
+    import lang_routing
+    import stt_remote
+    from handlers import transcribe as t
+    lang_routing.reset()
+    monkeypatch.setattr(audio_probe, "measure", _probe(-20.0))
+    monkeypatch.setattr(stt_remote, "is_available", lambda: True)
+    # Non-voice media is re-encoded before it leaves for the worker; there is
+    # no real file behind the mocked download, so stand in for ffmpeg.
+    import tempfile
+
+    async def fake_reencode(path, mime):
+        return path, "audio/ogg", tempfile.mkdtemp(prefix="nv_test_")
+    monkeypatch.setattr(gemini_service, "_reencode_to_opus", fake_reencode)
+    monkeypatch.setattr(gemini_service, "_read_file_bytes", lambda p: b"OGG")
+    gemini_spy = AsyncMock(side_effect=AssertionError("Gemini must not be called"))
+    monkeypatch.setattr(gemini_service, "transcribe", gemini_spy)
+    tracked = []
+    monkeypatch.setattr(t.analytics, "track",
+                        lambda ev, **kw: tracked.append((ev, kw.get("error_class"))))
+    yield SimpleNamespace(gemini=gemini_spy, tracked=tracked)
+    lang_routing.reset()
+
+
+async def test_worker_result_is_sent_and_cached_without_gemini(monkeypatch, _worker_env):
+    import stt_remote
+    from handlers import transcribe as t
+    remote = AsyncMock(return_value=stt_remote.RemoteResult(
+        status="ok", language="ru", text="локальний текст", speech_sec=4.0))
+    monkeypatch.setattr(stt_remote, "transcribe", remote)
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+
+    remote.assert_awaited_once()
+    assert remote.await_args.kwargs["duration_sec"] == 10
+    assert remote.await_args.kwargs["lang_hint"] == "en"
+    # a voice message travels as-is (opus already), no re-encode
+    assert "локальний текст" in status.edit_text.await_args_list[-1].args[0]
+    cached = cache.get_transcription("uniq_a")
+    assert cached is not None and cached.detected_language == "ru"
+    assert ("transcribe_success", None) in _worker_env.tracked
+
+
+async def test_worker_unavailable_falls_back_to_gemini(monkeypatch, _worker_env):
+    import stt_remote
+    from handlers import transcribe as t
+    monkeypatch.setattr(stt_remote, "transcribe",
+                        AsyncMock(side_effect=stt_remote.WorkerUnavailable("down")))
+    gemini = AsyncMock(return_value=GeminiResult(text="cloud text", prompt_tokens=1,
+                                                 candidates_tokens=1, total_tokens=2))
+    monkeypatch.setattr(gemini_service, "transcribe", gemini)
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+
+    gemini.assert_awaited_once()
+    assert "cloud text" in status.edit_text.await_args_list[-1].args[0]
+
+
+async def test_worker_cloud_language_goes_to_gemini_and_is_remembered(monkeypatch, _worker_env):
+    import lang_routing
+    import stt_remote
+    from handlers import transcribe as t
+    monkeypatch.setattr(lang_routing, "STT_CLOUD_LANGS", frozenset({"fa"}))
+    remote = AsyncMock(return_value=stt_remote.RemoteResult(status="cloud", language="fa"))
+    monkeypatch.setattr(stt_remote, "transcribe", remote)
+    gemini = AsyncMock(return_value=GeminiResult(text="متن", prompt_tokens=1,
+                                                 candidates_tokens=1, total_tokens=2,
+                                                 detected_language="fa"))
+    monkeypatch.setattr(gemini_service, "transcribe", gemini)
+
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+    gemini.assert_awaited_once()
+    assert "متن" in status.edit_text.await_args_list[-1].args[0]
+
+    # Second message from the same user skips the worker entirely.
+    update2, context2, status2, _ = _make_update_context(
+        voice=_make_voice(file_id="f2", file_unique_id="u2"))
+    await t.handle_message(update2, context2)
+    assert remote.await_count == 1
+    assert gemini.await_count == 2
+
+
+async def test_persian_ui_user_skips_worker(monkeypatch, _worker_env):
+    import lang_routing
+    import stt_remote
+    from handlers import transcribe as t
+    monkeypatch.setattr(lang_routing, "STT_CLOUD_LANGS", frozenset({"fa"}))
+    remote = AsyncMock()
+    monkeypatch.setattr(stt_remote, "transcribe", remote)
+    gemini = AsyncMock(return_value=GeminiResult(text="x", prompt_tokens=1,
+                                                 candidates_tokens=1, total_tokens=2))
+    monkeypatch.setattr(gemini_service, "transcribe", gemini)
+    update, context, _, _ = _make_update_context(user_lang="fa", voice=_make_voice())
+    await t.handle_message(update, context)
+    remote.assert_not_awaited()
+    gemini.assert_awaited_once()
+
+
+async def test_worker_empty_private_chat_tells_user(monkeypatch, _worker_env):
+    import stt_remote
+    from handlers import transcribe as t
+    from i18n import get_text
+    monkeypatch.setattr(stt_remote, "transcribe", AsyncMock(return_value=stt_remote.RemoteResult(
+        status="empty", speech_sec=0.0)))
+    update, context, status, _ = _make_update_context(video_note=_make_voice())
+    await t.handle_message(update, context)
+    assert status.edit_text.await_args_list[-1].args[0] == get_text("en", "media_no_speech")
+    assert ("transcribe_empty", "no_speech") in _worker_env.tracked
+    assert cache.get_transcription("uniq_a") is None
+    # exactly one reply (the status), nothing else was sent
+    assert update.message.reply_text.await_count == 1
+
+
+async def test_worker_empty_in_group_is_silent(monkeypatch, _worker_env):
+    import stt_remote
+    from handlers import transcribe as t
+    monkeypatch.setattr(stt_remote, "transcribe", AsyncMock(return_value=stt_remote.RemoteResult(
+        status="empty", speech_sec=0.2)))
+    update, context, status, _ = _make_update_context(chat_type="supergroup",
+                                                      video_note=_make_voice())
+    await t.handle_message(update, context)
+    status.delete.assert_awaited_once()
+    # status text was never replaced with "no speech" and no further reply went out
+    texts = [c.args[0] for c in status.edit_text.await_args_list]
+    assert all("speech" not in s.lower() for s in texts)
+    assert update.message.reply_text.await_count == 1
+
+
+async def test_silent_file_is_rejected_before_any_engine(monkeypatch, _worker_env):
+    import audio_probe
+    import stt_remote
+    from handlers import transcribe as t
+    from i18n import get_text
+    monkeypatch.setattr(audio_probe, "measure", _probe(-80.0))
+    remote = AsyncMock()
+    monkeypatch.setattr(stt_remote, "transcribe", remote)
+    update, context, status, _ = _make_update_context(voice=_make_voice())
+    await t.handle_message(update, context)
+    remote.assert_not_awaited()
+    assert status.edit_text.await_args_list[-1].args[0] == get_text("en", "media_no_speech")
+    assert ("transcribe_empty", "silent") in _worker_env.tracked
+
+
+async def test_gemini_timestamps_only_counts_as_empty(monkeypatch, _worker_env):
+    import stt_remote
+    from handlers import transcribe as t
+    from i18n import get_text
+    monkeypatch.setattr(stt_remote, "is_available", lambda: False)
+    gemini = AsyncMock(return_value=GeminiResult(
+        text="00:00 - 00:05\n00:05 - 00:10\n00:10 - 00:15", prompt_tokens=10,
+        candidates_tokens=5, total_tokens=15))
+    monkeypatch.setattr(gemini_service, "transcribe", gemini)
+    update, context, status, _ = _make_update_context(video_note=_make_voice())
+    await t.handle_message(update, context)
+    assert status.edit_text.await_args_list[-1].args[0] == get_text("en", "media_no_speech")
+    assert ("transcribe_degraded", "timestamps_only") in _worker_env.tracked
+    assert ("transcribe_empty", "timestamps_only") in _worker_env.tracked
+    assert cache.get_transcription("uniq_a") is None
+
+
+def test_timestamps_only_detector():
+    from handlers.transcribe import looks_like_timestamps_only
+    assert looks_like_timestamps_only("00:00 - 00:05, 00:05 - 00:10")
+    assert looks_like_timestamps_only("[00:01.200 --> 00:04.000]\n[00:04 → 00:09]")
+    assert not looks_like_timestamps_only("00:05 we start at five")
+    assert not looks_like_timestamps_only("")
+    # spoken numbers come back as digits and must survive
+    assert not looks_like_timestamps_only("123 456")
+    assert not looks_like_timestamps_only("5")
+    assert not looks_like_timestamps_only("10:30")
+    assert not looks_like_timestamps_only("067 123 45 67")
+    # pure punctuation is not a transcript
+    assert looks_like_timestamps_only("...")
+    assert looks_like_timestamps_only("— —")
+
+
+async def test_non_voice_reencode_failure_skips_worker(monkeypatch, _worker_env):
+    import stt_remote
+    from handlers import transcribe as t
+
+    async def failing_reencode(path, mime):
+        return path, mime, None
+    monkeypatch.setattr(gemini_service, "_reencode_to_opus", failing_reencode)
+    remote = AsyncMock()
+    monkeypatch.setattr(stt_remote, "transcribe", remote)
+    gemini = AsyncMock(return_value=GeminiResult(text="cloud", prompt_tokens=1,
+                                                 candidates_tokens=1, total_tokens=2))
+    monkeypatch.setattr(gemini_service, "transcribe", gemini)
+    update, context, status, _ = _make_update_context(video_note=_make_voice())
+    await t.handle_message(update, context)
+    remote.assert_not_awaited()
+    gemini.assert_awaited_once()
+
+
+async def test_probe_duration_fills_missing_telegram_duration(monkeypatch, _worker_env):
+    import audio_probe
+    import stt_remote
+    from handlers import transcribe as t
+    monkeypatch.setattr(audio_probe, "measure", AsyncMock(return_value=audio_probe.Loudness(
+        max_db=-20.0, mean_db=-30.0, duration_sec=77)))
+    remote = AsyncMock(return_value=stt_remote.RemoteResult(status="ok", language="en", text="t"))
+    monkeypatch.setattr(stt_remote, "transcribe", remote)
+    update, context, _, _ = _make_update_context(voice=_make_voice(duration=0))
+    await t.handle_message(update, context)
+    assert remote.await_args.kwargs["duration_sec"] == 77
+
+
+async def test_long_file_skips_probe(monkeypatch, _worker_env):
+    import audio_probe
+    import stt_remote
+    from handlers import transcribe as t
+    probe = _probe(-20.0)
+    monkeypatch.setattr(audio_probe, "measure", probe)
+    monkeypatch.setattr(stt_remote, "transcribe", AsyncMock(return_value=stt_remote.RemoteResult(
+        status="ok", language="en", text="t")))
+    update, context, _, _ = _make_update_context(voice=_make_voice(duration=600))
+    await t.handle_message(update, context)
+    probe.assert_not_awaited()

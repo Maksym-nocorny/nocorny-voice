@@ -6,3 +6,5 @@ asyncpg==0.30.0
 cffi>=1.17
 # Bundled ffmpeg binary so chunking works on Render Free without apt-get.
 imageio-ffmpeg==0.6.0
+# Webhook server; pinned to the version the test suite runs on.
+tornado==6.5.2

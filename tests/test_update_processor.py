@@ -146,3 +146,28 @@ async def test_group_chat_is_serialized_per_chat():
 def test_zero_or_negative_cap_rejected():
     with pytest.raises(ValueError):
         FairUpdateProcessor(max_media=0)
+
+
+@pytest.mark.asyncio
+async def test_per_user_cap_allows_parallel_but_leaves_a_slot_for_others():
+    p = FairUpdateProcessor(max_media=3, max_per_user=2)
+    rec, gate = _Recorder(), asyncio.Event()
+    flood = [asyncio.create_task(p.process_update(_update(1), rec.job(f"a{i}", gate)))
+             for i in range(6)]
+    await _settle()
+    # Two of user 1's files run side by side, the third slot stays free...
+    assert rec.running == 2
+    other = asyncio.create_task(p.process_update(_update(2), rec.job("boss", gate)))
+    await _settle()
+    # ...so another user starts immediately.
+    assert ("start", "boss") in rec.log and rec.running == 3
+    gate.set()
+    await asyncio.gather(*flood, other)
+    assert rec.peak == 3 and p.busy_count() == 0 and p._user_locks == {}
+
+
+def test_per_user_cap_is_clamped_to_global():
+    p = FairUpdateProcessor(max_media=2, max_per_user=5)
+    assert p._max_per_user == 2
+    with pytest.raises(ValueError):
+        FairUpdateProcessor(max_media=2, max_per_user=0)

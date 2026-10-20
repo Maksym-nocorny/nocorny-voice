@@ -5,12 +5,15 @@ bot. On 2026-09-27 a user forwarded 11 voice messages in a row and every other
 user (the owner included) waited ~3.5 minutes behind them.
 
 Rules:
-  - Media updates (voice / audio / video / video note) are serialized PER USER
-    (per chat in groups) — a user's own files still come back in the order they were sent — and at
-    most `max_media` transcriptions run at once across all users, which keeps
-    RSS inside Render's 512 MiB.
-  - The per-user lock is taken BEFORE the global media slot, so a user with a
-    backlog holds at most one slot while their other files wait.
+  - Media updates (voice / audio / video / video note) run at most `max_media`
+    at once across all users (keeps RSS inside Render's 512 MiB) and at most
+    `max_per_user` at once for one user. Since 2026-10-20 a user's files may
+    run in parallel in private chats (replies quote the message they answer,
+    so order no longer matters) — but the per-user cap stays below the global
+    one so a backlog from one user can never take every slot. Groups stay one
+    at a time per chat: Telegram throttles bots at ~20 messages/minute/group.
+  - The per-user slot is taken BEFORE the global media slot, so a user with a
+    backlog holds at most `max_per_user` slots while their other files wait.
   - Everything else (/start, /stats, callback buttons) is not throttled and
     never waits behind a transcription.
 
@@ -53,17 +56,20 @@ def _media_key(update: object) -> Optional[Hashable]:
 
 
 class FairUpdateProcessor(BaseUpdateProcessor):
-    __slots__ = ("_max_media", "_media_sem", "_user_locks", "_busy")
+    __slots__ = ("_max_media", "_max_per_user", "_media_sem", "_user_locks", "_busy")
 
-    def __init__(self, max_media: int):
+    def __init__(self, max_media: int, max_per_user: int = 1):
         super().__init__(_MAX_CONCURRENT_UPDATES)
         if max_media < 1:
             raise ValueError("max_media must be a positive integer")
+        if max_per_user < 1:
+            raise ValueError("max_per_user must be a positive integer")
         self._max_media = max_media
+        self._max_per_user = min(max_per_user, max_media)
         # Created on first use, inside the running loop (Python <3.10 binds
         # asyncio primitives to the loop current at construction time).
         self._media_sem: Optional[asyncio.Semaphore] = None
-        # key -> [lock, number of updates holding or waiting on it]
+        # key -> [semaphore, number of updates holding or waiting on it]
         self._user_locks: Dict[Hashable, list] = {}
         self._busy = 0
 
@@ -80,7 +86,10 @@ class FairUpdateProcessor(BaseUpdateProcessor):
                 return
             entry = self._user_locks.get(key)
             if entry is None:
-                entry = self._user_locks[key] = [asyncio.Lock(), 0]
+                # Groups stay one at a time per chat: parallel replies there
+                # would hit Telegram's ~20 messages/minute per-group limit.
+                per_key = 1 if key[0] == "chat" else self._max_per_user
+                entry = self._user_locks[key] = [asyncio.Semaphore(per_key), 0]
             if self._media_sem is None:
                 self._media_sem = asyncio.Semaphore(self._max_media)
             entry[1] += 1
@@ -100,7 +109,8 @@ class FairUpdateProcessor(BaseUpdateProcessor):
             self._busy -= 1
 
     async def initialize(self) -> None:
-        logger.info("update_processor_started max_media=%d", self._max_media)
+        logger.info("update_processor_started max_media=%d max_per_user=%d",
+                    self._max_media, self._max_per_user)
 
     async def shutdown(self) -> None:
         pass

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -23,10 +24,14 @@ from telegram.ext import ContextTypes
 from google.api_core import exceptions as google_exceptions
 
 import analytics
+import audio_probe
 import cache
 import gemini_service
+import lang_routing
 import rate_limit
+import stt_remote
 from config import (
+    EMPTY_AUDIO_PROBE_MAX_SEC,
     MAX_DURATION_SEC,
     MAX_FILE_SIZE_MB,
     TELEGRAM_MAX_MESSAGE_LEN,
@@ -64,6 +69,25 @@ def _is_message_gone(exc: BadRequest) -> bool:
 # 5-6s; longer waits mean give up on the status message and let the rest of
 # the flow proceed.
 _RETRY_AFTER_MAX_SLEEP_SEC = 6.0
+
+# A transcript made only of timestamps, punctuation and arrows is not speech:
+# on an empty video note Gemini once answered with a list of timestamps
+# ("00:00 - 00:05, 00:05 - 00:10 ...") and the user got that as "text". A
+# spoken number ("5", "10:30", a phone number) also comes back as digits, so
+# digits alone are NOT enough: it takes at least two clock tokens, or no digit
+# at all (pure punctuation such as "..." or "—").
+_TIMESTAMPS_ONLY_RE = re.compile(r"^[\s\d:.,;\-\u2013\u2014\[\]()<>\u2192|/]*$")
+_CLOCK_TOKEN_RE = re.compile(r"\d{1,2}:\d{2}")
+_ANY_DIGIT_RE = re.compile(r"\d")
+
+
+def looks_like_timestamps_only(text: str) -> bool:
+    t = text.strip()
+    if not t or _TIMESTAMPS_ONLY_RE.match(t) is None:
+        return False
+    if not _ANY_DIGIT_RE.search(t):
+        return True
+    return len(_CLOCK_TOKEN_RE.findall(t)) >= 2
 
 
 async def _safe_edit(message: Optional[Message], text: str, **kwargs) -> bool:
@@ -146,6 +170,9 @@ class _MediaInfo:
     mime_type: str
     duration: Optional[int]
     file_size: Optional[int]
+    # "voice" | "video_note" | "audio" | "video" — only voice is known to be a
+    # small opus file; everything else is re-encoded before leaving the box.
+    kind: str = "audio"
 
 
 def _extract_media_info(message: Message) -> Optional[_MediaInfo]:
@@ -156,10 +183,12 @@ def _extract_media_info(message: Message) -> Optional[_MediaInfo]:
     # too_short purely because metadata is missing.
     if message.voice:
         m = message.voice
-        return _MediaInfo(m.file_id, m.file_unique_id, ".ogg", "audio/ogg", m.duration or None, m.file_size)
+        return _MediaInfo(m.file_id, m.file_unique_id, ".ogg", "audio/ogg", m.duration or None,
+                          m.file_size, kind="voice")
     if message.video_note:
         m = message.video_note
-        return _MediaInfo(m.file_id, m.file_unique_id, ".mp4", "video/mp4", m.duration or None, m.file_size)
+        return _MediaInfo(m.file_id, m.file_unique_id, ".mp4", "video/mp4", m.duration or None,
+                          m.file_size, kind="video_note")
     if message.audio:
         m = message.audio
         return _MediaInfo(
@@ -169,6 +198,7 @@ def _extract_media_info(message: Message) -> Optional[_MediaInfo]:
             m.mime_type or "audio/mpeg",
             m.duration or None,
             m.file_size,
+            kind="audio",
         )
     if message.video:
         m = message.video
@@ -179,6 +209,7 @@ def _extract_media_info(message: Message) -> Optional[_MediaInfo]:
             m.mime_type or "video/mp4",
             m.duration or None,
             m.file_size,
+            kind="video",
         )
     return None
 
@@ -209,7 +240,7 @@ async def _send_transcription(
                     await status_message.delete()
                 except TelegramError:
                     pass
-        await update.message.reply_text(full_message, parse_mode="HTML")
+        await update.message.reply_text(full_message, parse_mode="HTML", do_quote=True)
         return
 
     # Chunked path
@@ -222,7 +253,80 @@ async def _send_transcription(
     for i, chunk in enumerate(chunks):
         body = escape_html(chunk)
         msg_text = (prefix + body) if i == 0 else body
-        await update.message.reply_text(msg_text, parse_mode="HTML")
+        await update.message.reply_text(msg_text, parse_mode="HTML", do_quote=True)
+
+
+async def _finish_empty(
+    update: Update,
+    user_lang: str,
+    is_group: bool,
+    status_message: Optional[Message],
+    *,
+    reason: str,
+    detail: str = "",
+    user=None,
+    chat=None,
+    info: Optional[_MediaInfo] = None,
+    t0: float = 0.0,
+) -> None:
+    """Nobody spoke. Private chat: say so. Group: say nothing at all — a bot
+    announcing "this circle was empty" in a 200-person group is noise, and the
+    sender can see for themselves."""
+    logger.info("transcribe_empty reason=%s %s mime=%s duration=%s",
+                reason, detail, getattr(info, "mime_type", None),
+                getattr(info, "duration", None))
+    analytics.track(
+        "transcribe_empty", user=user, chat=chat, info=info,
+        error_class=reason,
+        latency_ms=int((time.monotonic() - t0) * 1000) if t0 else None,
+    )
+    if is_group:
+        if status_message is not None:
+            try:
+                await status_message.delete()
+            except TelegramError as e:
+                logger.info("transcribe_empty_status_delete_failed msg=%s", e)
+        return
+    await _safe_edit(status_message, get_text(user_lang, "media_no_speech"))
+
+
+async def _transcribe_remote(temp_path: str, info: _MediaInfo,
+                             lang_hint: Optional[str],
+                             duration_sec: Optional[int]) -> Optional[stt_remote.RemoteResult]:
+    """Ship the audio to the connected Whisper worker. None = fall back to Gemini.
+
+    Voice messages are already small opus files and go as-is; anything else
+    (video notes, mp3, mp4, uploaded .ogg) is re-encoded to 32k opus first so
+    a 20 MB clip never travels the socket raw — and if that re-encode fails,
+    the worker is skipped rather than fed the original."""
+    send_path, reencode_dir = temp_path, None
+    if info.kind != "voice":
+        send_path, _mime, reencode_dir = await gemini_service._reencode_to_opus(
+            temp_path, info.mime_type
+        )
+        if reencode_dir is None:
+            logger.warning("stt_remote_skipped reason=reencode_failed kind=%s mime=%s",
+                           info.kind, info.mime_type)
+            return None
+    try:
+        audio = await asyncio.to_thread(gemini_service._read_file_bytes, send_path)
+        return await stt_remote.transcribe(
+            audio, "audio/ogg", duration_sec=duration_sec, lang_hint=lang_hint,
+        )
+    except stt_remote.WorkerUnavailable as e:
+        logger.warning("stt_remote_unavailable reason=%s — falling back to Gemini", e)
+        return None
+    except Exception as e:  # noqa: BLE001 — never let the worker path break the request
+        logger.exception("stt_remote_failed exc=%s — falling back to Gemini", e)
+        return None
+    finally:
+        if reencode_dir:
+            await asyncio.to_thread(_rmtree_quiet, reencode_dir)
+
+
+def _rmtree_quiet(path: str) -> None:
+    import shutil
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _validation_error(info: _MediaInfo, user_lang: str) -> Optional[Tuple[str, str]]:
@@ -314,7 +418,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # _send_transcription gets its own chance to land.
     status_message: Optional[Message] = None
     try:
-        status_message = await update.message.reply_text(get_text(user_lang, "downloading"))
+        # Quote the source: with two of a user's files in flight at once the
+        # answers may land out of order, and the quote says which is which.
+        status_message = await update.message.reply_text(
+            get_text(user_lang, "downloading"), do_quote=True
+        )
     except BadRequest as e:
         # BadRequest must precede NetworkError (PTB makes BadRequest a
         # NetworkError subclass).
@@ -374,13 +482,70 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
+        # Nobody spoke? Catch pure silence before any engine hears it (the
+        # worker adds a real voice detector on top; this one also covers the
+        # Gemini-only path). Long files skip it: decoding them costs real CPU
+        # on this box and nobody records 10 silent minutes by accident.
+        loud = None
+        if info.duration is None or info.duration <= EMPTY_AUDIO_PROBE_MAX_SEC:
+            loud = await audio_probe.measure(temp_path)
+        duration_sec = info.duration or (loud.duration_sec if loud else None)
+        if loud is not None and loud.is_empty:
+            await _finish_empty(
+                update, user_lang, is_group, status_message, reason="silent",
+                detail=f"max_db={loud.max_db:.1f}", user=user, chat=chat, info=info, t0=t0,
+            )
+            return
+
         await _safe_edit(status_message, get_text(user_lang, "transcribing"))
 
         analytics.track("transcribe_request", user=user, chat=chat, info=info)
-        try:
-            result = await gemini_service.transcribe(
-                temp_path, info.mime_type, duration_sec=info.duration
+        # Local Whisper worker first, unless this user is known to speak a
+        # language Whisper handles badly (Persian) — those go straight to Gemini.
+        if stt_remote.is_available() and not lang_routing.prefers_cloud(
+                user.id, user.language_code):
+            remote = await _transcribe_remote(
+                temp_path, info,
+                lang_routing.last_language(user.id) or user.language_code,
+                duration_sec,
             )
+            if remote is not None:
+                if remote.status == "empty":
+                    await _finish_empty(
+                        update, user_lang, is_group, status_message, reason="no_speech",
+                        detail=f"speech_sec={remote.speech_sec:.1f}",
+                        user=user, chat=chat, info=info, t0=t0,
+                    )
+                    return
+                lang_routing.remember(user.id, remote.language)
+                if remote.status == "ok":
+                    result = gemini_service.GeminiResult(
+                        text=remote.text, prompt_tokens=0, candidates_tokens=0,
+                        total_tokens=0, detected_language=remote.language,
+                    )
+                    logger.info("transcribe_engine=whisper lang=%s whisper_s=%.2f elapsed=%.2f",
+                                remote.language, remote.whisper_sec, remote.elapsed_sec)
+                else:  # "cloud": Whisper heard a language it is weak at
+                    logger.info("transcribe_engine=gemini reason=cloud_language lang=%s",
+                                remote.language)
+        try:
+            if result is None:
+                result = await gemini_service.transcribe(
+                    temp_path, info.mime_type, duration_sec=duration_sec
+                )
+                lang_routing.remember(user.id, result.detected_language)
+                if looks_like_timestamps_only(result.text):
+                    analytics.track(
+                        "transcribe_degraded", user=user, chat=chat, info=info,
+                        result=result, error_class="timestamps_only",
+                        latency_ms=int((time.monotonic() - t0) * 1000),
+                    )
+                    await _finish_empty(
+                        update, user_lang, is_group, status_message,
+                        reason="timestamps_only", detail=f"chars={len(result.text)}",
+                        user=user, chat=chat, info=info, t0=t0,
+                    )
+                    return
         except gemini_service.RateLimitedError:
             analytics.track("rate_limited_gemini", user=user, chat=chat, info=info,
                             latency_ms=int((time.monotonic() - t0) * 1000))

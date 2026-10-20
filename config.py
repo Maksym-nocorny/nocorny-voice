@@ -81,10 +81,50 @@ TRANSCRIBE_RETRY_FINAL_TEMPERATURE = _env_float("TRANSCRIBE_RETRY_FINAL_TEMPERAT
 TRANSCRIBE_CHUNK_SEC = _env_int("TRANSCRIBE_CHUNK_SEC", 150)
 # Max parallel Gemini transcribe calls when chunking. Keep modest to avoid rate limits.
 TRANSCRIBE_CHUNK_CONCURRENCY = _env_int("TRANSCRIBE_CHUNK_CONCURRENCY", 3)
-# Max media messages transcribed at once across ALL users (each user is also
-# serialized to one at a time). Bounded by RSS on the 512 MiB Render plan:
-# ffmpeg children count against the container limit but not mem_guard's RSS.
-MAX_CONCURRENT_TRANSCRIPTIONS = max(1, _env_int("MAX_CONCURRENT_TRANSCRIPTIONS", 2))
+# Max media messages transcribed at once across ALL users. Raised 2 -> 3 on
+# 2026-10-20 together with the local Whisper worker: with the heavy lifting on
+# the M1 the Render process mostly waits on the socket. Still bounded by RSS on
+# the 512 MiB plan: ffmpeg children count against the container limit but not
+# mem_guard's RSS.
+MAX_CONCURRENT_TRANSCRIPTIONS = max(1, _env_int("MAX_CONCURRENT_TRANSCRIPTIONS", 3))
+# How many of those slots ONE user (one chat in groups) may hold at a time.
+# Kept below the global cap so a user forwarding a backlog can never take
+# every slot (2026-09-27: 11 voices from one user held the whole bot).
+MAX_CONCURRENT_PER_USER = max(1, _env_int("MAX_CONCURRENT_PER_USER", 2))
+
+# --- Local Whisper worker (self-hosted, connects to us over WebSocket) ---
+# The M1 at home runs scripts/stt_server.py from the dispatcher repo and dials
+# wss://<WEBHOOK_URL>/stt/worker with `Authorization: Bearer STT_SERVER_TOKEN`.
+# No worker connected (power cut, laptop asleep) -> every request goes to
+# Gemini exactly as before. Empty token disables the endpoint entirely.
+STT_SERVER_TOKEN = os.getenv("STT_SERVER_TOKEN") or ""
+# Languages Whisper is known to be weak at (FLEURS WER: Persian ~17-19% vs
+# 4-8% for cloud models). Users speaking these go to Gemini: pre-routed by their
+# Telegram UI language / last detected language, and re-routed when the worker
+# reports one of these after detection.
+STT_CLOUD_LANGS = frozenset(
+    s.strip().lower() for s in os.getenv("STT_CLOUD_LANGS", "fa").split(",") if s.strip()
+)
+# Wait budget for a worker result: base + per audio second, capped. WhisperKit
+# turbo on the M1 runs ~6x real time plus queueing behind other jobs; past the
+# cap the job is cancelled on the worker and Gemini takes over.
+STT_TIMEOUT_BASE_SEC = _env_float("STT_TIMEOUT_BASE_SEC", 25.0)
+STT_TIMEOUT_PER_AUDIO_SEC = _env_float("STT_TIMEOUT_PER_AUDIO_SEC", 0.6)
+STT_TIMEOUT_MAX_SEC = _env_float("STT_TIMEOUT_MAX_SEC", 480.0)
+# Circuit breaker: after this many worker timeouts in a row, skip the worker
+# for the cooldown (a stuck decoder behind a healthy socket would otherwise
+# make every request sit out the full budget before Gemini takes over).
+STT_TRIP_AFTER_TIMEOUTS = max(1, _env_int("STT_TRIP_AFTER_TIMEOUTS", 2))
+STT_TRIP_COOLDOWN_SEC = _env_float("STT_TRIP_COOLDOWN_SEC", 120.0)
+# Audio whose loudest sample sits below this is treated as "nobody spoke"
+# before any engine sees it (the worker runs a real voice detector on top;
+# this ffmpeg check also covers the Gemini-only path). Pure silence from a
+# phone mic measures around -90 dB, room tone -45..-60 dB, speech -5..-25 dB.
+EMPTY_AUDIO_MAX_DB = _env_float("EMPTY_AUDIO_MAX_DB", -50.0)
+# The probe decodes the whole file; on Render Free's fractional CPU a 30-minute
+# file costs tens of seconds, and long recordings are never "accidentally
+# empty". Files longer than this skip the probe (unknown duration still runs it).
+EMPTY_AUDIO_PROBE_MAX_SEC = _env_int("EMPTY_AUDIO_PROBE_MAX_SEC", 120)
 # Path to ffmpeg binary; resolved via PATH if just "ffmpeg".
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
