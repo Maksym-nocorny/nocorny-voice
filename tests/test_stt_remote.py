@@ -280,3 +280,12 @@ async def test_ok_in_cloud_language_is_downgraded_to_cloud():
         ws.close()
     finally:
         srv.stop()
+
+
+def test_result_from_keeps_ok_when_cloud_list_is_empty(monkeypatch):
+    """With no cloud languages configured (default since 2026-11-02) a Persian
+    result is delivered as-is instead of being downgraded to "cloud"."""
+    monkeypatch.setattr(stt_remote, "STT_CLOUD_LANGS", frozenset())
+    res = stt_remote._result_from({"status": "ok", "language": "fa-IR", "text": "متن"},
+                                  "rid", 3, 0.1)
+    assert res.status == "ok" and res.language == "fa-ir" and res.text == "متن"

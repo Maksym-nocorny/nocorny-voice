@@ -526,8 +526,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _safe_edit(status_message, get_text(user_lang, "transcribing"))
 
         analytics.track("transcribe_request", user=user, chat=chat, info=info)
-        # Local Whisper worker first, unless this user is known to speak a
-        # language Whisper handles badly (Persian) — those go straight to Gemini.
+        # Local Whisper worker first, unless this user is known to speak one of
+        # STT_CLOUD_LANGS (empty by default since 2026-11-02; Persian used to be
+        # routed to Gemini here) — those go straight to Gemini.
         if stt_remote.is_available() and not lang_routing.prefers_cloud(
                 user.id, user.language_code):
             remote = await _transcribe_remote(

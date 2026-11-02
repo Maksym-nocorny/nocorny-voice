@@ -844,6 +844,32 @@ async def test_persian_ui_user_skips_worker(monkeypatch, _worker_env):
     gemini.assert_awaited_once()
 
 
+async def test_persian_stays_on_worker_with_empty_cloud_list(monkeypatch, _worker_env):
+    """Default since 2026-11-02: no cloud languages, so a Persian-UI user, and a
+    user the worker just heard speaking Persian, both stay on Whisper."""
+    import lang_routing
+    import stt_remote
+    from handlers import transcribe as t
+    monkeypatch.setattr(lang_routing, "STT_CLOUD_LANGS", frozenset())
+    remote = AsyncMock(return_value=stt_remote.RemoteResult(status="ok", language="fa",
+                                                            text="متن فارسی"))
+    monkeypatch.setattr(stt_remote, "transcribe", remote)
+
+    update, context, status, _ = _make_update_context(user_lang="fa", voice=_make_voice())
+    await t.handle_message(update, context)
+    remote.assert_awaited_once()
+    _worker_env.gemini.assert_not_awaited()
+    assert "متن فارسی" in status.edit_text.await_args_list[-1].args[0]
+    assert lang_routing.last_language(update.effective_user.id) == "fa"
+
+    # Second message: Persian is remembered, yet the worker is still first.
+    update2, context2, _, _ = _make_update_context(
+        user_lang="fa", voice=_make_voice(file_id="f2", file_unique_id="u2"))
+    await t.handle_message(update2, context2)
+    assert remote.await_count == 2
+    _worker_env.gemini.assert_not_awaited()
+
+
 async def test_worker_empty_private_chat_tells_user(monkeypatch, _worker_env):
     import stt_remote
     from handlers import transcribe as t

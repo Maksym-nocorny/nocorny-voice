@@ -1,12 +1,17 @@
 """Which engine should hear this user: local Whisper or Gemini?
 
-Whisper is weak at a few languages (Persian above all — ~19% of our users).
-The worker reports the language it detected and the handler re-routes to
-Gemini when it is one of STT_CLOUD_LANGS, but that costs one wasted Whisper
-pass per message. To skip the pass next time, remember the last detected
-language per user; the user's Telegram UI language is a first guess before
-anything was detected. Memory only (TTL 30 days, bounded) — a restart just
-means one more Whisper pass per Persian speaker.
+STT_CLOUD_LANGS lists languages that must go to Gemini. It is empty by
+default since 2026-11-02: Persian (~19% of our users, where Whisper makes
+roughly twice the word errors of Gemini) used to be the one entry, but the
+owner chose to keep Persian speakers on the free local Whisper. When the list
+is non-empty: the worker reports the language it detected and the handler
+re-routes to Gemini when it is one of STT_CLOUD_LANGS, but that costs one
+wasted Whisper pass per message. To skip the pass next time, remember the
+last detected language per user; the user's Telegram UI language is a first
+guess before anything was detected. Memory only (TTL 30 days, bounded) — a
+restart just means one more Whisper pass per speaker of a cloud language.
+The memory is kept even with an empty list: the worker gets the user's recent
+languages as a decoder hint.
 
 Group chats are keyed by user as well: the speaker is what matters, not the
 room.

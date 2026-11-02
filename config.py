@@ -89,8 +89,8 @@ TRANSCRIBE_CHUNK_CONCURRENCY = _env_int("TRANSCRIBE_CHUNK_CONCURRENCY", 3)
 # Still: download + ffmpeg probe/re-encode run before either path, and ffmpeg
 # children count against the 512 MiB container limit but not mem_guard's RSS.
 MAX_CONCURRENT_TRANSCRIPTIONS = max(1, _env_int("MAX_CONCURRENT_TRANSCRIPTIONS", 5))
-# How many of those may be inside a Gemini call at once (worker down, Persian,
-# fallback). This is the old global cap: each Gemini transcription spawns
+# How many of those may be inside a Gemini call at once (worker down or
+# tripped, STT_CLOUD_LANGS, fallback). This is the old global cap: each Gemini transcription spawns
 # ffmpeg and holds the audio in memory, and the 512 MiB plan OOM-killed us at
 # higher counts. Bounded separately so a worker outage never turns five slots
 # into five Gemini jobs.
@@ -141,12 +141,15 @@ STT_LOCAL_URL = (os.getenv("STT_LOCAL_URL") or "").rstrip("/")
 # No worker connected (power cut, laptop asleep) -> every request goes to
 # Gemini exactly as before. Empty token disables the endpoint entirely.
 STT_SERVER_TOKEN = os.getenv("STT_SERVER_TOKEN") or ""
-# Languages Whisper is known to be weak at (FLEURS WER: Persian ~17-19% vs
-# 4-8% for cloud models). Users speaking these go to Gemini: pre-routed by their
-# Telegram UI language / last detected language, and re-routed when the worker
-# reports one of these after detection.
+# Languages that bypass the worker and go straight to Gemini: pre-routed by the
+# user's Telegram UI language / last detected language, and re-routed when the
+# worker reports one of these after detection. Empty by default since
+# 2026-11-02: Persian used to be here (own benchmark on 200 FLEURS clips, same
+# engines as production: Whisper large-v3-turbo 21.7% WER vs 12.4% for
+# gemini-2.5-flash-lite), but the owner chose to keep Persian speakers on the
+# free local Whisper. Set STT_CLOUD_LANGS=fa to restore the old routing.
 STT_CLOUD_LANGS = frozenset(
-    s.strip().lower() for s in os.getenv("STT_CLOUD_LANGS", "fa").split(",") if s.strip()
+    s.strip().lower() for s in os.getenv("STT_CLOUD_LANGS", "").split(",") if s.strip()
 )
 # Wait budget for a worker result: base + per audio second, capped. WhisperKit
 # turbo on the M1 runs ~6x real time plus queueing behind other jobs; past the
