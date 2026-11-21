@@ -28,8 +28,20 @@ over HTTPS — not through the database, which must be allowed to sleep:
       the next beat so the primary cleans up.
 
 BOT_STOP_FLAG_FILE (primary only): when the dispatcher's low-battery marker
-appears, the primary sends a final beat with leaving=true (the standby takes
-over at once) and stops, instead of dying with the battery mid-transcription.
+appears, the primary sends leaving=true beats and keeps serving until the
+standby reports it holds the cloud webhook (bounded), then stops instead of
+dying with the battery mid-transcription. Once its handlers have drained it
+logs the bot out of its OWN Bot API server too: a local server that stays
+logged in keeps the bot on two servers ("no guarantee that it will receive
+all updates") and, on the next boot, catches up everything that happened
+while the box was off. The next start logs in there again from scratch.
+
+Backlog guard (primary, local Bot API): before the first getUpdates the
+primary asks the standby whether it served while we were away. If it did,
+queued updates older than BOT_BACKLOG_MAX_AGE_SEC are dropped (logged,
+counted) instead of being answered hours late (2026-11-20: 58 voices the
+standby had already answered were transcribed again by the M1 six hours
+later). A restart of seconds is untouched.
 """
 from __future__ import annotations
 
@@ -48,6 +60,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 
 from config import (
+    BOT_BACKLOG_MAX_AGE_SEC,
     BOT_HEARTBEAT_SEC,
     BOT_INSTANCE,
     BOT_RECLAIM_MIN_GAP_SEC,
@@ -85,6 +98,19 @@ def standby_should_hold_webhook(beat_age_sec: Optional[float], uptime_sec: float
     return beat_age_sec > stale_sec
 
 
+CLOCK_SKEW_SEC = 2.0   # Telegram dates are whole seconds; both hosts run NTP
+
+
+def is_stale_backlog(msg_ts: float, start_wall: float, max_age: float) -> bool:
+    """True = an update queued for us during a standby watch is too old to answer.
+
+    The queue cannot tell a duplicate (the standby answered it: on 2026-11-20
+    58 of them, up to six hours old) from an update only our server got. Past
+    `max_age` a reply is noise either way; inside it a second copy of a reply
+    beats a lost voice, so the young ones are answered."""
+    return start_wall - msg_ts > max_age
+
+
 def uses_local_api() -> bool:
     return bool(TELEGRAM_API_BASE_URL)
 
@@ -105,6 +131,7 @@ class StandbyState:
         self.last_beat: Optional[float] = None
         self.last_beat_info: dict = {}
         self.holding = False
+        self.held_since: Optional[float] = None   # wall clock of the take-over (time.time())
         self.takeovers = 0
         self.busy_fn = lambda: 0   # updates accepted but not finished (set by start())
 
@@ -131,6 +158,7 @@ class StandbyState:
     def status(self) -> dict:
         age = self.beat_age()
         return {"holding": self.holding, "primary_age": None if age is None else round(age, 1),
+                "held_since": self.held_since,
                 "uptime": round(self.uptime(), 1), "takeovers": self.takeovers,
                 "busy": self.busy(), "primary": self.last_beat_info}
 
@@ -150,8 +178,9 @@ class BeatHandler(tornado.web.RequestHandler):
             info = {}
         standby.note_beat(info if isinstance(info, dict) else {})
         self.set_header("Content-Type", "application/json")
+        # held_since: the primary's backlog guard drops what was sent during our watch.
         self.write({"holding": standby.holding, "uptime": round(standby.uptime()),
-                    "busy": standby.busy()})
+                    "busy": standby.busy(), "held_since": standby.held_since})
 
 
 class StatusHandler(tornado.web.RequestHandler):
@@ -181,6 +210,7 @@ async def standby_loop(bot, webhook_url: str) -> None:
                 await bot.set_webhook(url=webhook_url, drop_pending_updates=False)
                 if not standby.holding:
                     standby.takeovers += 1
+                    standby.held_since = time.time()
                     logger.warning("bot_lease_standby_webhook_set takeovers=%d", standby.takeovers)
                 standby.holding = True
             except TelegramError as e:
@@ -190,6 +220,7 @@ async def standby_loop(bot, webhook_url: str) -> None:
         elif standby.holding:
             logger.info("bot_lease_standby_stepping_back primary_age=%.0f", standby.beat_age())
             standby.holding = False
+            standby.held_since = None
         await asyncio.sleep(BOT_HEARTBEAT_SEC)
 
 
@@ -198,6 +229,13 @@ async def standby_loop(bot, webhook_url: str) -> None:
 def cloud_bot() -> Bot:
     """A client that always talks to api.telegram.org, whatever app.bot uses."""
     return Bot(TELEGRAM_BOT_TOKEN)
+
+
+def local_bot() -> Bot:
+    """A client for OUR Bot API server, independent of app.bot (which is shut
+    down by the time post_shutdown runs)."""
+    return Bot(TELEGRAM_BOT_TOKEN, base_url=f"{TELEGRAM_API_BASE_URL}/bot",
+               base_file_url=f"{TELEGRAM_API_BASE_URL}/file/bot", local_mode=True)
 
 
 _beat_client: Optional[httpx.AsyncClient] = None
@@ -232,6 +270,114 @@ async def send_beat(leaving: bool = False) -> Optional[dict]:
 # Primary bookkeeping, module level so the error handler can poke it.
 _reclaim_owed = False
 _reclaim_reason = ""
+_local_logout_owed = False    # stop flag + standby confirmed holding -> logOut locally on exit
+_backlog_guard: Optional[tuple] = None   # (start_wall, held_since or None) once armed
+_backlog_dropped = 0
+
+
+async def hand_over_to_standby() -> bool:
+    """Stop flag: leaving beats until the standby reports it holds the cloud
+    webhook, at most ~2.5 beats (its loop looks once per beat). Polling goes on
+    meanwhile, so the gap is served by us rather than by nobody. True = the
+    standby holds the webhook: our own Bot API server may let go of the bot."""
+    deadline = time.monotonic() + 2.5 * BOT_HEARTBEAT_SEC
+    while True:
+        reply = await send_beat(leaving=True)
+        if reply is not None and reply.get("holding"):
+            logger.warning("bot_lease_primary_handover_confirmed")
+            return True
+        if time.monotonic() >= deadline:
+            logger.warning("bot_lease_primary_handover_unconfirmed reply=%s", reply)
+            return False
+        await asyncio.sleep(min(5.0, BOT_HEARTBEAT_SEC))
+
+
+async def release_local_server() -> bool:
+    """logOut on our own Bot API server. Telegram (tdlib/telegram-bot-api
+    README): "If the bot is logged in on more than one server simultaneously,
+    there is no guarantee that it will receive all updates. To move a bot from
+    one local server to another you can use the method logOut to log out on the
+    old server". With the bot logged out here the cloud the standby holds is
+    its only server and gets every update. What is still queued locally (sent
+    after the standby took over — we polled until it did) is counted and not
+    answered; should the server keep any of it, the backlog guard drops what
+    is older than BOT_BACKLOG_MAX_AGE_SEC on our return. The next request with the token (our next start) logs the bot
+    in here again (the server just creates a new client for the token): a
+    fresh session that does not catch up the time we were away."""
+    try:
+        async with local_bot() as lb:
+            left = await lb.get_updates(timeout=0, limit=100)   # no offset: confirms nothing
+            await lb.log_out()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("bot_lease_local_logout_failed exc=%s", e)
+        return False
+    logger.warning("bot_lease_local_logged_out discarded=%d%s", len(left),
+                   "+" if len(left) >= 100 else "")
+    return True
+
+
+async def arm_backlog_guard() -> None:
+    """Primary with a local Bot API server, before the first getUpdates: ask
+    the standby whether it served while we were away. It did (or cannot say:
+    unreachable, or itself restarted too recently to have taken over yet) →
+    queued updates older than BOT_BACKLOG_MAX_AGE_SEC are dropped instead of
+    answered hours late. It did not and has been up long enough to know (it
+    had our beats: a restart of seconds) → everything queued is answered, as
+    before."""
+    global _backlog_guard, _backlog_dropped
+    start = time.time()
+    if not WEBHOOK_URL or not STT_SERVER_TOKEN:
+        _backlog_guard = None    # no standby configured: nobody served while we were away
+        logger.info("bot_lease_backlog_guard_off reason=no_standby")
+        return
+    try:
+        reply = await send_beat()
+    except Exception as e:  # noqa: BLE001 — must never keep the bot from starting
+        logger.info("bot_lease_backlog_guard_beat_failed exc=%s", e)
+        reply = None
+    try:
+        standby_up = float((reply or {}).get("uptime") or 0)
+    except (TypeError, ValueError):
+        standby_up = 0.0
+    if reply is not None and not reply.get("holding") and standby_up >= BOT_STALE_SEC:
+        _backlog_guard = None
+        logger.info("bot_lease_backlog_guard_off standby_holding=False")
+        return
+    held = reply.get("held_since") if reply is not None else None
+    try:
+        held = float(held) if held is not None else None
+    except (TypeError, ValueError):
+        held = None
+    _backlog_guard, _backlog_dropped = (start, held), 0
+    logger.warning("bot_lease_backlog_guard_armed standby=%s held_for=%s max_age=%.0fs",
+                   "unreachable" if reply is None
+                   else "holding" if reply.get("holding") else "just_restarted",
+                   "-" if held is None else "%.0fs" % (start - held), BOT_BACKLOG_MAX_AGE_SEC)
+
+
+def backlog_drop(update: object) -> bool:
+    """FairUpdateProcessor's drop predicate on the primary: True = do not answer.
+    Every drop is logged with a running total."""
+    global _backlog_dropped
+    guard = _backlog_guard
+    if guard is None:
+        return False
+    if getattr(update, "callback_query", None) is not None:
+        return False   # a button press carries the date of OUR message, not of the press
+    msg = getattr(update, "effective_message", None)
+    date = getattr(msg, "date", None)
+    if date is None:
+        return False
+    ts = date.timestamp()
+    start, held = guard
+    if not is_stale_backlog(ts, start, BOT_BACKLOG_MAX_AGE_SEC):
+        return False
+    _backlog_dropped += 1
+    # Forensics only: sent while the standby held the webhook (it most likely answered).
+    watch = "unknown" if held is None else ("yes" if ts >= held - CLOCK_SKEW_SEC else "no")
+    logger.warning("bot_lease_backlog_dropped update_id=%s age=%.0fs standby_watch=%s total=%d",
+                   getattr(update, "update_id", "-"), start - ts, watch, _backlog_dropped)
+    return True
 
 
 def note_conflict() -> None:
@@ -325,7 +471,7 @@ async def _api_alive(bot) -> bool:
 
 async def primary_loop(app) -> None:
     """Beat to the standby; clean the cloud whenever a reclaim is owed."""
-    global _reclaim_owed, _webhook_deleted_at
+    global _reclaim_owed, _webhook_deleted_at, _local_logout_owed
     last_logout = float("-inf")
     polling_seen = False
     unreachable_since: Optional[float] = None
@@ -337,7 +483,12 @@ async def primary_loop(app) -> None:
         if BOT_STOP_FLAG_FILE and os.path.exists(BOT_STOP_FLAG_FILE):
             logger.warning("bot_lease_primary_handing_over reason=stop_flag file=%s",
                            BOT_STOP_FLAG_FILE)
-            await send_beat(leaving=True)
+            # Long absence ahead: once the standby holds the cloud, our own
+            # Bot API server must let go of the bot (done in stop(), after the
+            # handlers drained — any request with the token logs it back in).
+            # Unconfirmed → stay logged in; the backlog guard covers the return.
+            if await hand_over_to_standby() and uses_local_api():
+                _local_logout_owed = True
             _stop(app)
             return
         updater = getattr(app, "updater", None)
@@ -424,7 +575,7 @@ def start(app, *, webhook_url: str = "") -> None:
 
 
 async def stop() -> None:
-    global _task, _beat_client
+    global _task, _beat_client, _local_logout_owed
     started = _task is not None
     if _task is not None:
         _task.cancel()
@@ -435,6 +586,11 @@ async def stop() -> None:
         _task = None
     if BOT_INSTANCE == PRIMARY and started:
         await send_beat(leaving=True)
+    if _local_logout_owed:
+        # post_shutdown: polling stopped and every handler finished, so nothing
+        # of ours will call the local server again before the next start.
+        _local_logout_owed = False
+        await release_local_server()
     if _beat_client is not None:
         await _beat_client.aclose()
         _beat_client = None

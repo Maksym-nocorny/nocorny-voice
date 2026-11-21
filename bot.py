@@ -66,6 +66,10 @@ async def _post_init(app: Application) -> None:
     # once the standby has nothing in flight).
     if BOT_INSTANCE == bot_lease.PRIMARY and bot_lease.uses_local_api():
         bot_lease._owe("startup")
+        # Before the first getUpdates (post_init runs before polling starts):
+        # if the standby served while we were away, what our server queued
+        # meanwhile is not answered again hours late (incident 2026-11-20).
+        await bot_lease.arm_backlog_guard()
     # Primary beats to the standby over HTTPS and cleans the cloud whenever a
     # reclaim is owed; standby sets the cloud webhook only while those beats
     # are stale. No-op when BOT_INSTANCE is unset.
@@ -316,8 +320,10 @@ def main() -> None:
         builder
         # Fair concurrency: one user's backlog no longer blocks everyone else
         # (2026-09-27: 11 forwarded voices held the whole bot ~3.5 min).
-        .concurrent_updates(FairUpdateProcessor(MAX_CONCURRENT_TRANSCRIPTIONS,
-                                                MAX_CONCURRENT_PER_USER))
+        .concurrent_updates(FairUpdateProcessor(
+            MAX_CONCURRENT_TRANSCRIPTIONS, MAX_CONCURRENT_PER_USER,
+            # Primary only: stale backlog after a standby watch (no-op unless armed).
+            drop_fn=bot_lease.backlog_drop if BOT_INSTANCE == bot_lease.PRIMARY else None))
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
@@ -356,6 +362,8 @@ def main() -> None:
         logger.info("Starting polling instance=%s", BOT_INSTANCE or "local")
         # drop_pending_updates=False: whatever queued up during a hand-over is
         # still wanted; python-telegram-bot deletes the webhook before polling.
+        # Only after a standby watch does the backlog guard (armed in
+        # post_init) skip queued updates too old to answer.
         app.run_polling(drop_pending_updates=False)
 
 

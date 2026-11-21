@@ -20,12 +20,16 @@ Rules:
 `busy_count()` reports every update accepted but not finished (waiting or
 running); mem_guard must not restart while it is non-zero, otherwise updates
 Telegram already got a 200 for would be lost.
+
+`drop_fn` (optional): an update it returns True for is discarded before it
+takes any slot — the primary's stale-backlog guard (bot_lease.backlog_drop).
+A predicate that raises never drops.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Dict, Hashable, Optional
+from typing import Any, Awaitable, Callable, Dict, Hashable, Optional
 
 from telegram import Update
 from telegram.ext import BaseUpdateProcessor
@@ -56,10 +60,13 @@ def _media_key(update: object) -> Optional[Hashable]:
 
 
 class FairUpdateProcessor(BaseUpdateProcessor):
-    __slots__ = ("_max_media", "_max_per_user", "_media_sem", "_user_locks", "_busy")
+    __slots__ = ("_max_media", "_max_per_user", "_media_sem", "_user_locks", "_busy",
+                 "_drop_fn")
 
-    def __init__(self, max_media: int, max_per_user: int = 1):
+    def __init__(self, max_media: int, max_per_user: int = 1,
+                 drop_fn: Optional[Callable[[object], bool]] = None):
         super().__init__(_MAX_CONCURRENT_UPDATES)
+        self._drop_fn = drop_fn
         if max_media < 1:
             raise ValueError("max_media must be a positive integer")
         if max_per_user < 1:
@@ -76,8 +83,21 @@ class FairUpdateProcessor(BaseUpdateProcessor):
     def busy_count(self) -> int:
         return self._busy
 
+    def _should_drop(self, update: object) -> bool:
+        if self._drop_fn is None:
+            return False
+        try:
+            return bool(self._drop_fn(update))
+        except Exception:  # noqa: BLE001
+            logger.exception("update_drop_check_failed — processing the update")
+            return False
+
     async def do_process_update(self, update: object,
                                 coroutine: Awaitable[Any]) -> None:
+        if self._should_drop(update):
+            if hasattr(coroutine, "close"):
+                coroutine.close()   # never started: no "never awaited" warning
+            return
         self._busy += 1
         try:
             key = _media_key(update)

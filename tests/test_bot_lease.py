@@ -3,11 +3,15 @@ standby holds the webhook only while beats are stale; nothing touches the databa
 from __future__ import annotations
 
 import asyncio
+import datetime
+import logging
 import signal
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from telegram import CallbackQuery, Chat, Message, Update, User, Voice
 from telegram.error import BadRequest
 
 import bot_lease
@@ -25,9 +29,14 @@ def _fast(monkeypatch):
     bot_lease._reclaim_owed = False
     bot_lease._reclaim_reason = ""
     bot_lease._webhook_deleted_at = None
+    bot_lease._local_logout_owed = False
+    bot_lease._backlog_guard = None
+    bot_lease._backlog_dropped = 0
     yield
     bot_lease._beat_client = None
     bot_lease._reclaim_owed = False
+    bot_lease._local_logout_owed = False
+    bot_lease._backlog_guard = None
 
 
 def _bot():
@@ -347,3 +356,200 @@ def test_start_picks_loop_by_instance(monkeypatch):
     bot_lease.start(app, webhook_url="https://x/hook"); assert created[-1] == "bot-lease-standby"
     bot_lease.start(app, webhook_url=""); assert len(created) == 2   # standby needs a URL
     bot_lease._task = None
+
+
+# ------------------------------------------------------------ stale backlog after a standby watch
+# 2026-11-20: the M1's own Bot API server was never logged out while the standby
+# served for six hours; after the reboot it handed the bot 58 voices the standby
+# had already answered, and the M1 transcribed them all again.
+
+def _voice_update(update_id: int, sent_at: float) -> Update:
+    user = User(id=42, first_name="u", is_bot=False)
+    msg = Message(message_id=update_id, chat=Chat(id=42, type=Chat.PRIVATE), from_user=user,
+                  date=datetime.datetime.fromtimestamp(sent_at, tz=datetime.timezone.utc),
+                  voice=Voice("f", "uf", duration=5))
+    return Update(update_id=update_id, message=msg)
+
+
+def test_backlog_decision():
+    start, age = 10_000.0, 600.0
+    stale = bot_lease.is_stale_backlog
+    assert stale(start + 5, start, age) is False         # sent after we came back
+    assert stale(start - 120, start, age) is False       # young: a second copy beats a lost voice
+    assert stale(start - 600, start, age) is False       # boundary still answered
+    assert stale(start - 601, start, age) is True
+    assert stale(start - 6 * 3600, start, age) is True   # 2026-11-20: six hours late
+
+
+@pytest.mark.asyncio
+async def test_guard_stays_off_after_a_short_restart(monkeypatch):
+    """Standby not holding (restart of seconds): everything queued is answered, as before."""
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(
+        200, json={"holding": False, "uptime": 100, "busy": 0, "held_since": None}))
+    await bot_lease.arm_backlog_guard()
+    assert bot_lease._backlog_guard is None
+    assert bot_lease.backlog_drop(_voice_update(1, time.time() - 86_000)) is False
+
+
+@pytest.mark.asyncio
+async def test_guard_drops_what_the_standby_served_and_keeps_new(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="bot_lease")
+    held = time.time() - 6 * 3600
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(
+        200, json={"holding": True, "uptime": 99_000, "busy": 0, "held_since": held}))
+    await bot_lease.arm_backlog_guard()
+    start, held_seen = bot_lease._backlog_guard
+    assert held_seen == pytest.approx(held)
+    served = [_voice_update(i, held + 60 * i) for i in range(1, 6)]   # hours old, its watch
+    recent = _voice_update(10, start - 120)       # two minutes old: answered
+    fresh = _voice_update(11, start + 1)          # sent after we came back
+    assert all(bot_lease.backlog_drop(u) for u in served)
+    assert bot_lease.backlog_drop(recent) is False
+    assert bot_lease.backlog_drop(fresh) is False
+    assert bot_lease._backlog_dropped == 5
+    assert "bot_lease_backlog_dropped" in caplog.text and "total=5" in caplog.text
+    assert "standby_watch=yes" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_guard_arms_when_standby_restarted_during_our_absence(monkeypatch):
+    """A standby that rebooted and has not taken over yet cannot vouch for a short absence."""
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(
+        200, json={"holding": False, "uptime": 0, "busy": 0, "held_since": None}))
+    await bot_lease.arm_backlog_guard()
+    assert bot_lease._backlog_guard is not None
+    start = bot_lease._backlog_guard[0]
+    assert bot_lease.backlog_drop(_voice_update(1, start - 3600)) is True
+
+
+@pytest.mark.asyncio
+async def test_guard_with_unreachable_standby_drops_only_old(monkeypatch):
+    def boom(req):
+        raise httpx.ConnectError("down")
+    _install_standby_transport(monkeypatch, boom)
+    await bot_lease.arm_backlog_guard()
+    start, held = bot_lease._backlog_guard
+    assert held is None
+    assert bot_lease.backlog_drop(_voice_update(1, start - 3600)) is True
+    assert bot_lease.backlog_drop(_voice_update(2, start - 60)) is False
+
+
+def test_guard_ignores_button_presses():
+    now = time.time()
+    bot_lease._backlog_guard = (now, now - 3600)
+    user = User(id=42, first_name="u", is_bot=False)
+    ours = Message(message_id=1, chat=Chat(id=42, type=Chat.PRIVATE), from_user=user, text="stats",
+                   date=datetime.datetime.fromtimestamp(now - 1800, tz=datetime.timezone.utc))
+    press = Update(update_id=5, callback_query=CallbackQuery("q", user, "inst", message=ours,
+                                                             data="stats:x"))
+    assert bot_lease.backlog_drop(press) is False
+
+
+@pytest.mark.asyncio
+async def test_standby_reports_when_it_took_over():
+    bot = _bot()
+    bot_lease.standby.boot -= 10
+    before = time.time()
+    await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
+    first = bot_lease.standby.held_since
+    assert first is not None and first >= before
+    await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
+    assert bot_lease.standby.held_since == first          # re-setting keeps the take-over time
+    assert bot_lease.standby.status()["held_since"] == first
+    bot_lease.standby.note_beat({"instance": "m1"})       # primary back -> step back, forget it
+    await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
+    assert bot_lease.standby.held_since is None
+
+
+# ------------------------------------------------------------ battery hand-over: leave our own server
+
+@pytest.mark.asyncio
+async def test_stop_flag_waits_for_standby_then_owes_local_logout(monkeypatch, tmp_path):
+    flag = tmp_path / ".power_low"; flag.write_text("")
+    monkeypatch.setattr(bot_lease, "BOT_STOP_FLAG_FILE", str(flag))
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+    monkeypatch.setattr(bot_lease, "BOT_HEARTBEAT_SEC", 0.1)    # wait bound 0.25 s
+    replies = [{"holding": False}, {"holding": True}]
+    bodies = []
+
+    def handler(req):
+        bodies.append(req.read())
+        return httpx.Response(200, json=replies.pop(0) if replies else {"holding": True})
+    _install_standby_transport(monkeypatch, handler)
+    app = MagicMock(); app.running = True
+    await asyncio.wait_for(bot_lease.primary_loop(app), 2)
+    app.stop_running.assert_called_once()
+    assert len(bodies) == 2 and all(b'"leaving":true' in b for b in bodies)
+    assert bot_lease._local_logout_owed is True
+
+
+@pytest.mark.asyncio
+async def test_stop_flag_unconfirmed_or_cloud_mode_keeps_local_login(monkeypatch, tmp_path):
+    flag = tmp_path / ".power_low"; flag.write_text("")
+    monkeypatch.setattr(bot_lease, "BOT_STOP_FLAG_FILE", str(flag))
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(200, json={"holding": False}))
+    app = MagicMock(); app.running = True
+    await asyncio.wait_for(bot_lease.primary_loop(app), 1)
+    app.stop_running.assert_called_once()
+    assert bot_lease._local_logout_owed is False          # standby never confirmed: stay logged in
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "")   # cloud mode: no own server
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(200, json={"holding": True}))
+    app = MagicMock(); app.running = True
+    await asyncio.wait_for(bot_lease.primary_loop(app), 1)
+    assert bot_lease._local_logout_owed is False
+
+
+def _local_bot_mock(left=(), log_out_exc=None):
+    lb = MagicMock()
+    lb.get_updates = AsyncMock(return_value=tuple(left))
+    lb.log_out = AsyncMock(side_effect=log_out_exc)
+    lb.__aenter__ = AsyncMock(return_value=lb); lb.__aexit__ = AsyncMock(return_value=False)
+    return lb
+
+
+@pytest.mark.asyncio
+async def test_stop_logs_out_of_local_server_only_when_owed(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="bot_lease")
+    monkeypatch.setattr(bot_lease, "BOT_INSTANCE", "m1")
+    lb = _local_bot_mock(left=[1, 2, 3])
+    monkeypatch.setattr(bot_lease, "local_bot", lambda: lb)
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(200, json={}))
+    bot_lease._task = None
+    await bot_lease.stop()                      # ordinary restart: stays logged in locally
+    lb.get_updates.assert_not_awaited(); lb.log_out.assert_not_awaited()
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(200, json={}))
+    bot_lease._local_logout_owed = True
+    await bot_lease.stop()
+    assert lb.get_updates.await_args.kwargs == {"timeout": 0, "limit": 100}   # no offset
+    lb.log_out.assert_awaited_once()
+    assert bot_lease._local_logout_owed is False
+    assert "bot_lease_local_logged_out discarded=3" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_local_logout_failure_is_logged_not_raised(monkeypatch):
+    monkeypatch.setattr(bot_lease, "local_bot",
+                        lambda: _local_bot_mock(log_out_exc=RuntimeError("server gone")))
+    assert await bot_lease.release_local_server() is False
+
+
+def test_local_bot_targets_own_server(monkeypatch):
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+    monkeypatch.setattr(bot_lease, "TELEGRAM_BOT_TOKEN", "123:abc")
+    b = bot_lease.local_bot()
+    assert b.base_url.startswith("http://127.0.0.1:8081/bot") and b.local_mode is True
+
+
+@pytest.mark.asyncio
+async def test_guard_never_blocks_start_up(monkeypatch):
+    monkeypatch.setattr(bot_lease, "WEBHOOK_URL", "")          # no standby configured
+    await bot_lease.arm_backlog_guard()
+    assert bot_lease._backlog_guard is None
+    monkeypatch.setattr(bot_lease, "WEBHOOK_URL", "https://standby.test")
+
+    async def broken(leaving=False):
+        raise ValueError("unexpected")
+    monkeypatch.setattr(bot_lease, "send_beat", broken)
+    await bot_lease.arm_backlog_guard()                        # no exception: age-only guard
+    assert bot_lease._backlog_guard is not None and bot_lease._backlog_guard[1] is None

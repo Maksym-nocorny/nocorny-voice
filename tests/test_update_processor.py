@@ -171,3 +171,31 @@ def test_per_user_cap_is_clamped_to_global():
     assert p._max_per_user == 2
     with pytest.raises(ValueError):
         FairUpdateProcessor(max_media=2, max_per_user=0)
+
+
+@pytest.mark.asyncio
+async def test_drop_fn_discards_before_any_slot():
+    """The primary's stale-backlog guard: a dropped update never takes a slot or runs."""
+    proc = FairUpdateProcessor(1, 1, drop_fn=lambda u: u.update_id % 2 == 0)
+    ran = []
+
+    async def job(u):
+        ran.append(u.update_id)
+    ups = [_update(5) for _ in range(4)]
+    for u in ups:
+        await proc.do_process_update(u, job(u))
+    assert ran == [u.update_id for u in ups if u.update_id % 2]
+    assert proc.busy_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_drop_fn_that_raises_never_drops():
+    def boom(u):
+        raise RuntimeError("bad predicate")
+    proc = FairUpdateProcessor(2, 1, drop_fn=boom)
+    ran = []
+
+    async def job():
+        ran.append(1)
+    await proc.do_process_update(_update(5), job())
+    assert ran == [1]
