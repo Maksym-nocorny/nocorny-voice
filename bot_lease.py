@@ -41,7 +41,8 @@ the standby already answered (2026-11-20: 58 voices, transcribed a second time
 six hours later). Armed before the first getUpdates when the standby served
 (or cannot say) and in-process after a stale period without beats or with our
 API server dead. Updates sent during the standby's watch — from its
-held_since to our cloud deleteWebhook — are dropped whatever their age; ones
+held_since to our cloud deleteWebhook, less a clock-skew margin at each edge
+(at an edge a second copy beats a loss) — are dropped whatever their age; ones
 sent before it are answered (nobody did); when the standby cannot say, ones
 older than BOT_BACKLOG_MAX_AGE_SEC are dropped. Every drop is logged and
 counted. A restart of seconds (standby not holding) is untouched.
@@ -60,7 +61,7 @@ from typing import Optional
 import httpx
 import tornado.web
 from telegram import Bot
-from telegram.error import TelegramError
+from telegram.error import BadRequest, NetworkError, TelegramError, TimedOut
 
 from config import (
     BOT_BACKLOG_MAX_AGE_SEC,
@@ -110,20 +111,22 @@ def backlog_verdict(msg_ts: float, now: float, start: Optional[float], end: Opti
     answered — None = answer it.
 
     The watch runs from the standby's take-over (`start`, its held_since) to
-    the moment we deleted the cloud webhook (`end`; None = not yet). Sent
-    inside it → the standby served it, whatever its age (2026-11-20: 58 voices
-    answered by the standby came back to us six hours later). Sent after it →
-    ours. Sent before it, and the standby vouches its record covers that time
+    the moment we took the cloud back (`end`; None = not yet). Sent inside it
+    → the standby served it, whatever its age (2026-11-20: 58 voices answered
+    by the standby came back to us six hours later). The clock-skew margin
+    NARROWS the watch: within CLOCK_SKEW_SEC of either edge an update may have
+    reached only our server, and at an edge a second copy of a reply beats a
+    lost voice. Sent after it → ours. Sent before it, and the standby vouches its record covers that time
     → nobody answered it (at most the ~210 s until a take-over) → answered,
     even late. The standby cannot say (unreachable, old format, just
     restarted) → age at the moment of the decision: older than `max_age` is
     dropped."""
     skew = CLOCK_SKEW_SEC
-    if end is not None and msg_ts > end + skew:
-        return None
-    if start is not None and msg_ts >= start - skew:
+    if start is not None and msg_ts >= start + skew and (end is None or msg_ts <= end - skew):
         return "standby_watch"
-    if start is not None and vouched:
+    if end is not None and msg_ts > end - skew:
+        return None
+    if start is not None and vouched and msg_ts < start + skew:
         return None
     return "too_old" if now - msg_ts > max_age else None
 
@@ -230,6 +233,12 @@ def standby_routes():
     return [(BEAT_PATH, BeatHandler), (STATUS_PATH, StatusHandler)]
 
 
+def _outcome_unknown(e: Exception) -> bool:
+    """A failed setWebhook that Telegram may still have carried out."""
+    return isinstance(e, TimedOut) or (isinstance(e, NetworkError)
+                                       and not isinstance(e, BadRequest))
+
+
 async def standby_loop(bot, webhook_url: str) -> None:
     """Hold the cloud webhook only while the primary is gone; never touch the
     cloud while it is alive."""
@@ -239,20 +248,26 @@ async def standby_loop(bot, webhook_url: str) -> None:
             if not standby.holding:
                 logger.warning("bot_lease_standby_taking_over primary_age=%s uptime=%.0f",
                                standby.beat_age() and round(standby.beat_age()), standby.uptime())
-                if standby._trying_since is None:
-                    standby._trying_since = time.time()
+            attempt = time.time()
             try:
                 await bot.set_webhook(url=webhook_url, drop_pending_updates=False)
                 standby.last_set_ok = time.monotonic()
                 if not standby.holding:
                     standby.takeovers += 1
-                    standby.held_since = standby._trying_since or time.time()
+                    standby.held_since = (standby._trying_since if standby._trying_since is not None
+                                          else attempt)
                     logger.warning("bot_lease_standby_webhook_set takeovers=%d", standby.takeovers)
                 standby.holding = True
             except TelegramError as e:
                 # Inside the cloud's 10-minute lockout after the primary's
                 # logOut the call fails with "Logged out": keep trying.
                 logger.warning("bot_lease_standby_set_webhook_failed exc=%s", e)
+                if not standby.holding and standby._trying_since is None and _outcome_unknown(e):
+                    # Timed out / network: the cloud may have taken the webhook
+                    # and be serving from here. A clear refusal ("Logged out",
+                    # flood control) starts no watch: updates of that window
+                    # reached only the primary's server.
+                    standby._trying_since = attempt
         elif standby.holding:
             logger.info("bot_lease_standby_stepping_back primary_age=%.0f", standby.beat_age())
             standby.holding = False
@@ -338,12 +353,13 @@ class BacklogGuard:
         self.end: Optional[float] = None     # wall: our cloud deleteWebhook after the watch
         self.vouched = False                 # standby's record covers the time before start
         self.informed = False                # a beat reply arrived since arming
+        self.opened_at: Optional[float] = None   # wall: when we learned of the open watch
         self.dropped = 0
         self._event: Optional[asyncio.Event] = None
 
     def arm(self, reason: str) -> None:
         self.armed = True
-        self.start = self.end = None
+        self.start = self.end = self.opened_at = None
         self.vouched = self.informed = False
         self.dropped = 0
         self._event = asyncio.Event()
@@ -358,16 +374,20 @@ class BacklogGuard:
         if self._event is not None:
             self._event.set()      # whoever waits is answered now
 
-    def inform(self, reply: dict, now: float) -> None:
-        """A beat reply while armed: did the standby take over, and since when?"""
+    def inform(self, reply: dict, now: float) -> bool:
+        """A beat reply while armed: did the standby take over, and since when?
+        True = it took the webhook AFTER we had taken the cloud back: the watch
+        is open again and the reclaim must start over from deleteWebhook."""
         if not self.armed:
-            return
+            return False
+        reopened = False
         up = _num(reply.get("uptime"))
         held = _num(reply.get("held_since"))
         if reply.get("holding"):
             if held is not None and held != self.start:
                 if self.end is not None and held > self.end:
-                    self.end = None      # our earlier deleteWebhook preceded this watch
+                    self.end, reopened = None, True   # our closure preceded this watch
+                self.opened_at = now
                 # Its record reaches back before the take-over only if it had
                 # been up (hearing from us) a whole stale period first; a
                 # standby that rebooted mid-outage may have had a predecessor
@@ -381,23 +401,31 @@ class BacklogGuard:
             # Up long enough to have taken over, yet not holding: it never
             # served, or it released the webhook after we took the cloud back.
             self.disarm("standby_released" if self.start is not None else "standby_not_serving")
-            return
+            return False
         if not self.informed:
             self.informed = True
             if self._event is not None:
                 self._event.set()
+        return reopened
 
     def note_cloud_taken_back(self, now: float) -> None:
-        """We deleted the cloud webhook: the watch ends here. The latest deletion
-        counts — a standby still holding re-sets the webhook every beat."""
-        if self.armed:
+        """We deleted the cloud webhook, or found / left the cloud logged out:
+        the watch ends here. The first closure counts and is never moved later
+        (that would widen the watch); a later take-over reopens it (inform)."""
+        if self.armed and self.end is None:
             self.end = now
             logger.info("bot_lease_backlog_guard_watch_closed")
 
     def verdict(self, msg_ts: float, now: float) -> Optional[str]:
         if not self.armed:
             return None
-        return backlog_verdict(msg_ts, now, self.start, self.end, self.vouched,
+        end = self.end
+        if end is None and self.opened_at is not None:
+            # An open watch is trusted for two beats only: the reclaim closes it
+            # on its first tick. If it cannot (the cloud out of reach), later
+            # traffic is answered — never dropped silently on a guess.
+            end = self.opened_at + 2 * BOT_HEARTBEAT_SEC
+        return backlog_verdict(msg_ts, now, self.start, end, self.vouched,
                                BOT_BACKLOG_MAX_AGE_SEC)
 
     async def wait_informed(self, timeout: float) -> None:
@@ -597,11 +625,15 @@ async def release_cloud_staged(reply: Optional[dict], last_logout: float) -> tup
             await cb.log_out()
         logger.warning("bot_lease_cloud_released reason=%s logout=True", _reclaim_reason)
         _webhook_deleted_at = None
+        _guard.note_cloud_taken_back(time.time())   # no-op if the deletion closed it
         return True, time.monotonic()
     except TelegramError as e:
         if "logged out" in str(e).lower():
             logger.info("bot_lease_cloud_already_logged_out reason=%s", _reclaim_reason)
             _webhook_deleted_at = None
+            # The cloud cannot serve anyone: a watch still open ends now, or every
+            # new voice would be dropped as the standby's with nobody serving it.
+            _guard.note_cloud_taken_back(time.time())
             return True, last_logout
         logger.warning("bot_lease_cloud_release_failed reason=%s exc=%s", _reclaim_reason, e)
         return False, last_logout
@@ -689,7 +721,10 @@ async def primary_loop(app) -> None:
                 unreachable_armed = True
         else:
             unreachable_since, unreachable_owed, unreachable_armed = None, False, False
-            _guard.inform(reply, time.time())   # before the reclaim: start, then end
+            if _guard.inform(reply, time.time()):   # before the reclaim: start, then end
+                # It set the webhook after we had taken the cloud back: delete
+                # it again (that also closes the reopened watch).
+                _webhook_deleted_at = None
             up = _num(reply.get("uptime")) or 0.0
             if reply.get("holding"):
                 _owe("standby_holding")

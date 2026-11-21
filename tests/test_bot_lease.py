@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 from telegram import CallbackQuery, Chat, Message, Update, User, Voice
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter, TimedOut
 
 import bot_lease
 
@@ -384,9 +384,15 @@ def test_backlog_verdict():
     # inside the watch: dropped whatever the age (a five-minute outage too)
     assert v(start + 10, now, start, end, True, age) == "standby_watch"
     assert v(end - 60, now, start, end, True, age) == "standby_watch"
-    assert v(end + 2, now, start, end, True, age) == "standby_watch"     # clock-skew margin
-    assert v(start - 2, now, start, end, True, age) == "standby_watch"
+    assert v(start + 4, now, start, end, True, age) == "standby_watch"
+    assert v(end - 4, now, start, end, True, age) == "standby_watch"
+    # the skew margin NARROWS the watch: at an edge a second copy, never a loss
+    assert v(start + 2, now, start, end, True, age) is None
+    assert v(start - 2, now, start, end, True, age) is None
+    assert v(end - 2, now, start, end, True, age) is None
+    assert v(end + 2, now, start, end, True, age) is None
     assert v(end + 5, now, start, end, True, age) is None                # after we took it back
+    assert v(start + 3.5, now, start, start + 5, True, age) is None      # watch shorter than 2 skews
     # watch still open (cloud webhook not deleted yet): everything since start is its
     assert v(now - 1, now, start, None, True, age) == "standby_watch"
     # before the take-over and the standby vouches: nobody answered -> answered, even late
@@ -577,18 +583,38 @@ async def test_standby_reports_when_it_took_over():
 
 
 @pytest.mark.asyncio
-async def test_held_since_is_the_first_attempt_of_the_take_over():
+async def test_held_since_starts_at_an_attempt_that_may_have_worked():
+    """Timed out: Telegram may have set the webhook anyway -> the watch starts there."""
     bot = _bot()
     calls = []
 
     async def flaky(**kw):
         calls.append(time.time())
         if len(calls) == 1:
-            raise BadRequest("Logged out")
+            raise TimedOut("Timed out")
     bot.set_webhook = AsyncMock(side_effect=flaky)
     bot_lease.standby.boot -= 10
     await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
     assert len(calls) >= 2 and bot_lease.standby.held_since <= calls[0]
+
+
+@pytest.mark.asyncio
+async def test_clear_refusals_start_no_watch():
+    """Review round 3: "Logged out" (the cloud's lockout after the primary's logOut)
+    and flood control are clear refusals — the watch starts at the success."""
+    bot = _bot()
+    calls = []
+
+    async def refused(**kw):
+        calls.append(time.time())
+        if len(calls) == 1:
+            raise BadRequest("Logged out")
+        if len(calls) == 2:
+            raise RetryAfter(1)
+    bot.set_webhook = AsyncMock(side_effect=refused)
+    bot_lease.standby.boot -= 10
+    await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
+    assert len(calls) >= 3 and bot_lease.standby.held_since > calls[1]
 
 
 @pytest.mark.asyncio
@@ -718,3 +744,68 @@ async def test_queue_count_failure_does_not_skip_the_logout(monkeypatch, caplog)
     assert await bot_lease.release_local_server() is True
     lb.log_out.assert_awaited_once()
     assert "bot_lease_local_logged_out discarded=?" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_edges_of_a_real_watch_are_answered(monkeypatch):
+    """Review round 3, BLOCKED 1: a voice 2 s before the standby's setWebhook and
+    one 2 s after our deleteWebhook reached only our server: both answered."""
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+    bot = _bot()
+    bot_lease.standby.boot -= 10
+    await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
+    held = bot_lease.standby.held_since
+    assert held is not None
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(200, json={
+        "holding": bot_lease.standby.holding, "held_since": bot_lease.standby.held_since,
+        "uptime": round(bot_lease.standby.uptime()), "busy": 0}))
+    await bot_lease.arm_backlog_guard()
+    cb = MagicMock()
+    cb.delete_webhook = AsyncMock(); cb.log_out = AsyncMock()
+    cb.__aenter__ = AsyncMock(return_value=cb); cb.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(bot_lease, "cloud_bot", lambda: cb)
+    await bot_lease.release_cloud_staged({"busy": 0}, float("-inf"))
+    end = bot_lease._guard.end
+    assert end is not None
+    assert bot_lease.backlog_drop(_voice_update(1, held - 2)) is False
+    assert bot_lease.backlog_drop(_voice_update(2, end + 2)) is False
+
+
+@pytest.mark.asyncio
+async def test_logged_out_cloud_closes_a_reopened_watch(monkeypatch):
+    """Review round 3, BLOCKED 2: the standby took the webhook after our
+    deletion; the reclaim then finds the cloud logged out. The watch must
+    close there, and the guard must come off once the standby lets go —
+    otherwise every new voice is dropped with nobody serving it."""
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+    cb = MagicMock()
+    cb.delete_webhook = AsyncMock(side_effect=BadRequest("Logged out")); cb.log_out = AsyncMock()
+    cb.__aenter__ = AsyncMock(return_value=cb); cb.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(bot_lease, "cloud_bot", lambda: cb)
+    g = bot_lease._guard
+    g.arm("startup")
+    g.inform({"holding": True, "held_since": time.time() - 3600, "uptime": 99_999}, time.time())
+    g.note_cloud_taken_back(time.time() - 60)          # our first reclaim, a minute ago
+    bot_lease._webhook_deleted_at = time.monotonic()    # ...staged: logOut next
+    replies = [{"holding": True, "held_since": time.time() - 30, "uptime": 99_999, "busy": 0}]
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(
+        200, json=replies.pop(0) if replies else {"holding": False, "uptime": 99_999, "busy": 0}))
+    app = MagicMock(); app.running = True; app.updater.running = True
+    app.bot.get_me = AsyncMock()
+    await _run_briefly(bot_lease.primary_loop(app), 0.08)
+    cb.delete_webhook.assert_awaited()                  # reopened watch -> delete again
+    assert not bot_lease.reclaim_owed()
+    assert not g.armed                                   # released -> guard off
+    assert bot_lease.backlog_drop(_voice_update(1, time.time())) is False
+
+
+@pytest.mark.asyncio
+async def test_open_watch_is_trusted_for_two_beats_only():
+    """No closure (the cloud out of reach): later traffic is answered, never dropped on a guess."""
+    g = bot_lease._guard
+    g.arm("startup")
+    now = time.time()
+    g.inform({"holding": True, "held_since": now - 3600, "uptime": 99_999}, now)
+    g.opened_at = now - 60                                # learned of it a minute ago, still open
+    assert bot_lease.backlog_drop(_voice_update(1, now - 1800)) is True     # inside the watch
+    assert bot_lease.backlog_drop(_voice_update(2, now)) is False           # live traffic
