@@ -353,7 +353,7 @@ class BacklogGuard:
         self.end: Optional[float] = None     # wall: our cloud deleteWebhook after the watch
         self.vouched = False                 # standby's record covers the time before start
         self.informed = False                # a beat reply arrived since arming
-        self.opened_at: Optional[float] = None   # wall: when we learned of the open watch
+        self.opened_at: Optional[float] = None   # wall: when we learned of the watch (its end while open)
         self.dropped = 0
         self._event: Optional[asyncio.Event] = None
 
@@ -421,10 +421,11 @@ class BacklogGuard:
             return None
         end = self.end
         if end is None and self.opened_at is not None:
-            # An open watch is trusted for two beats only: the reclaim closes it
-            # on its first tick. If it cannot (the cloud out of reach), later
-            # traffic is answered — never dropped silently on a guess.
-            end = self.opened_at + 2 * BOT_HEARTBEAT_SEC
+            # Not closed yet: only what was sent before we learned of the watch
+            # counts as the standby's. From then on we answer — whether the
+            # cloud is down or our closure is still on its way (~1 s of
+            # possible second copies per return beats any window of loss).
+            end = self.opened_at
         return backlog_verdict(msg_ts, now, self.start, end, self.vouched,
                                BOT_BACKLOG_MAX_AGE_SEC)
 

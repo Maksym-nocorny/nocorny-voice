@@ -800,12 +800,62 @@ async def test_logged_out_cloud_closes_a_reopened_watch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_open_watch_is_trusted_for_two_beats_only():
-    """No closure (the cloud out of reach): later traffic is answered, never dropped on a guess."""
+async def test_open_watch_ends_where_we_learned_of_it(monkeypatch):
+    """Review round 4 (a): the cloud API itself down when we learn of an open
+    watch, so it cannot be closed. With the real 30 s beat the old bound
+    (learned + 2 beats) dropped a voice sent 56 s later; now everything sent
+    after we learned of the watch is answered."""
+    monkeypatch.setattr(bot_lease, "BOT_HEARTBEAT_SEC", 30.0)
     g = bot_lease._guard
     g.arm("startup")
     now = time.time()
-    g.inform({"holding": True, "held_since": now - 3600, "uptime": 99_999}, now)
-    g.opened_at = now - 60                                # learned of it a minute ago, still open
-    assert bot_lease.backlog_drop(_voice_update(1, now - 1800)) is True     # inside the watch
-    assert bot_lease.backlog_drop(_voice_update(2, now)) is False           # live traffic
+    g.inform({"holding": True, "held_since": now - 3600, "uptime": 99_999}, now - 56)
+    assert g.end is None and g.opened_at == pytest.approx(now - 56)
+    assert bot_lease.backlog_drop(_voice_update(1, now - 1800)) is True     # the standby's
+    assert bot_lease.backlog_drop(_voice_update(2, now)) is False           # 56 s after: ours
+    assert bot_lease.backlog_drop(_voice_update(3, now - 55)) is False      # 1 s after: ours
+
+
+@pytest.mark.asyncio
+async def test_voice_during_the_closing_round_trip_is_answered(monkeypatch):
+    """Review round 4 (b): between inform and the closure on "Logged out" in
+    the same tick (the cloud round trip) nobody serves — such a voice is ours."""
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+    monkeypatch.setattr(bot_lease, "BOT_HEARTBEAT_SEC", 30.0)
+    seen = []
+
+    async def logged_out(**kw):
+        seen.append(bot_lease.backlog_drop(_voice_update(1, time.time())))
+        raise BadRequest("Logged out")
+    cb = MagicMock()
+    cb.delete_webhook = AsyncMock(side_effect=logged_out); cb.log_out = AsyncMock()
+    cb.__aenter__ = AsyncMock(return_value=cb); cb.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(bot_lease, "cloud_bot", lambda: cb)
+    bot_lease._guard.arm("startup")
+    _install_standby_transport(monkeypatch, _beat_reply(holding=True,
+                                                        held_since=time.time() - 3600))
+    app = MagicMock(); app.running = True; app.updater.running = True
+    app.bot.get_me = AsyncMock()
+    await _run_briefly(bot_lease.primary_loop(app), 0.05)
+    assert seen == [False]                                 # answered, not dropped
+    assert bot_lease._guard.end is not None                # and the watch closed right after
+
+
+@pytest.mark.asyncio
+async def test_ordinary_restarts_still_answer_everything(monkeypatch):
+    """Round 4: a restart of seconds is unchanged. Standby not holding: guard
+    off. Standby's tick slipped into the restart (holding since 4 s, we learn
+    of it now): its watch is narrower than the two margins — every queued
+    voice is answered."""
+    monkeypatch.setattr(bot_lease, "BOT_HEARTBEAT_SEC", 30.0)
+    _install_standby_transport(monkeypatch, _beat_reply())
+    await bot_lease.arm_backlog_guard()
+    assert not bot_lease._guard.armed
+    now = time.time()
+    assert all(bot_lease.backlog_drop(_voice_update(i, now - age)) is False
+               for i, age in enumerate((1, 5, 30, 900), start=1))
+    _install_standby_transport(monkeypatch, _beat_reply(holding=True, held_since=now - 4))
+    await bot_lease.arm_backlog_guard()
+    assert bot_lease._guard.armed and bot_lease._guard.end is None
+    assert all(bot_lease.backlog_drop(_voice_update(10 + i, now - age)) is False
+               for i, age in enumerate((8, 6, 4, 2, 0)))
