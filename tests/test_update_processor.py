@@ -199,3 +199,24 @@ async def test_drop_fn_that_raises_never_drops():
         ran.append(1)
     await proc.do_process_update(_update(5), job())
     assert ran == [1]
+
+
+@pytest.mark.asyncio
+async def test_drop_fn_may_wait_and_counts_as_busy():
+    """The guard may hold an update until a beat says what the standby did."""
+    gate = asyncio.Event()
+
+    async def later(u):
+        await gate.wait()
+        return True
+    proc = FairUpdateProcessor(1, 1, drop_fn=later)
+    ran = []
+
+    async def job():
+        ran.append(1)
+    t = asyncio.ensure_future(proc.do_process_update(_update(5), job()))
+    await asyncio.sleep(0)
+    assert proc.busy_count() == 1 and not t.done()
+    gate.set()
+    await t
+    assert ran == [] and proc.busy_count() == 0

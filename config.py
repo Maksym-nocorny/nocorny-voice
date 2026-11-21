@@ -118,11 +118,11 @@ BOT_STOP_FLAG_FILE = os.getenv("BOT_STOP_FLAG_FILE") or ""
 # Primary: minimum gap between two cloud clean-ups (each logOut restarts the
 # cloud's 10-minute lockout, so a reclaim must not be repeated every beat).
 BOT_RECLAIM_MIN_GAP_SEC = _env_float("BOT_RECLAIM_MIN_GAP_SEC", 300.0)
-# Primary (local Bot API): coming back after the standby served, a queued update
-# older than this is not answered (bot_lease backlog guard) — it is a duplicate
-# of what the standby answered or too late to help. 2026-11-20: 58 voices the
-# standby had answered were transcribed again six hours later. A restart of
-# seconds (standby not holding) is untouched.
+# Primary (local Bot API), bot_lease backlog guard: updates sent during the
+# standby's watch are never answered again, whatever their age (2026-11-20: 58
+# voices the standby had answered were transcribed again six hours later).
+# This age limit is the fallback for when the standby cannot say what it did
+# (unreachable, just restarted, old format): older queued updates are dropped.
 BOT_BACKLOG_MAX_AGE_SEC = _env_float("BOT_BACKLOG_MAX_AGE_SEC", 600.0)
 # Standby only: it must never call the cloud while the primary is alive, so it
 # cannot ask Telegram "who am I" at start-up; the id comes from the token and

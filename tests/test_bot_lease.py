@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import inspect
 import logging
 import signal
 import time
@@ -30,13 +31,12 @@ def _fast(monkeypatch):
     bot_lease._reclaim_reason = ""
     bot_lease._webhook_deleted_at = None
     bot_lease._local_logout_owed = False
-    bot_lease._backlog_guard = None
-    bot_lease._backlog_dropped = 0
+    bot_lease._guard = bot_lease.BacklogGuard()
     yield
     bot_lease._beat_client = None
     bot_lease._reclaim_owed = False
     bot_lease._local_logout_owed = False
-    bot_lease._backlog_guard = None
+    bot_lease._guard = bot_lease.BacklogGuard()
 
 
 def _bot():
@@ -371,72 +371,187 @@ def _voice_update(update_id: int, sent_at: float) -> Update:
     return Update(update_id=update_id, message=msg)
 
 
-def test_backlog_decision():
-    start, age = 10_000.0, 600.0
-    stale = bot_lease.is_stale_backlog
-    assert stale(start + 5, start, age) is False         # sent after we came back
-    assert stale(start - 120, start, age) is False       # young: a second copy beats a lost voice
-    assert stale(start - 600, start, age) is False       # boundary still answered
-    assert stale(start - 601, start, age) is True
-    assert stale(start - 6 * 3600, start, age) is True   # 2026-11-20: six hours late
+def _beat_reply(**kw):
+    body = {"holding": False, "uptime": 99_999, "busy": 0, "held_since": None,
+            "handover_confirmed": False}
+    body.update(kw)
+    return lambda req: httpx.Response(200, json=body)
+
+
+def test_backlog_verdict():
+    v = bot_lease.backlog_verdict
+    start, end, now, age = 1_000.0, 9_000.0, 10_000.0, 600.0
+    # inside the watch: dropped whatever the age (a five-minute outage too)
+    assert v(start + 10, now, start, end, True, age) == "standby_watch"
+    assert v(end - 60, now, start, end, True, age) == "standby_watch"
+    assert v(end + 2, now, start, end, True, age) == "standby_watch"     # clock-skew margin
+    assert v(start - 2, now, start, end, True, age) == "standby_watch"
+    assert v(end + 5, now, start, end, True, age) is None                # after we took it back
+    # watch still open (cloud webhook not deleted yet): everything since start is its
+    assert v(now - 1, now, start, None, True, age) == "standby_watch"
+    # before the take-over and the standby vouches: nobody answered -> answered, even late
+    assert v(start - 600, now, start, end, True, age) is None
+    # before the take-over, standby cannot vouch (rebooted mid-outage): age decides
+    assert v(start - 600, now, start, end, False, age) == "too_old"
+    # standby cannot say at all
+    assert v(now - 300, now, None, None, False, age) is None
+    assert v(now - 601, now, None, None, False, age) == "too_old"
+    assert v(now - 601, now, None, now - 700, False, age) is None         # after our deletion
 
 
 @pytest.mark.asyncio
 async def test_guard_stays_off_after_a_short_restart(monkeypatch):
-    """Standby not holding (restart of seconds): everything queued is answered, as before."""
-    _install_standby_transport(monkeypatch, lambda req: httpx.Response(
-        200, json={"holding": False, "uptime": 100, "busy": 0, "held_since": None}))
+    """Standby not holding and up for long (a restart of seconds): all queued is answered."""
+    _install_standby_transport(monkeypatch, _beat_reply())
     await bot_lease.arm_backlog_guard()
-    assert bot_lease._backlog_guard is None
+    assert bot_lease._guard.armed is False
     assert bot_lease.backlog_drop(_voice_update(1, time.time() - 86_000)) is False
 
 
 @pytest.mark.asyncio
-async def test_guard_drops_what_the_standby_served_and_keeps_new(monkeypatch, caplog):
+async def test_startup_drops_the_watch_answers_the_gap_and_new(monkeypatch, caplog):
+    """The 2026-11-20 return: a six-hour watch, 27 s nobody served before it."""
     caplog.set_level(logging.WARNING, logger="bot_lease")
     held = time.time() - 6 * 3600
-    _install_standby_transport(monkeypatch, lambda req: httpx.Response(
-        200, json={"holding": True, "uptime": 99_000, "busy": 0, "held_since": held}))
+    _install_standby_transport(monkeypatch, _beat_reply(holding=True, held_since=held))
     await bot_lease.arm_backlog_guard()
-    start, held_seen = bot_lease._backlog_guard
-    assert held_seen == pytest.approx(held)
-    served = [_voice_update(i, held + 60 * i) for i in range(1, 6)]   # hours old, its watch
-    recent = _voice_update(10, start - 120)       # two minutes old: answered
-    fresh = _voice_update(11, start + 1)          # sent after we came back
-    assert all(bot_lease.backlog_drop(u) for u in served)
-    assert bot_lease.backlog_drop(recent) is False
-    assert bot_lease.backlog_drop(fresh) is False
-    assert bot_lease._backlog_dropped == 5
-    assert "bot_lease_backlog_dropped" in caplog.text and "total=5" in caplog.text
-    assert "standby_watch=yes" in caplog.text
+    g = bot_lease._guard
+    assert g.armed and g.informed and g.vouched and g.start == pytest.approx(held)
+    served = [_voice_update(i, held + 600 * i) for i in range(1, 6)]
+    recent = _voice_update(10, time.time() - 120)     # two minutes old, still its watch
+    gap = _voice_update(11, held - 27)                # nobody answered it: answered, late
+    assert all(bot_lease.backlog_drop(u) is True for u in served)
+    assert bot_lease.backlog_drop(recent) is True
+    assert bot_lease.backlog_drop(gap) is False
+    g.note_cloud_taken_back(time.time())              # our first reclaim tick
+    assert bot_lease.backlog_drop(_voice_update(12, time.time() + 5)) is False
+    assert g.dropped == 6 and "total=6" in caplog.text and "reason=standby_watch" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_standby_rebooted_mid_outage_cannot_vouch_for_the_gap(monkeypatch):
+    held = time.time() - 3600
+    # up only since just before its take-over: a predecessor may have held before
+    _install_standby_transport(monkeypatch, _beat_reply(holding=True, held_since=held,
+                                                        uptime=3600.5))
+    await bot_lease.arm_backlog_guard()
+    g = bot_lease._guard
+    assert g.armed and not g.vouched
+    assert bot_lease.backlog_drop(_voice_update(1, held - 900)) is True    # old, before its watch
+    assert bot_lease.backlog_drop(_voice_update(2, held + 60)) is True     # its watch
 
 
 @pytest.mark.asyncio
 async def test_guard_arms_when_standby_restarted_during_our_absence(monkeypatch):
-    """A standby that rebooted and has not taken over yet cannot vouch for a short absence."""
-    _install_standby_transport(monkeypatch, lambda req: httpx.Response(
-        200, json={"holding": False, "uptime": 0, "busy": 0, "held_since": None}))
+    """A standby that rebooted and has not taken over yet cannot vouch: age fallback."""
+    _install_standby_transport(monkeypatch, _beat_reply(uptime=0))
     await bot_lease.arm_backlog_guard()
-    assert bot_lease._backlog_guard is not None
-    start = bot_lease._backlog_guard[0]
-    assert bot_lease.backlog_drop(_voice_update(1, start - 3600)) is True
+    g = bot_lease._guard
+    assert g.armed and g.informed and g.start is None
+    assert bot_lease.backlog_drop(_voice_update(1, time.time() - 3600)) is True
+    assert bot_lease.backlog_drop(_voice_update(2, time.time() - 60)) is False
 
 
 @pytest.mark.asyncio
-async def test_guard_with_unreachable_standby_drops_only_old(monkeypatch):
+async def test_guard_holds_old_updates_until_a_beat_tells(monkeypatch):
     def boom(req):
         raise httpx.ConnectError("down")
     _install_standby_transport(monkeypatch, boom)
     await bot_lease.arm_backlog_guard()
-    start, held = bot_lease._backlog_guard
-    assert held is None
-    assert bot_lease.backlog_drop(_voice_update(1, start - 3600)) is True
-    assert bot_lease.backlog_drop(_voice_update(2, start - 60)) is False
+    g = bot_lease._guard
+    assert g.armed and not g.informed
+    assert bot_lease.backlog_drop(_voice_update(1, time.time() - 1)) is False   # live: no wait
+    pending = bot_lease.backlog_drop(_voice_update(2, time.time() - 240))      # a catch-up?
+    assert inspect.isawaitable(pending)
+    task = asyncio.ensure_future(pending)
+    await asyncio.sleep(0)
+    assert not task.done()
+    g.inform({"holding": True, "held_since": time.time() - 300, "uptime": 99_999}, time.time())
+    assert await task is True                         # sent during the watch: dropped
+    # nobody ever answers: after the bounded wait the age fallback decides
+    g.arm("test")
+    assert await bot_lease.backlog_drop(_voice_update(3, time.time() - 240)) is False
+    assert await bot_lease.backlog_drop(_voice_update(4, time.time() - 3600)) is True
+
+
+@pytest.mark.asyncio
+async def test_guard_arms_in_process_when_beats_stop(monkeypatch):
+    """Review round 2: internet gone on the M1 for a stale period with the
+    process alive. The standby took over; once the link is back our server
+    catches the watch up and the same process must not answer it again."""
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+    monkeypatch.setattr(bot_lease, "BOT_STALE_SEC", 0.02)
+
+    def boom(req):
+        raise httpx.ConnectError("down")
+    _install_standby_transport(monkeypatch, boom)
+    phase = {"down": True}
+
+    async def rel(reply, last_logout):
+        if phase["down"]:
+            return False, last_logout                 # the cloud is out of reach as well
+        bot_lease._guard.note_cloud_taken_back(time.time())
+        return True, last_logout
+    monkeypatch.setattr(bot_lease, "release_cloud_staged", rel)
+    app = MagicMock(); app.running = True; app.updater.running = True
+    app.bot.get_me = AsyncMock()
+    await _run_briefly(bot_lease.primary_loop(app), 0.1)
+    g = bot_lease._guard
+    assert g.armed and not g.informed
+    phase["down"] = False                             # link back: it held for the last minute
+    held = time.time() - 60
+    _install_standby_transport(monkeypatch, _beat_reply(holding=True, held_since=held))
+    await _run_briefly(bot_lease.primary_loop(app), 0.05)
+    assert g.informed and g.start == pytest.approx(held) and g.end is not None
+    # the catch-up: only a minute old, but sent during the watch -> dropped
+    assert bot_lease.backlog_drop(_voice_update(1, held + 30)) is True
+    assert bot_lease.backlog_drop(_voice_update(2, time.time() + 5)) is False
+    # the standby lets go of the webhook -> guard off
+    _install_standby_transport(monkeypatch, _beat_reply(holding=False))
+    await _run_briefly(bot_lease.primary_loop(app), 0.05)
+    assert not g.armed
+
+
+@pytest.mark.asyncio
+async def test_guard_arms_when_our_api_server_dies(monkeypatch):
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+    monkeypatch.setattr(bot_lease, "BOT_STALE_SEC", 0.02)
+    _install_standby_transport(monkeypatch, _beat_reply())
+    app = MagicMock(); app.running = True; app.updater.running = True
+    app.bot.get_me = AsyncMock(side_effect=RuntimeError("refused"))
+    await _run_briefly(bot_lease.primary_loop(app), 0.1)
+    assert bot_lease._guard.armed and not bot_lease._guard.informed
+
+
+@pytest.mark.asyncio
+async def test_release_records_the_end_of_the_watch(monkeypatch):
+    cb = MagicMock()
+    cb.delete_webhook = AsyncMock(); cb.log_out = AsyncMock()
+    cb.__aenter__ = AsyncMock(return_value=cb); cb.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(bot_lease, "cloud_bot", lambda: cb)
+    monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
+    bot_lease._guard.arm("test")
+    before = time.time()
+    await bot_lease.release_cloud_staged({"busy": 0}, float("-inf"))
+    assert bot_lease._guard.end is not None and bot_lease._guard.end >= before
+
+
+@pytest.mark.asyncio
+async def test_non_object_json_reply_counts_as_no_reply(monkeypatch):
+    """Review round 2: a 200 with a JSON list must not crash the start-up."""
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(200, json=[1, 2]))
+    assert await bot_lease.send_beat() is None
+    await bot_lease.arm_backlog_guard()
+    assert bot_lease._guard.armed and not bot_lease._guard.informed
+    app = MagicMock(); app.running = True; app.updater.running = True
+    app.bot.get_me = AsyncMock()
+    await _run_briefly(bot_lease.primary_loop(app))   # the loop survives the same replies
 
 
 def test_guard_ignores_button_presses():
     now = time.time()
-    bot_lease._backlog_guard = (now, now - 3600)
+    bot_lease._guard.arm("test")
+    bot_lease._guard.inform({"holding": True, "held_since": now - 3600, "uptime": 99_999}, now)
     user = User(id=42, first_name="u", is_bot=False)
     ours = Message(message_id=1, chat=Chat(id=42, type=Chat.PRIVATE), from_user=user, text="stats",
                    date=datetime.datetime.fromtimestamp(now - 1800, tz=datetime.timezone.utc))
@@ -461,6 +576,41 @@ async def test_standby_reports_when_it_took_over():
     assert bot_lease.standby.held_since is None
 
 
+@pytest.mark.asyncio
+async def test_held_since_is_the_first_attempt_of_the_take_over():
+    bot = _bot()
+    calls = []
+
+    async def flaky(**kw):
+        calls.append(time.time())
+        if len(calls) == 1:
+            raise BadRequest("Logged out")
+    bot.set_webhook = AsyncMock(side_effect=flaky)
+    bot_lease.standby.boot -= 10
+    await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
+    assert len(calls) >= 2 and bot_lease.standby.held_since <= calls[0]
+
+
+@pytest.mark.asyncio
+async def test_handover_confirmed_only_by_a_fresh_set_after_leaving():
+    """Review round 2: `holding` is sticky through failed re-sets."""
+    bot = _bot()
+    st = bot_lease.standby
+    st.boot -= 10
+    await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
+    assert st.holding and not st.handover_confirmed()        # nobody is leaving
+    st.note_beat({"instance": "m1"})                          # primary back (no step-back tick yet)
+    bot.set_webhook = AsyncMock(side_effect=BadRequest("Logged out"))   # cloud lockout
+    st.note_beat({"instance": "m1", "leaving": True})
+    await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
+    assert st.holding and not st.handover_confirmed()        # sticky holding does not confirm
+    bot.set_webhook = AsyncMock()
+    await _run_briefly(bot_lease.standby_loop(bot, "https://standby.test/hook"))
+    assert st.handover_confirmed()
+    st.note_beat({"instance": "m1"})                          # back again: nothing pending
+    assert not st.handover_confirmed()
+
+
 # ------------------------------------------------------------ battery hand-over: leave our own server
 
 @pytest.mark.asyncio
@@ -469,7 +619,8 @@ async def test_stop_flag_waits_for_standby_then_owes_local_logout(monkeypatch, t
     monkeypatch.setattr(bot_lease, "BOT_STOP_FLAG_FILE", str(flag))
     monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
     monkeypatch.setattr(bot_lease, "BOT_HEARTBEAT_SEC", 0.1)    # wait bound 0.25 s
-    replies = [{"holding": False}, {"holding": True}]
+    replies = [{"holding": True, "handover_confirmed": False},     # sticky holding: not enough
+               {"holding": True, "handover_confirmed": True}]
     bodies = []
 
     def handler(req):
@@ -488,13 +639,15 @@ async def test_stop_flag_unconfirmed_or_cloud_mode_keeps_local_login(monkeypatch
     flag = tmp_path / ".power_low"; flag.write_text("")
     monkeypatch.setattr(bot_lease, "BOT_STOP_FLAG_FILE", str(flag))
     monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081")
-    _install_standby_transport(monkeypatch, lambda req: httpx.Response(200, json={"holding": False}))
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(
+        200, json={"holding": True, "handover_confirmed": False}))
     app = MagicMock(); app.running = True
     await asyncio.wait_for(bot_lease.primary_loop(app), 1)
     app.stop_running.assert_called_once()
     assert bot_lease._local_logout_owed is False          # standby never confirmed: stay logged in
     monkeypatch.setattr(bot_lease, "TELEGRAM_API_BASE_URL", "")   # cloud mode: no own server
-    _install_standby_transport(monkeypatch, lambda req: httpx.Response(200, json={"holding": True}))
+    _install_standby_transport(monkeypatch, lambda req: httpx.Response(
+        200, json={"holding": True, "handover_confirmed": True}))
     app = MagicMock(); app.running = True
     await asyncio.wait_for(bot_lease.primary_loop(app), 1)
     assert bot_lease._local_logout_owed is False
@@ -545,11 +698,23 @@ def test_local_bot_targets_own_server(monkeypatch):
 async def test_guard_never_blocks_start_up(monkeypatch):
     monkeypatch.setattr(bot_lease, "WEBHOOK_URL", "")          # no standby configured
     await bot_lease.arm_backlog_guard()
-    assert bot_lease._backlog_guard is None
+    assert not bot_lease._guard.armed
     monkeypatch.setattr(bot_lease, "WEBHOOK_URL", "https://standby.test")
 
     async def broken(leaving=False):
         raise ValueError("unexpected")
     monkeypatch.setattr(bot_lease, "send_beat", broken)
-    await bot_lease.arm_backlog_guard()                        # no exception: age-only guard
-    assert bot_lease._backlog_guard is not None and bot_lease._backlog_guard[1] is None
+    await bot_lease.arm_backlog_guard()                        # no exception: armed, waits for beats
+    assert bot_lease._guard.armed and not bot_lease._guard.informed
+
+
+@pytest.mark.asyncio
+async def test_queue_count_failure_does_not_skip_the_logout(monkeypatch, caplog):
+    """Review round 2: the counter's getUpdates failing must not cancel the logOut."""
+    caplog.set_level(logging.WARNING, logger="bot_lease")
+    lb = _local_bot_mock()
+    lb.get_updates = AsyncMock(side_effect=RuntimeError("Conflict: terminated by other getUpdates"))
+    monkeypatch.setattr(bot_lease, "local_bot", lambda: lb)
+    assert await bot_lease.release_local_server() is True
+    lb.log_out.assert_awaited_once()
+    assert "bot_lease_local_logged_out discarded=?" in caplog.text

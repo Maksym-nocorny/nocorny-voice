@@ -23,11 +23,14 @@ Telegram already got a 200 for would be lost.
 
 `drop_fn` (optional): an update it returns True for is discarded before it
 takes any slot — the primary's stale-backlog guard (bot_lease.backlog_drop).
-A predicate that raises never drops.
+It may return an awaitable (the guard holding an update until it knows what
+the standby did); a waiting update counts as busy. A predicate that raises
+never drops.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any, Awaitable, Callable, Dict, Hashable, Optional
 
@@ -83,23 +86,32 @@ class FairUpdateProcessor(BaseUpdateProcessor):
     def busy_count(self) -> int:
         return self._busy
 
-    def _should_drop(self, update: object) -> bool:
+    async def _should_drop(self, update: object) -> bool:
         if self._drop_fn is None:
             return False
         try:
-            return bool(self._drop_fn(update))
+            verdict = self._drop_fn(update)
+            if inspect.isawaitable(verdict):
+                verdict = await verdict
+            return bool(verdict)
         except Exception:  # noqa: BLE001
             logger.exception("update_drop_check_failed — processing the update")
             return False
 
     async def do_process_update(self, update: object,
                                 coroutine: Awaitable[Any]) -> None:
-        if self._should_drop(update):
-            if hasattr(coroutine, "close"):
-                coroutine.close()   # never started: no "never awaited" warning
-            return
         self._busy += 1
         try:
+            try:
+                drop = await self._should_drop(update)
+            except asyncio.CancelledError:
+                if hasattr(coroutine, "close"):
+                    coroutine.close()
+                raise
+            if drop:
+                if hasattr(coroutine, "close"):
+                    coroutine.close()   # never started: no "never awaited" warning
+                return
             key = _media_key(update)
             if key is None:
                 await coroutine

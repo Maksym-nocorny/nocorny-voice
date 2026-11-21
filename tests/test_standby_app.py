@@ -55,6 +55,7 @@ async def test_standby_app_routes(monkeypatch):
                                body='{"instance": "m1"}', headers={"Authorization": "Bearer wtok"})
         assert r.code == 200 and json.loads(r.body)["holding"] is False
         assert json.loads(r.body)["held_since"] is None   # not holding: no watch to report
+        assert json.loads(r.body)["handover_confirmed"] is False
         assert bot_lease.standby.beat_age() < 1
         r = await client.fetch(f"http://127.0.0.1:{port}{bot_lease.STATUS_PATH}",
                                headers={"Authorization": "Bearer wtok"})

@@ -67,8 +67,8 @@ async def _post_init(app: Application) -> None:
     if BOT_INSTANCE == bot_lease.PRIMARY and bot_lease.uses_local_api():
         bot_lease._owe("startup")
         # Before the first getUpdates (post_init runs before polling starts):
-        # if the standby served while we were away, what our server queued
-        # meanwhile is not answered again hours late (incident 2026-11-20).
+        # if the standby served while we were away, what it answered is not
+        # answered again by us hours later (incident 2026-11-20).
         await bot_lease.arm_backlog_guard()
     # Primary beats to the standby over HTTPS and cleans the cloud whenever a
     # reclaim is owed; standby sets the cloud webhook only while those beats
@@ -362,8 +362,9 @@ def main() -> None:
         logger.info("Starting polling instance=%s", BOT_INSTANCE or "local")
         # drop_pending_updates=False: whatever queued up during a hand-over is
         # still wanted; python-telegram-bot deletes the webhook before polling.
-        # Only after a standby watch does the backlog guard (armed in
-        # post_init) skip queued updates too old to answer.
+        # Only after a standby watch does the backlog guard (bot_lease) skip
+        # queued updates: those the standby served, or, when it cannot say,
+        # those too old to answer.
         app.run_polling(drop_pending_updates=False)
 
 
